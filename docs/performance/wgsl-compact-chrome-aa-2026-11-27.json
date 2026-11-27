@@ -1,0 +1,134 @@
+{
+  "browser": "Chrome/158.0.8127.89",
+  "loadStart": [5.95849609375, 5.35791015625, 4.50830078125],
+  "sampling": "11 alternating variant pairs, 100 calls/sample, five warmups per call, Chrome V8 compact-only; no GPU",
+  "cases": [
+    {
+      "n": 0,
+      "size": 230000,
+      "last": true,
+      "samples": [
+        {"base": 30.759999990463257, "patch": 30.040000021457672, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.12000000476837, "patch": 27.305000007152557, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.069999992847443, "patch": 26.085000038146973, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.694999992847443, "patch": 27.12999999523163, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.555000007152557, "patch": 26.164999961853027, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.19999998807907, "patch": 25.8400000333786, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.214999973773956, "patch": 26.725000023841858, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.100000023841858, "patch": 26.069999992847443, "sourceLength": 229983, "stubLength": 25},
+        {"base": 25.869999945163727, "patch": 25.860000014305115, "sourceLength": 229983, "stubLength": 25},
+        {"base": 25.834999978542328, "patch": 25.980000019073486, "sourceLength": 229983, "stubLength": 25},
+        {"base": 25.889999985694885, "patch": 25.830000042915344, "sourceLength": 229983, "stubLength": 25}
+      ]
+    },
+    {
+      "n": 4,
+      "size": 230000,
+      "last": true,
+      "samples": [
+        {"base": 44.20999997854233, "patch": 44.924999952316284, "sourceLength": 229978, "stubLength": 302},
+        {"base": 43.72499996423721, "patch": 44.594999969005585, "sourceLength": 229978, "stubLength": 302},
+        {"base": 44.07499998807907, "patch": 44.235000014305115, "sourceLength": 229978, "stubLength": 302},
+        {"base": 42.294999957084656, "patch": 41.50499999523163, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.68000000715256, "patch": 43.62999999523163, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.84999996423721, "patch": 39.939999997615814, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.56999999284744, "patch": 38.44999998807907, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.5, "patch": 38.55000001192093, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.375, "patch": 39.0450000166893, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.40000003576279, "patch": 38.52500003576279, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.29000002145767, "patch": 39.24500000476837, "sourceLength": 229978, "stubLength": 302}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 230000,
+      "last": true,
+      "samples": [
+        {"base": 71.12999999523163, "patch": 71.32499998807907, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 71.21000003814697, "patch": 71.50999999046326, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 71.31000000238419, "patch": 70.55000001192093, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 69.625, "patch": 69.98500001430511, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.19999998807907, "patch": 70.3299999833107, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.95000004768372, "patch": 70.59999996423721, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 71.18500000238419, "patch": 71.25499999523163, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 71, "patch": 70.75, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.73500001430511, "patch": 71.11000001430511, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.34500002861023, "patch": 69.78999996185303, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 69.75, "patch": 70.70999997854233, "sourceLength": 229987, "stubLength": 1148}
+      ]
+    },
+    {
+      "n": 32,
+      "size": 230000,
+      "last": true,
+      "samples": [
+        {"base": 104.5, "patch": 105.31499999761581, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 104.68000000715256, "patch": 105.05500000715256, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.38499999046326, "patch": 103.35499995946884, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 104.51499998569489, "patch": 104.52999997138977, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 102.22499996423721, "patch": 102.00499999523163, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.8299999833107, "patch": 103.59499996900558, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.51999998092651, "patch": 104.68999999761581, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.51499998569489, "patch": 103.34499996900558, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 104.61500000953674, "patch": 104.47499996423721, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 107.18999999761581, "patch": 104.80500000715256, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 105.55500000715256, "patch": 105.375, "sourceLength": 229989, "stubLength": 2300}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 230000,
+      "last": false,
+      "samples": [
+        {"base": 26.834999978542328, "patch": 26.634999990463257, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.514999985694885, "patch": 26.87000000476837, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.6599999666214, "patch": 27.439999997615814, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 27.185000002384186, "patch": 27.0450000166893, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 27.00499999523163, "patch": 26.810000002384186, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.710000038146973, "patch": 26.514999985694885, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.55000001192093, "patch": 26.855000019073486, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.5450000166893, "patch": 26.67500001192093, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.47999995946884, "patch": 26.980000019073486, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 27.405000030994415, "patch": 28.634999990463257, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.850000023841858, "patch": 27.325000047683716, "sourceLength": 229987, "stubLength": 1148}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 5000,
+      "last": true,
+      "samples": [
+        {"base": 3.0700000524520874, "patch": 1.590000033378601, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.6449999809265137, "patch": 1.699999988079071, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.649999976158142, "patch": 1.600000023841858, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5550000071525574, "patch": 1.5699999928474426, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5699999928474426, "patch": 1.6550000309944153, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.659999966621399, "patch": 1.5649999976158142, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.6650000214576721, "patch": 1.6050000190734863, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.550000011920929, "patch": 1.5400000214576721, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5449999570846558, "patch": 1.5600000023841858, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5700000524520874, "patch": 1.5549999475479126, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5649999976158142, "patch": 1.590000033378601, "sourceLength": 4992, "stubLength": 1148}
+      ]
+    },
+    {
+      "n": 65,
+      "size": 230000,
+      "last": true,
+      "samples": [
+        {"base": 175.34500002861023, "patch": 174.11999994516373, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 176.25999999046326, "patch": 174.85999995470047, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 173.14000004529953, "patch": 171.8949999809265, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 176.74500000476837, "patch": 174.92500001192093, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 176.52499997615814, "patch": 174.125, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 176.13499999046326, "patch": 174.1449999809265, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 177.03500002622604, "patch": 174.85499995946884, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 181.41500002145767, "patch": 172.4650000333786, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 179.57499998807907, "patch": 179.91500002145767, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 174.9549999833107, "patch": 170.23500001430511, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 176.99500000476837, "patch": 175.35000002384186, "sourceLength": 229991, "stubLength": 4676}
+      ]
+    }
+  ],
+  "loadEnd": [5.58935546875, 5.29638671875, 4.49609375]
+}

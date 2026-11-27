@@ -652,16 +652,66 @@ function compactWgslForMetadata(wgslSource) {
   const declLines = [];
   const usedVarNames = [];
   COMPACT_WGSL_GROUP0_VAR_RE.lastIndex = 0;
-  while ((match = COMPACT_WGSL_GROUP0_VAR_RE.exec(cleaned)) !== null) {
-    const varName = match[1];
-    if (hasFunction) {
-      const refRe = new RegExp(`(?:^|[^A-Za-z0-9_.])${varName}(?![A-Za-z0-9_])`);
-      if (!refRe.test(bodies)) {
-        continue;
+  // Batch the body scan only when enough declarations can amortize it. Bound
+  // the alternation and fall back to the original scan for unusual inputs.
+  let declarations = null;
+  if (hasFunction && bodies.length > 16384) {
+    declarations = [];
+    while ((match = COMPACT_WGSL_GROUP0_VAR_RE.exec(cleaned)) !== null) {
+      declarations.push([match[0], match[1]]);
+      if (declarations.length > 64) {
+        declarations = null;
+        break;
       }
     }
-    declLines.push(match[0]);
-    usedVarNames.push(varName);
+  }
+  if (declarations === null) {
+    COMPACT_WGSL_GROUP0_VAR_RE.lastIndex = 0;
+    while ((match = COMPACT_WGSL_GROUP0_VAR_RE.exec(cleaned)) !== null) {
+      const varName = match[1];
+      if (hasFunction) {
+        const refRe = new RegExp(`(?:^|[^A-Za-z0-9_.])${varName}(?![A-Za-z0-9_])`);
+        if (!refRe.test(bodies)) {
+          continue;
+        }
+      }
+      declLines.push(match[0]);
+      usedVarNames.push(varName);
+    }
+  } else {
+    const names = [...new Set(declarations.map((entry) => entry[1]))];
+    const useBatch = declarations.length > 3 && names.reduce((sum, name) => sum + name.length, 0) <= 4096;
+    const foundNames = new Set();
+    if (useBatch) {
+      // Preserve the original fast path when bindings occur near the start.
+      const prefix = bodies.slice(0, 4096);
+      for (const name of names) {
+        const ref = new RegExp(`(?:^|[^A-Za-z0-9_.])${name}(?![A-Za-z0-9_])`).exec(prefix);
+        if (ref && (ref.index + ref[0].length < prefix.length ||
+            prefix.length === bodies.length || !/[A-Za-z0-9_]/.test(bodies[prefix.length]))) {
+          foundNames.add(name);
+        }
+      }
+      const missing = names.filter((name) => !foundNames.has(name));
+      if (missing.length) {
+        // Names are identifiers captured by COMPACT_WGSL_GROUP0_VAR_RE, so no
+        // regex metacharacters can be introduced into this bounded pattern.
+        const refs = new RegExp(`(?:^|[^A-Za-z0-9_.])(${missing.join('|')})(?![A-Za-z0-9_])`, 'g');
+        let ref;
+        while ((ref = refs.exec(bodies)) !== null) {
+          foundNames.add(ref[1]);
+          if (foundNames.size === names.length) break;
+        }
+      }
+    }
+    for (const [declaration, varName] of declarations) {
+      if (useBatch ? !foundNames.has(varName) :
+          !new RegExp(`(?:^|[^A-Za-z0-9_.])${varName}(?![A-Za-z0-9_])`).test(bodies)) {
+        continue;
+      }
+      declLines.push(declaration);
+      usedVarNames.push(varName);
+    }
   }
 
   const entryLines = [];

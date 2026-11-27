@@ -1,0 +1,196 @@
+{
+  "workload": "Synthetic WGSL metadata compaction; no device or game data",
+  "environment": {
+    "node": "v24.21.0",
+    "platform": "darwin",
+    "arch": "arm64",
+    "cpu": "Apple M5",
+    "loadStart": [3.2509765625, 4.603515625, 4.32666015625],
+    "loadEnd": [2.904296875, 4.484375, 4.28759765625]
+  },
+  "sampling": "11 alternating baseline/patch pairs; 100 calls per sample; five warmups per variant",
+  "cases": [
+    {
+      "bindings": 0,
+      "targetBytes": 230000,
+      "position": "late",
+      "sourceBytes": 229983,
+      "stubBytes": 25,
+      "samples": [
+        {"base": {"cpuMs": 46.575, "wallMs": 39.068584}, "patch": {"cpuMs": 41.125, "wallMs": 36.68529199999999}},
+        {"patch": {"cpuMs": 37.403, "wallMs": 37.580167}, "base": {"cpuMs": 45.518, "wallMs": 59.35258300000001}},
+        {"base": {"cpuMs": 41.722, "wallMs": 43.055916999999965}, "patch": {"cpuMs": 38.428, "wallMs": 38.96937499999996}},
+        {"patch": {"cpuMs": 37.125, "wallMs": 37.22187500000001}, "base": {"cpuMs": 37.765, "wallMs": 38.124000000000024}},
+        {"base": {"cpuMs": 37.585, "wallMs": 37.860209}, "patch": {"cpuMs": 37.456, "wallMs": 37.88604200000003}},
+        {"patch": {"cpuMs": 38.623, "wallMs": 39.18275}, "base": {"cpuMs": 32.082, "wallMs": 32.377250000000004}},
+        {"base": {"cpuMs": 31.541, "wallMs": 33.36737500000004}, "patch": {"cpuMs": 27.657, "wallMs": 27.770457999999962}},
+        {"patch": {"cpuMs": 27.339, "wallMs": 27.624250000000075}, "base": {"cpuMs": 26.574, "wallMs": 27.117375000000038}},
+        {"base": {"cpuMs": 26.514, "wallMs": 26.747875000000022}, "patch": {"cpuMs": 31.213, "wallMs": 31.323667}},
+        {"patch": {"cpuMs": 29.863, "wallMs": 30.076208000000065}, "base": {"cpuMs": 27.986, "wallMs": 28.934624999999983}},
+        {"base": {"cpuMs": 24.225, "wallMs": 24.338750000000005}, "patch": {"cpuMs": 31.723, "wallMs": 31.860916999999972}}
+      ]
+    },
+    {
+      "bindings": 4,
+      "targetBytes": 230000,
+      "position": "late",
+      "sourceBytes": 229978,
+      "stubBytes": 302,
+      "samples": [
+        {"base": {"cpuMs": 54.097, "wallMs": 54.242875000000026}, "patch": {"cpuMs": 40.217, "wallMs": 40.51104099999998}},
+        {"patch": {"cpuMs": 40.081, "wallMs": 38.7907919999999}, "base": {"cpuMs": 47.539, "wallMs": 46.457708000000025}},
+        {"base": {"cpuMs": 47.849, "wallMs": 47.91479100000004}, "patch": {"cpuMs": 38.97, "wallMs": 37.86849999999981}},
+        {"patch": {"cpuMs": 39.937, "wallMs": 38.927415999999994}, "base": {"cpuMs": 47.23, "wallMs": 47.26800000000003}},
+        {"base": {"cpuMs": 47.195, "wallMs": 47.070291}, "patch": {"cpuMs": 44.869, "wallMs": 35.79254100000003}},
+        {"patch": {"cpuMs": 36.656, "wallMs": 36.69666700000016}, "base": {"cpuMs": 49.176, "wallMs": 49.25387500000011}},
+        {"base": {"cpuMs": 47.79, "wallMs": 47.856624999999894}, "patch": {"cpuMs": 34.645, "wallMs": 34.67508299999986}},
+        {"patch": {"cpuMs": 35.294, "wallMs": 35.3107500000001}, "base": {"cpuMs": 48.558, "wallMs": 48.584749999999985}},
+        {"base": {"cpuMs": 49.164, "wallMs": 49.248333}, "patch": {"cpuMs": 33.866, "wallMs": 33.91729200000009}},
+        {"patch": {"cpuMs": 36.882, "wallMs": 36.98474999999985}, "base": {"cpuMs": 46.531, "wallMs": 46.57641699999999}},
+        {"base": {"cpuMs": 46.869, "wallMs": 46.967332999999826}, "patch": {"cpuMs": 36.732, "wallMs": 36.760583}}
+      ]
+    },
+    {
+      "bindings": 16,
+      "targetBytes": 230000,
+      "position": "late",
+      "sourceBytes": 229987,
+      "stubBytes": 1148,
+      "samples": [
+        {"base": {"cpuMs": 87.864, "wallMs": 87.81729200000018}, "patch": {"cpuMs": 37.229, "wallMs": 37.260750000000144}},
+        {"patch": {"cpuMs": 35.406, "wallMs": 35.49070800000004}, "base": {"cpuMs": 80.752, "wallMs": 80.72841699999981}},
+        {"base": {"cpuMs": 80.879, "wallMs": 81.25029200000017}, "patch": {"cpuMs": 34.496, "wallMs": 34.549875000000156}},
+        {"patch": {"cpuMs": 33.179, "wallMs": 33.15758300000016}, "base": {"cpuMs": 80.324, "wallMs": 80.5233330000001}},
+        {"base": {"cpuMs": 78.233, "wallMs": 78.32516600000008}, "patch": {"cpuMs": 33.411, "wallMs": 33.375082999999904}},
+        {"patch": {"cpuMs": 32.305, "wallMs": 32.360667000000376}, "base": {"cpuMs": 77.382, "wallMs": 77.4753340000002}},
+        {"base": {"cpuMs": 77.993, "wallMs": 78.25358300000016}, "patch": {"cpuMs": 31.316, "wallMs": 31.312583999999788}},
+        {"patch": {"cpuMs": 36.668, "wallMs": 36.69679199999973}, "base": {"cpuMs": 80.104, "wallMs": 80.23708399999987}},
+        {"base": {"cpuMs": 83.837, "wallMs": 79.82566600000018}, "patch": {"cpuMs": 35.405, "wallMs": 35.45420899999999}},
+        {"patch": {"cpuMs": 35.643, "wallMs": 35.598417000000154}, "base": {"cpuMs": 77.619, "wallMs": 73.15374999999995}},
+        {"base": {"cpuMs": 77.745, "wallMs": 78.7503340000003}, "patch": {"cpuMs": 39.469, "wallMs": 39.87700000000041}}
+      ]
+    },
+    {
+      "bindings": 32,
+      "targetBytes": 230000,
+      "position": "late",
+      "sourceBytes": 229989,
+      "stubBytes": 2300,
+      "samples": [
+        {"base": {"cpuMs": 109.649, "wallMs": 110.0799579999998}, "patch": {"cpuMs": 38.471, "wallMs": 38.468417000000045}},
+        {"patch": {"cpuMs": 38.248, "wallMs": 38.272249999999985}, "base": {"cpuMs": 108.365, "wallMs": 108.69725000000017}},
+        {"base": {"cpuMs": 107.936, "wallMs": 108.0480419999999}, "patch": {"cpuMs": 38.059, "wallMs": 38.26800000000003}},
+        {"patch": {"cpuMs": 37.582, "wallMs": 37.74104200000011}, "base": {"cpuMs": 107.233, "wallMs": 107.44195800000034}},
+        {"base": {"cpuMs": 109.386, "wallMs": 109.45737500000041}, "patch": {"cpuMs": 37.836, "wallMs": 37.83604199999991}},
+        {"patch": {"cpuMs": 38.292, "wallMs": 38.31429100000014}, "base": {"cpuMs": 105.662, "wallMs": 105.76237499999979}},
+        {"base": {"cpuMs": 107.352, "wallMs": 107.42083300000013}, "patch": {"cpuMs": 38.314, "wallMs": 38.32858299999998}},
+        {"patch": {"cpuMs": 36.824, "wallMs": 36.83591699999988}, "base": {"cpuMs": 108.478, "wallMs": 108.83091600000034}},
+        {"base": {"cpuMs": 107.074, "wallMs": 107.32666700000027}, "patch": {"cpuMs": 38.3, "wallMs": 38.32216700000026}},
+        {"patch": {"cpuMs": 37.463, "wallMs": 37.482332999999926}, "base": {"cpuMs": 107.295, "wallMs": 107.36066600000049}},
+        {"base": {"cpuMs": 106.197, "wallMs": 106.24741600000016}, "patch": {"cpuMs": 38.347, "wallMs": 38.36699999999928}}
+      ]
+    },
+    {
+      "bindings": 16,
+      "targetBytes": 230000,
+      "position": "early",
+      "sourceBytes": 229987,
+      "stubBytes": 1148,
+      "samples": [
+        {"base": {"cpuMs": 42.676, "wallMs": 42.75495799999953}, "patch": {"cpuMs": 48.946, "wallMs": 39.42224999999962}},
+        {"patch": {"cpuMs": 29.75, "wallMs": 29.875083999999333}, "base": {"cpuMs": 29.721, "wallMs": 29.743540999999823}},
+        {"base": {"cpuMs": 30.835, "wallMs": 30.856832999999824}, "patch": {"cpuMs": 26.425, "wallMs": 26.404374999999163}},
+        {"patch": {"cpuMs": 26.472, "wallMs": 26.490584000000126}, "base": {"cpuMs": 29.382, "wallMs": 29.406541999999718}},
+        {"base": {"cpuMs": 30.016, "wallMs": 29.958582999999635}, "patch": {"cpuMs": 26.439, "wallMs": 26.468041999999514}},
+        {"patch": {"cpuMs": 26.253, "wallMs": 26.274499999999534}, "base": {"cpuMs": 27.306, "wallMs": 27.308874999999716}},
+        {"base": {"cpuMs": 31.522, "wallMs": 31.536707999999635}, "patch": {"cpuMs": 27.888, "wallMs": 27.902333}},
+        {"patch": {"cpuMs": 26.747, "wallMs": 26.74775000000045}, "base": {"cpuMs": 28.524, "wallMs": 28.54150000000027}},
+        {"base": {"cpuMs": 29.873, "wallMs": 29.903166000000056}, "patch": {"cpuMs": 23.689, "wallMs": 23.699125000000095}},
+        {"patch": {"cpuMs": 28.528, "wallMs": 28.536000000000058}, "base": {"cpuMs": 32.078, "wallMs": 32.0987499999992}},
+        {"base": {"cpuMs": 31.819, "wallMs": 31.844082999999955}, "patch": {"cpuMs": 28.301, "wallMs": 28.280125000000226}}
+      ]
+    },
+    {
+      "bindings": 16,
+      "targetBytes": 5000,
+      "position": "late",
+      "sourceBytes": 4992,
+      "stubBytes": 1148,
+      "samples": [
+        {"base": {"cpuMs": 1.884, "wallMs": 1.8839170000001104}, "patch": {"cpuMs": 2.604, "wallMs": 2.614792000000307}},
+        {"patch": {"cpuMs": 3.836, "wallMs": 2.5747919999994338}, "base": {"cpuMs": 2.023, "wallMs": 1.9822089999997843}},
+        {"base": {"cpuMs": 1.718, "wallMs": 1.7217089999994641}, "patch": {"cpuMs": 2.366, "wallMs": 2.37145800000053}},
+        {"patch": {"cpuMs": 2.324, "wallMs": 2.3233340000006137}, "base": {"cpuMs": 1.777, "wallMs": 1.777541000000383}},
+        {"base": {"cpuMs": 1.929, "wallMs": 1.8892919999998412}, "patch": {"cpuMs": 2.36, "wallMs": 2.3601669999998194}},
+        {"patch": {"cpuMs": 3.562, "wallMs": 2.3517910000000484}, "base": {"cpuMs": 1.729, "wallMs": 1.7318330000007336}},
+        {"base": {"cpuMs": 1.913, "wallMs": 1.8422920000002705}, "patch": {"cpuMs": 2.362, "wallMs": 2.3623749999997017}},
+        {"patch": {"cpuMs": 2.338, "wallMs": 2.3379580000000715}, "base": {"cpuMs": 1.843, "wallMs": 1.7567920000001322}},
+        {"base": {"cpuMs": 1.974, "wallMs": 1.8938749999997526}, "patch": {"cpuMs": 3.683, "wallMs": 2.462792000000263}},
+        {"patch": {"cpuMs": 1.652, "wallMs": 1.6526669999993828}, "base": {"cpuMs": 1.757, "wallMs": 1.7561669999995502}},
+        {"base": {"cpuMs": 1.754, "wallMs": 1.7541249999994761}, "patch": {"cpuMs": 2.609, "wallMs": 1.849500000000262}}
+      ]
+    },
+    {
+      "bindings": 16,
+      "targetBytes": 230000,
+      "position": "late",
+      "variant": "prefix",
+      "sourceBytes": 229988,
+      "stubBytes": 1148,
+      "samples": [
+        {"base": {"cpuMs": 104.943, "wallMs": 105.05025000000023}, "patch": {"cpuMs": 42.201, "wallMs": 42.22504099999969}},
+        {"patch": {"cpuMs": 36.641, "wallMs": 36.616790999999466}, "base": {"cpuMs": 94.516, "wallMs": 94.61887500000012}},
+        {"base": {"cpuMs": 94.932, "wallMs": 95.02470799999992}, "patch": {"cpuMs": 35.924, "wallMs": 35.93149999999969}},
+        {"patch": {"cpuMs": 36.536, "wallMs": 36.59937499999978}, "base": {"cpuMs": 95.554, "wallMs": 95.65645799999947}},
+        {"base": {"cpuMs": 96.336, "wallMs": 96.4217920000001}, "patch": {"cpuMs": 36.872, "wallMs": 36.90245899999991}},
+        {"patch": {"cpuMs": 36.321, "wallMs": 36.336207999999715}, "base": {"cpuMs": 95.326, "wallMs": 95.69037500000013}},
+        {"base": {"cpuMs": 97.706, "wallMs": 99.25858400000016}, "patch": {"cpuMs": 37.158, "wallMs": 37.24033299999974}},
+        {"patch": {"cpuMs": 39.414, "wallMs": 39.504541000000245}, "base": {"cpuMs": 94.375, "wallMs": 94.5942500000001}},
+        {"base": {"cpuMs": 95.211, "wallMs": 95.37929199999962}, "patch": {"cpuMs": 36.755, "wallMs": 36.7660420000002}},
+        {"patch": {"cpuMs": 39.571, "wallMs": 39.568459000000075}, "base": {"cpuMs": 95.522, "wallMs": 95.62737500000003}},
+        {"base": {"cpuMs": 93.825, "wallMs": 93.87316699999974}, "patch": {"cpuMs": 34.532, "wallMs": 34.61554200000046}}
+      ]
+    },
+    {
+      "bindings": 16,
+      "targetBytes": 230000,
+      "position": "late",
+      "variant": "unused",
+      "sourceBytes": 229986,
+      "stubBytes": 25,
+      "samples": [
+        {"base": {"cpuMs": 91.252, "wallMs": 86.7604169999995}, "patch": {"cpuMs": 48.663, "wallMs": 48.69629199999963}},
+        {"patch": {"cpuMs": 54.063, "wallMs": 44.48895900000025}, "base": {"cpuMs": 73.539, "wallMs": 73.52145799999926}},
+        {"base": {"cpuMs": 70.794, "wallMs": 70.83500000000004}, "patch": {"cpuMs": 36.929, "wallMs": 36.95966700000008}},
+        {"patch": {"cpuMs": 36.788, "wallMs": 36.81195800000023}, "base": {"cpuMs": 73.322, "wallMs": 73.37374999999975}},
+        {"base": {"cpuMs": 73.399, "wallMs": 73.456459}, "patch": {"cpuMs": 36.799, "wallMs": 36.93262500000037}},
+        {"patch": {"cpuMs": 35.173, "wallMs": 35.19366700000046}, "base": {"cpuMs": 71.921, "wallMs": 71.97933300000022}},
+        {"base": {"cpuMs": 70.495, "wallMs": 70.48679100000027}, "patch": {"cpuMs": 36.894, "wallMs": 36.91279200000008}},
+        {"patch": {"cpuMs": 36.97, "wallMs": 36.98783300000014}, "base": {"cpuMs": 69.91, "wallMs": 69.95933299999979}},
+        {"base": {"cpuMs": 70.051, "wallMs": 70.08575000000019}, "patch": {"cpuMs": 37.003, "wallMs": 37.01850000000013}},
+        {"patch": {"cpuMs": 36.917, "wallMs": 36.942541999999776}, "base": {"cpuMs": 70.043, "wallMs": 70.07408299999952}},
+        {"base": {"cpuMs": 71.554, "wallMs": 71.6058750000002}, "patch": {"cpuMs": 36.903, "wallMs": 36.91400000000067}}
+      ]
+    },
+    {
+      "bindings": 65,
+      "targetBytes": 230000,
+      "position": "late",
+      "sourceBytes": 229991,
+      "stubBytes": 4676,
+      "samples": [
+        {"base": {"cpuMs": 183.05, "wallMs": 183.14095799999996}, "patch": {"cpuMs": 184.171, "wallMs": 184.58945900000072}},
+        {"patch": {"cpuMs": 179.163, "wallMs": 181.19404199999917}, "base": {"cpuMs": 172.323, "wallMs": 172.38112499999988}},
+        {"base": {"cpuMs": 170.903, "wallMs": 171.00670900000114}, "patch": {"cpuMs": 177.338, "wallMs": 177.61283300000105}},
+        {"patch": {"cpuMs": 176.648, "wallMs": 177.12737500000003}, "base": {"cpuMs": 180.133, "wallMs": 181.63787500000035}},
+        {"base": {"cpuMs": 176.588, "wallMs": 177.1432079999995}, "patch": {"cpuMs": 175.412, "wallMs": 175.51608400000077}},
+        {"patch": {"cpuMs": 175.626, "wallMs": 175.87620799999968}, "base": {"cpuMs": 172.228, "wallMs": 172.29079099999944}},
+        {"base": {"cpuMs": 173.001, "wallMs": 173.13641599999937}, "patch": {"cpuMs": 179.186, "wallMs": 179.40658299999996}},
+        {"patch": {"cpuMs": 178.663, "wallMs": 179.16849999999977}, "base": {"cpuMs": 174.88, "wallMs": 175.00708300000042}},
+        {"base": {"cpuMs": 171.97, "wallMs": 172.13824999999997}, "patch": {"cpuMs": 177.485, "wallMs": 177.78420899999946}},
+        {"patch": {"cpuMs": 175.912, "wallMs": 176.07974999999897}, "base": {"cpuMs": 172.396, "wallMs": 172.56233299999985}},
+        {"base": {"cpuMs": 169.779, "wallMs": 169.8858339999988}, "patch": {"cpuMs": 173.961, "wallMs": 174.04574999999932}}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,179 @@
+{
+  "browser": "Chrome/158.0.8127.89",
+  "loadStart": [3.31201171875, 4.54248046875, 4.30908203125],
+  "sampling": "11 alternating variant pairs, 100 calls/sample, five warmups per call, Chrome V8 compact-only; no GPU",
+  "cases": [
+    {
+      "n": 0,
+      "size": 230000,
+      "last": true,
+      "variant": "normal",
+      "samples": [
+        {"base": 33.235000014305115, "patch": 31.040000021457672, "sourceLength": 229983, "stubLength": 25},
+        {"base": 27.560000002384186, "patch": 26.100000023841858, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.48499995470047, "patch": 26.2950000166893, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.2049999833107, "patch": 26.30999994277954, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.225000023841858, "patch": 26.209999978542328, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.51500004529953, "patch": 26.49500000476837, "sourceLength": 229983, "stubLength": 25},
+        {"base": 28.4099999666214, "patch": 26.814999997615814, "sourceLength": 229983, "stubLength": 25},
+        {"base": 30.185000002384186, "patch": 26.884999990463257, "sourceLength": 229983, "stubLength": 25},
+        {"base": 27.4549999833107, "patch": 26.555000007152557, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.805000007152557, "patch": 26.75, "sourceLength": 229983, "stubLength": 25},
+        {"base": 26.649999976158142, "patch": 26.530000030994415, "sourceLength": 229983, "stubLength": 25}
+      ]
+    },
+    {
+      "n": 4,
+      "size": 230000,
+      "last": true,
+      "variant": "normal",
+      "samples": [
+        {"base": 44.61500000953674, "patch": 36.110000014305115, "sourceLength": 229978, "stubLength": 302},
+        {"base": 44.5900000333786, "patch": 37.24000000953674, "sourceLength": 229978, "stubLength": 302},
+        {"base": 44.33500003814697, "patch": 35.730000019073486, "sourceLength": 229978, "stubLength": 302},
+        {"base": 40.6599999666214, "patch": 35.185000002384186, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.685000002384186, "patch": 35.87000000476837, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.85499995946884, "patch": 31.644999980926514, "sourceLength": 229978, "stubLength": 302},
+        {"base": 39.01500004529953, "patch": 31.360000014305115, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.88000005483627, "patch": 31.560000002384186, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.31999999284744, "patch": 31.05000001192093, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.644999980926514, "patch": 30.980000019073486, "sourceLength": 229978, "stubLength": 302},
+        {"base": 38.42500001192093, "patch": 31.05000001192093, "sourceLength": 229978, "stubLength": 302}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 230000,
+      "last": true,
+      "variant": "normal",
+      "samples": [
+        {"base": 70.29999995231628, "patch": 32.17500001192093, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.7849999666214, "patch": 32.36500000953674, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.40500003099442, "patch": 32.185000002384186, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.85499995946884, "patch": 31.855000019073486, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.75499999523163, "patch": 32.485000014305115, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.75, "patch": 31.985000014305115, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 71.59499996900558, "patch": 32.02000004053116, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.97500002384186, "patch": 32, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.44999998807907, "patch": 32.19499999284744, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 70.48000001907349, "patch": 32.25499999523163, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 69.5799999833107, "patch": 31.87999999523163, "sourceLength": 229987, "stubLength": 1148}
+      ]
+    },
+    {
+      "n": 32,
+      "size": 230000,
+      "last": true,
+      "variant": "normal",
+      "samples": [
+        {"base": 103, "patch": 32.72999995946884, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.39999997615814, "patch": 32.6599999666214, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 102.56499999761581, "patch": 32.85000002384186, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.46000003814697, "patch": 32.62000000476837, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 100.96999996900558, "patch": 33.01500004529953, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.93999999761581, "patch": 32.575000047683716, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.84499996900558, "patch": 32.730000019073486, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 102.33500003814697, "patch": 32.625, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 104.09499996900558, "patch": 33.19499999284744, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.81999999284744, "patch": 33.52499997615814, "sourceLength": 229989, "stubLength": 2300},
+        {"base": 103.5450000166893, "patch": 33.58499997854233, "sourceLength": 229989, "stubLength": 2300}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 230000,
+      "last": false,
+      "variant": "normal",
+      "samples": [
+        {"base": 26.235000014305115, "patch": 30.7399999499321, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.594999969005585, "patch": 26.49500000476837, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.205000042915344, "patch": 26.34500002861023, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.900000035762787, "patch": 26.594999969005585, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.384999990463257, "patch": 26.325000047683716, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.344999969005585, "patch": 26.685000002384186, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.335000038146973, "patch": 26.400000035762787, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.4200000166893, "patch": 26.37999999523163, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.350000023841858, "patch": 26.450000047683716, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.51500004529953, "patch": 27.07499998807907, "sourceLength": 229987, "stubLength": 1148},
+        {"base": 26.494999945163727, "patch": 27.50499999523163, "sourceLength": 229987, "stubLength": 1148}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 5000,
+      "last": true,
+      "variant": "normal",
+      "samples": [
+        {"base": 1.6200000047683716, "patch": 1.925000011920929, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.649999976158142, "patch": 2.034999966621399, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5449999570846558, "patch": 1.9200000166893005, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.6100000143051147, "patch": 2.0199999809265137, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5649999976158142, "patch": 1.9200000166893005, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.574999988079071, "patch": 2.0700000524520874, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.550000011920929, "patch": 1.590000033378601, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5099999904632568, "patch": 1.5850000381469727, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5600000023841858, "patch": 1.550000011920929, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.574999988079071, "patch": 1.5049999952316284, "sourceLength": 4992, "stubLength": 1148},
+        {"base": 1.5250000357627869, "patch": 1.5950000286102295, "sourceLength": 4992, "stubLength": 1148}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 230000,
+      "last": true,
+      "variant": "prefix",
+      "samples": [
+        {"base": 91.64999997615814, "patch": 33.764999985694885, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 92.46000003814697, "patch": 33.94999998807907, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 91.44499999284744, "patch": 33.95999997854233, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 91.50499999523163, "patch": 33.605000019073486, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 90.55500000715256, "patch": 33.72000002861023, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 90.30500000715256, "patch": 33.72499996423721, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 91.29000002145767, "patch": 33.7049999833107, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 90.88999998569489, "patch": 33.30500000715256, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 90.53000003099442, "patch": 33.41500002145767, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 90.31000000238419, "patch": 33.19499999284744, "sourceLength": 229988, "stubLength": 1148},
+        {"base": 91.18000000715256, "patch": 33.39999997615814, "sourceLength": 229988, "stubLength": 1148}
+      ]
+    },
+    {
+      "n": 16,
+      "size": 230000,
+      "last": true,
+      "variant": "unused",
+      "samples": [
+        {"base": 73.4650000333786, "patch": 36.62000000476837, "sourceLength": 229986, "stubLength": 25},
+        {"base": 70.76999998092651, "patch": 31.649999976158142, "sourceLength": 229986, "stubLength": 25},
+        {"base": 69.74000000953674, "patch": 31.555000007152557, "sourceLength": 229986, "stubLength": 25},
+        {"base": 71.23000001907349, "patch": 31.394999980926514, "sourceLength": 229986, "stubLength": 25},
+        {"base": 69.92500001192093, "patch": 31.430000007152557, "sourceLength": 229986, "stubLength": 25},
+        {"base": 70.15499997138977, "patch": 31.360000014305115, "sourceLength": 229986, "stubLength": 25},
+        {"base": 69.56999999284744, "patch": 31.464999973773956, "sourceLength": 229986, "stubLength": 25},
+        {"base": 70.85999995470047, "patch": 31.580000042915344, "sourceLength": 229986, "stubLength": 25},
+        {"base": 69.60000002384186, "patch": 32.105000019073486, "sourceLength": 229986, "stubLength": 25},
+        {"base": 69.26499998569489, "patch": 32.31999999284744, "sourceLength": 229986, "stubLength": 25},
+        {"base": 69.51999998092651, "patch": 31.69999998807907, "sourceLength": 229986, "stubLength": 25}
+      ]
+    },
+    {
+      "n": 65,
+      "size": 230000,
+      "last": true,
+      "variant": "normal",
+      "samples": [
+        {"base": 170.62999999523163, "patch": 171.44499999284744, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 174.92500001192093, "patch": 171.19499999284744, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 174.60000002384186, "patch": 168.41000002622604, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 175.27999997138977, "patch": 171.77999997138977, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 175.78500002622604, "patch": 172.48500001430511, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 173.78000003099442, "patch": 172.5600000023842, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 175.56999999284744, "patch": 173.34499996900558, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 171.24500000476837, "patch": 173.9350000023842, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 175.67500001192093, "patch": 173.9099999666214, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 176.71000003814697, "patch": 173.1500000357628, "sourceLength": 229991, "stubLength": 4676},
+        {"base": 174.75, "patch": 174.0199999809265, "sourceLength": 229991, "stubLength": 4676}
+      ]
+    }
+  ],
+  "loadEnd": [3.5166015625, 4.54150390625, 4.31103515625]
+}
