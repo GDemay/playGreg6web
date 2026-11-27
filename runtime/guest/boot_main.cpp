@@ -1195,6 +1195,8 @@ void write_outputs(bool print_summary) {
                      static_cast<unsigned long long>(heap.total_allocs),
                      static_cast<unsigned long long>(heap.total_frees));
     }
+    // A title load that waits on a status entry that never completes shows up here.
+    std::fprintf(stderr, "[harness] dstorage state: %s\n", os::scarlett::guest_api::dstorage_debug_state().c_str());
     if (!g_options.audio_dump.empty() || g_options.audio_out) {
         playgta6::os::audio_downmix::set_stereo_sink(nullptr, nullptr);
         g_audio_dump.close();
