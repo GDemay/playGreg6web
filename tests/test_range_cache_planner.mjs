@@ -39,8 +39,13 @@ test('coalescing accounting matches containment across oversized overlapping spa
     { path: 'a', offset: 2 ** 54, length: 1 }, { path: 'a', offset: 2 ** 54, length: 2 },
     { path: 'a', offset: 0, length: Number.MAX_SAFE_INTEGER },
   ];
-  for (const limit of [10, 1000, Number.MAX_SAFE_INTEGER]) {
-    assert.deepEqual(cache._planCoalescedSpans(raw, 10, limit), reference(cache, raw, 10, limit));
+  const padding = Array.from({ length: 140 }, (_, i) => ({
+    path: 'padding', offset: Math.floor(i / 2) * 100000 + i % 2, length: 20,
+  }));
+  for (const entries of [raw, [...raw, ...padding]]) {
+    for (const limit of [10, 1000, Number.MAX_SAFE_INTEGER]) {
+      assert.deepEqual(cache._planCoalescedSpans(entries, 10, limit), reference(cache, entries, 10, limit));
+    }
   }
 });
 
@@ -56,4 +61,20 @@ test('coalescing accounting matches the original planner for shuffled randomized
     const limit = 1 + random(15000);
     assert.deepEqual(cache._planCoalescedSpans(raw, gap, limit), reference(cache, raw, gap, limit));
   }
+});
+
+test('direct and indexed accounting preserve results around manifest and span thresholds', () => {
+  const cache = new RangeCache({ chunkSize: 257, fetchFn: async () => { throw Error('no fetch'); } });
+  for (const entries of [128, 129, 256]) {
+    for (const spans of [1, 4, 5]) {
+      const raw = Array.from({ length: entries }, (_, i) => ({
+        path: 'a', offset: (i % spans) * 100000 + Math.floor(i / spans) * 2, length: 100,
+      })).reverse();
+      const actual = cache._planCoalescedSpans(raw, 10, 10000);
+      assert.equal(actual.length, spans);
+      assert.deepEqual(actual, reference(cache, raw, 10, 10000));
+    }
+  }
+  const singletons = Array.from({ length: 129 }, (_, i) => ({ path: 'a', offset: i * 1000, length: 1 }));
+  assert.deepEqual(cache._planCoalescedSpans(singletons, 0, 10), reference(cache, singletons, 0, 10));
 });
