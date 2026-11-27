@@ -19,6 +19,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -9027,6 +9028,39 @@ void test_xbox_presentx_color_space_and_planes() {
         // B8G8R8X8_UNORM as an overlay forces opaque alpha (ignores undefined X bits).
         const auto bgrx_overlay = xb::classify_present_plane_color(88 /* B8G8R8X8_UNORM */, 0, false, true);
         CHECK(bgrx_overlay.opaque_alpha && bgrx_overlay.needs_color_compositor);
+
+        // Base-plane (is_overlay_plane == false) HDR10 / scRGB / linear RGBA8 / sRGB planes
+        // always force opaque_alpha = true even when their DXGI format carries an alpha channel;
+        // blended overlay planes (is_overlay_plane == true) preserve opaque_alpha = false unless XRGB.
+        CHECK(hdr10.opaque_alpha);
+        CHECK(scrgb.opaque_alpha);
+        CHECK(linear10.opaque_alpha);
+        CHECK(srgb_rgba.opaque_alpha);
+        const auto linear_rgba8_base =
+            xb::classify_present_plane_color(28 /* R8G8B8A8_UNORM */, static_cast<uint32_t>(CS::RgbFullG10NoneP709),
+                                             /*has_sub_rect=*/false, /*is_overlay_plane=*/false);
+        CHECK(linear_rgba8_base.opaque_alpha && linear_rgba8_base.needs_color_compositor);
+
+        const auto hdr10_overlay =
+            xb::classify_present_plane_color(24 /* R10G10B10A2_UNORM */, static_cast<uint32_t>(CS::RgbFullG2084NoneP2020),
+                                             /*has_sub_rect=*/false, /*is_overlay_plane=*/true);
+        CHECK(!hdr10_overlay.opaque_alpha && hdr10_overlay.needs_color_compositor);
+        const auto scrgb_overlay =
+            xb::classify_present_plane_color(10 /* R16G16B16A16_FLOAT */, 0,
+                                             /*has_sub_rect=*/false, /*is_overlay_plane=*/true);
+        CHECK(!scrgb_overlay.opaque_alpha && scrgb_overlay.needs_color_compositor);
+        const auto linear_rgba8_overlay =
+            xb::classify_present_plane_color(28 /* R8G8B8A8_UNORM */, static_cast<uint32_t>(CS::RgbFullG10NoneP709),
+                                             /*has_sub_rect=*/false, /*is_overlay_plane=*/true);
+        CHECK(!linear_rgba8_overlay.opaque_alpha && linear_rgba8_overlay.needs_color_compositor);
+        const auto srgb_rgba_overlay =
+            xb::classify_present_plane_color(29 /* R8G8B8A8_UNORM_SRGB */, 0,
+                                             /*has_sub_rect=*/false, /*is_overlay_plane=*/true);
+        CHECK(!srgb_rgba_overlay.opaque_alpha && srgb_rgba_overlay.needs_color_compositor);
+        const auto bgrx_srgb_overlay =
+            xb::classify_present_plane_color(93 /* B8G8R8X8_UNORM_SRGB */, 0,
+                                             /*has_sub_rect=*/false, /*is_overlay_plane=*/true);
+        CHECK(bgrx_srgb_overlay.opaque_alpha && bgrx_srgb_overlay.needs_color_compositor);
     }
 
     // 2) End-to-end PresentX command-stream verification:
@@ -9166,6 +9200,161 @@ void test_xbox_presentx_color_space_and_planes() {
 
     CHECK(t_balanced);
     scene.release_all({srgb_rt, hdr10_rt, fp16_rt});
+}
+
+// Regression test for bottom-plane alpha-zero HDR/linear blackout in color-managed PresentX:
+// the bottom-most plane (k == 0, !blended) must always emit the opaque_alpha=true fragment shader
+// (ignoring guest alpha == 0.0) even for alpha-bearing formats (R16G16B16A16_FLOAT, R10G10B10A2_UNORM,
+// R8G8B8A8_UNORM), while blended overlay planes (k > 0) must keep opaque_alpha=false unless XRGB.
+void test_xbox_presentx_base_plane_opaque_alpha() {
+    namespace xb = dg::xbox;
+    using CS = xb::PresentColorSpace;
+
+    Fixture fx;
+    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+    const uint64_t immediate_params = put<uint32_t>(1);
+
+    const uint64_t fp16_rt = committed(fx, scene.device, 1, texture_desc(64, 64, 10, 1), 4);    // R16G16B16A16_FLOAT
+    const uint64_t hdr10_rt = committed(fx, scene.device, 1, texture_desc(64, 64, 24, 1), 4);   // R10G10B10A2_UNORM
+    const uint64_t rgba8_rt = committed(fx, scene.device, 1, texture_desc(64, 64, 28, 1), 4);   // R8G8B8A8_UNORM
+    const uint64_t bgrx8_rt = committed(fx, scene.device, 1, texture_desc(64, 64, 88, 1), 4);   // B8G8R8X8_UNORM
+
+    std::unordered_map<uint32_t, std::string> shaders;
+    std::unordered_map<uint32_t, GpuCreateRenderPipeline2Payload> pipelines;
+    auto ingest_packets = [&](const std::vector<Packet>& ps) {
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::CreateShaderModule && p.payload.size() > sizeof(GpuCreateShaderModulePayload)) {
+                const auto hdr = payload_as<GpuCreateShaderModulePayload>(p);
+                shaders[hdr.id] = std::string(
+                    reinterpret_cast<const char*>(p.payload.data() + sizeof(GpuCreateShaderModulePayload)),
+                    p.payload.size() - sizeof(GpuCreateShaderModulePayload));
+            } else if (p.opcode == GpuOpcode::CreateRenderPipeline2 &&
+                       p.payload.size() >= sizeof(GpuCreateRenderPipeline2Payload)) {
+                const auto pl = payload_as<GpuCreateRenderPipeline2Payload>(p);
+                pipelines[pl.id] = pl;
+            }
+        }
+    };
+    auto draw_pipelines = [](const std::vector<Packet>& ps) {
+        std::vector<uint32_t> out;
+        uint32_t current = 0;
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::SetPipeline) {
+                current = payload_as<GpuSetPipelinePayload>(p).pipeline_id;
+            } else if (p.opcode == GpuOpcode::Draw) {
+                out.push_back(current);
+            }
+        }
+        return out;
+    };
+
+    // 1) Multi-plane: blended linear RGBA8 overlay (plane 0, k == 1) over scRGB FP16 base (plane 1, k == 0).
+    {
+        const uint64_t slots = put_bytes(std::array<uint64_t, 2>{rgba8_rt, fp16_rt}.data(), 16);
+        xb::GuestPresentPlaneX planes[2] = {};
+        planes[0].Token = 1;
+        planes[0].ResourceCount = 1;
+        planes[0].ppResources = slots;
+        planes[0].ColorSpace = static_cast<uint32_t>(CS::RgbFullG10NoneP709);
+        planes[1].Token = 1;
+        planes[1].ResourceCount = 1;
+        planes[1].ppResources = slots + 8;
+        planes[1].ColorSpace = static_cast<uint32_t>(CS::RgbFullG10NoneP709);
+
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX,
+                          {I(2), I(put_bytes(planes, sizeof(planes))), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        ingest_packets(ps);
+        const auto draws = draw_pipelines(ps);
+        CHECK(draws.size() == 2);
+        if (draws.size() == 2) {
+            const auto& base_pl = pipelines.at(draws[0]);
+            const auto& overlay_pl = pipelines.at(draws[1]);
+            const std::string& base_fs = shaders.at(base_pl.fs_module_id);
+            const std::string& overlay_fs = shaders.at(overlay_pl.fs_module_id);
+
+            // Base plane (k == 0): unblended, opaque_alpha=true (no a <= 1e-5 blackout).
+            CHECK(base_pl.key.color_targets[0].blend_enabled == 0);
+            CHECK(base_fs.find("return vec4<f32>(convert_rgb(c.rgb), 1.0);") != std::string::npos);
+            CHECK(base_fs.find("a <= 1e-5") == std::string::npos);
+
+            // Overlay plane (k == 1): blended, opaque_alpha=false (preserves alpha compositing).
+            CHECK(overlay_pl.key.color_targets[0].blend_enabled == 1);
+            CHECK(overlay_fs.find("a <= 1e-5") != std::string::npos);
+            CHECK(overlay_fs.find("convert_rgb(c.rgb / a) * a") != std::string::npos);
+        }
+    }
+
+    // 2) Multi-plane: blended XRGB overlay (plane 0, k == 1) over HDR10 PQ base (plane 1, k == 0).
+    //    Both must use opaque_alpha=true (base because k == 0, overlay because B8G8R8X8 has no alpha).
+    {
+        const uint64_t slots = put_bytes(std::array<uint64_t, 2>{bgrx8_rt, hdr10_rt}.data(), 16);
+        xb::GuestPresentPlaneX planes[2] = {};
+        planes[0].Token = 2;
+        planes[0].ResourceCount = 1;
+        planes[0].ppResources = slots;
+        planes[0].ColorSpace = static_cast<uint32_t>(CS::RgbFullG10NoneP709);
+        planes[1].Token = 2;
+        planes[1].ResourceCount = 1;
+        planes[1].ppResources = slots + 8;
+        planes[1].ColorSpace = static_cast<uint32_t>(CS::RgbFullG2084NoneP2020);
+
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX,
+                          {I(2), I(put_bytes(planes, sizeof(planes))), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        ingest_packets(ps);
+        const auto draws = draw_pipelines(ps);
+        CHECK(draws.size() == 2);
+        if (draws.size() == 2) {
+            const auto& base_pl = pipelines.at(draws[0]);
+            const auto& overlay_pl = pipelines.at(draws[1]);
+            const std::string& base_fs = shaders.at(base_pl.fs_module_id);
+            const std::string& overlay_fs = shaders.at(overlay_pl.fs_module_id);
+
+            CHECK(base_pl.key.color_targets[0].blend_enabled == 0);
+            CHECK(base_fs.find("pq_to_linear_sdr") != std::string::npos);
+            CHECK(base_fs.find("return vec4<f32>(convert_rgb(c.rgb), 1.0);") != std::string::npos);
+            CHECK(base_fs.find("a <= 1e-5") == std::string::npos);
+
+            CHECK(overlay_pl.key.color_targets[0].blend_enabled == 1);
+            CHECK(overlay_fs.find("return vec4<f32>(convert_rgb(c.rgb), 1.0);") != std::string::npos);
+            CHECK(overlay_fs.find("a <= 1e-5") == std::string::npos);
+        }
+    }
+
+    // 3) Defensive guard when a lower guest plane is missing/skipped: plane 0 was classified with
+    //    is_overlay=true (plan.opaque_alpha == false), yet becomes order[0] (k == 0, !blended) in
+    //    emit_color_managed_present_planes and must still force opaque_alpha=true.
+    {
+        const uint64_t slot = put<uint64_t>(rgba8_rt);
+        xb::GuestPresentPlaneX planes[2] = {};
+        planes[0].Token = 3;
+        planes[0].ResourceCount = 1;
+        planes[0].ppResources = slot;
+        planes[0].ColorSpace = static_cast<uint32_t>(CS::RgbFullG10NoneP709);
+        planes[1].Token = 3;
+        planes[1].ResourceCount = 0;  // skipped lower plane
+
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX,
+                          {I(2), I(put_bytes(planes, sizeof(planes))), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        ingest_packets(ps);
+        const auto draws = draw_pipelines(ps);
+        CHECK(draws.size() == 1);
+        if (draws.size() == 1) {
+            const auto& base_pl = pipelines.at(draws[0]);
+            const std::string& base_fs = shaders.at(base_pl.fs_module_id);
+            CHECK(base_pl.key.color_targets[0].blend_enabled == 0);
+            CHECK(base_fs.find("return vec4<f32>(convert_rgb(c.rgb), 1.0);") != std::string::npos);
+            CHECK(base_fs.find("a <= 1e-5") == std::string::npos);
+        }
+    }
+
+    CHECK(t_balanced);
+    scene.release_all({fp16_rt, hdr10_rt, rgba8_rt, bgrx8_rt});
 }
 
 // #1963: native CPU-visible buffers and relocated uniform ranges are flushed from the OS write
@@ -9607,6 +9796,7 @@ int main() {
     test_g79_resolve_subresource_msaa();
     test_xbox_wait_frame_event_no_2fps_stall();
     test_xbox_presentx_color_space_and_planes();
+    test_xbox_presentx_base_plane_opaque_alpha();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;
