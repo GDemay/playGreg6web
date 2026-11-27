@@ -13,6 +13,7 @@
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/pipeline_prewarm.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/small_texture_pool.h"
 #include "gpu/stage_reflection.h"
 #include "guest/boot.h"
 #include "guest/program_loader.h"
@@ -411,6 +412,14 @@ private:
     os::HttpfsMailboxClient* previous_ = nullptr;
     bool installed_ = false;
     std::unique_ptr<os::HttpfsMailboxClient> client_;
+};
+
+// The bundled browser worker implements ClearTexture (opcode 63). Enable its
+// producer path only for this boot, preserving the embedding host's prior mode.
+struct ScopedGpuTextureClear {
+    bool previous = gpu::gpu_texture_clear();
+    ScopedGpuTextureClear() { gpu::set_gpu_texture_clear(true); }
+    ~ScopedGpuTextureClear() { gpu::set_gpu_texture_clear(previous); }
 };
 
 struct ScopedDeviceOptions {
@@ -924,6 +933,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
         return load_file_via_httpfs(cfg, path, out, error);
     });
     os::win32::reset_relaunch_request();
+    ScopedGpuTextureClear gpu_texture_clear_guard;
     const guest::BootResult boot = guest::run_boot(program_boot.config);
     if (auto dev = gpu::d3d12_xs_exports::current_device()) {
         if (!dump_dir.empty()) {
@@ -1035,6 +1045,7 @@ WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg) {
     }
     boot_cfg.command_line = with_title_args("game.exe", cfg.title_args);
     os::win32::reset_relaunch_request();
+    ScopedGpuTextureClear gpu_texture_clear_guard;
     const guest::BootResult boot = guest::run_boot(boot_cfg);
     result.ok = boot.status == guest::BootStatus::Exited;
     result.exit_code = boot.stats.exit_code;

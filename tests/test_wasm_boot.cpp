@@ -20,6 +20,7 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/small_texture_pool.h"
 #include "guest/boot.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_runtime.h"
@@ -613,10 +614,18 @@ void test_program_boot_full_synthetic_execution() {
 
     g_test_dllmain_ran = false;
     g_test_entry_ran = false;
+    const bool previous_gpu_clear = playgta6::gpu::gpu_texture_clear();
+    playgta6::gpu::set_gpu_texture_clear(false);
+    bool gpu_clear_enabled_in_guest = false;
+    g_test_entry_hook = [&]() { gpu_clear_enabled_in_guest = playgta6::gpu::gpu_texture_clear(); };
 
     playgta6::os::VirtualMemoryArena arena;
     playgta6::os::win32::set_vmem_arena(&arena);
     const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+    g_test_entry_hook = nullptr;
+    CHECK(gpu_clear_enabled_in_guest);
+    CHECK(!playgta6::gpu::gpu_texture_clear());
+    playgta6::gpu::set_gpu_texture_clear(previous_gpu_clear);
     const bool dll_registered = playgta6::os::win32::GetModuleHandleA("helper.dll") == kTestDllBase;
     playgta6::guest::reset_boot();
     playgta6::os::win32::set_vmem_arena(nullptr);

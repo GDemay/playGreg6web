@@ -41,8 +41,8 @@ inline constexpr uint64_t kLargeTexturePoolMaxBytes = 256ull << 20;
 // share of the budget, so parked textures never push live ones into the size cap (texture_budget.h).
 inline constexpr uint32_t kLargeTexturePoolBudgetPercent = 60;
 
-// The GPU consumer zeroes textures itself (kGpuOpcodeClearTexture; the native executor). Off by
-// default: the browser worker does not have the packet yet.
+// The GPU consumer zeroes textures itself (kGpuOpcodeClearTexture). Enabled by live native
+// and browser boots, otherwise off for consumers that do not implement the packet.
 void set_gpu_texture_clear(bool on) noexcept;
 bool gpu_texture_clear() noexcept;
 
