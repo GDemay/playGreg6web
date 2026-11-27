@@ -1360,11 +1360,40 @@ private:
         if (row_pitch < row_bytes || (d > 1 && slice_pitch < uint64_t{row_pitch} * rows)) {
             return com::E_INVALIDARG_HR;
         }
-        std::vector<uint8_t> surface(chain_bytes);
+        // Small non-tail 2D mips occupy a standalone tiled span with the chain's pitch.
+        // Validate the original whole-chain read contract before avoiding its byte copy.
+        // Keep large mips on the faster whole-surface walker, and tails/window/3D unchanged.
+        gfx10::MipPlacement placement{};
+        bool selected_span = false;
+        if (!planar_ && desc_.dimension == 3 && mip > 0 && !guest_window::translated(src) &&
+            !VirtualMemoryArena::DiagnosticReads::active()) {
+            placement = gfx10::mip_placement(td, mip);
+            if (placement.ok && !placement.in_tail && placement.size_bytes <= 256u * 1024u &&
+                placement.size_bytes <= chain_bytes / 16 && placement.macro_block_offset <= chain_bytes &&
+                placement.size_bytes <= chain_bytes - placement.macro_block_offset &&
+                uint64_t{placement.pitch_elements} * g.bytes_per_block <= UINT32_MAX) {
+                const com::GuestRangeView readable(src, chain_bytes);
+                selected_span = readable.data() != nullptr;
+            }  // release the arena lock before reading or detiling
+        }
+        std::vector<uint8_t> surface(selected_span ? placement.size_bytes : chain_bytes);
         std::vector<uint8_t> linear;
-        if (!com::read_guest(src, surface.data(), surface.size()) ||
-            !gfx10::detile_from_surface(td, mip, surface.data(), surface.size(), linear).ok ||
-            linear.size() < size_t{row_bytes} * rows * d) {
+        gfx10::DetileResult decoded{};
+        if (selected_span) {
+            auto standalone = td;
+            standalone.width = w;
+            standalone.height = h;
+            standalone.mip_levels = 1;
+            standalone.pitch_bytes = placement.pitch_elements * g.bytes_per_block;
+            if (!com::read_guest(src + placement.macro_block_offset, surface.data(), surface.size())) {
+                return com::E_INVALIDARG_HR;
+            }
+            decoded = gfx10::detile_subresource(standalone, 0, surface.data(), surface.size(), linear);
+        } else {
+            if (!com::read_guest(src, surface.data(), surface.size())) return com::E_INVALIDARG_HR;
+            decoded = gfx10::detile_from_surface(td, mip, surface.data(), surface.size(), linear);
+        }
+        if (!decoded.ok || linear.size() < size_t{row_bytes} * rows * d) {
             return com::E_INVALIDARG_HR;
         }
         for (uint32_t z = 0; z < d; ++z) {

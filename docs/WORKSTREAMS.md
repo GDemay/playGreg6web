@@ -450,3 +450,6 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 - [x] **Bootset coalescing-accounting CPU cost (#2049)** — `DONE` (GDemay; no game files required).
   - Bound per-span containment accounting to entries starting inside that span, preserving coalescing output and byte-savings counters. Scope: `web/workers/range_cache.js`, focused planner test and synthetic benchmark only; does not change HTTPFS cache-refetch policy or mailbox parallelism tracked by #1015.
+
+- [ ] **Performance #2090 — Selected non-tail XG mip snapshots** — `IN PROGRESS` (@GDemay; GitHub assignment permission unavailable).
+  - Scope: public XG CopyFromSubresource slot 9 avoids full-chain snapshots for validated small non-tail 2D mips, retaining original full-chain access validation and all fallback lanes. Correctness oracle and matched synthetic COM evidence required; real game FPS remains unmeasured. No DirectStorage, XMem, HTTPFS, shader or GPU ABI changes.
