@@ -394,6 +394,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Tracks real guest boot milestones (`PGIM_LOAD` → `TLS_INIT` → `CRT_INITTERM` → `D3D12_CREATE_DEVICE` → `FIRST_PRESENT`) and deduplicates `__playgta6_unimplemented` / unresolved-import traps for HUD & CrashReporter.
 - [x] **W41 — Streaming `PGIM` v1 Guest Image & Shader Bundle Preloader (`web/runtime/pgim_preloader.js`)** — `DONE` (PR #213, closes #195) *(no game files required — disjoint files `web/runtime/pgim_preloader.js`, `tests/test_pgim_preloader.mjs`)*
   - Streams and validates `PGIM` v1 guest images (`R6`/`O10`), `.wgsl.pack` bundles, and S6 reflection manifests via HTTP `206` Range with progress reporting before guest entry.
+- [x] **Performance #2051 — PGIM relocation validation cursor** — `DONE` (#2051, @GDemay) *(synthetic validation; no game files required)*
+
 - [x] **W42 — Browser Local Splash Screen & Live Boot Stage Overlay (`web/ui/splash_overlay.js`)** — `DONE` (PR #223, closes #201) *(no game files required — disjoint files `web/ui/splash_overlay.js`, `tests/test_splash_overlay.mjs`)*
   - Displays the user's own local `ShellVisuals` splash image (`/game/xbs_splash.png`) with live `BootTracer` milestone progress and cross-fades cleanly to WebGPU on `FIRST_PRESENT`.
 - [x] **W43 — Local Server Splash, Shader Pack & PGIM Boot-Bundle Endpoints (`server/serve_local.py`)** — `DONE` (PR #229, closes #216) *(no game files required — disjoint files `server/serve_local.py`, `tests/test_serve_local_boot.py`)*
@@ -438,5 +440,3 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Handles Emscripten 7.0.1 `em-pthread` worker bootstrap and forwards `env.host_*` host-import bindings across worker threads inside `web/loader.js`.
 - [x] **W63 — Fix Inline `detectWasm64` (`address: 'i64'` + `index: 'i64'`) in `web/index.html`** — `DONE` (PR #385, closes #384) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
   - Updates the inline HUD `detectWasm64` probe in `web/index.html` to check `address: 'i64'` with `index: 'i64'` fallback consistently across all browser entrypoints.
-
-- [ ] **Performance #2051 — PGIM relocation validation cursor** — `IN PROGRESS` (#2051, @GDemay) *(synthetic validation; no game files required)*
