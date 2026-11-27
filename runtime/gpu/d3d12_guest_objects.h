@@ -1691,6 +1691,8 @@ enum class Work : size_t {
     DispatchesDroppedByBridge,
     IndirectExecutionsSkipped,
     IndirectExecutionsEmitted,  // G66: draws / indexed draws / dispatches through the clamp pass
+    IndirectVertexIndexArgsSkipped,  // ... signatures changing vertex / index buffer views per command (also counted in ...Skipped)
+    IndirectRootViewArgsSkipped,     // ... signatures setting root CBV / SRV / UAV addresses per command (also counted in ...Skipped)
     TextureUploads,
     TextureSyncViewSkips,    // sync skipped: view-backed range, no page written since the last full check
     TextureSyncViewTracked,  // sync of a wholly view-backed range (skipped or not)

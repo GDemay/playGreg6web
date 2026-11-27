@@ -2692,6 +2692,11 @@ void CommandList::ExecuteIndirect(com::CallContext& ctx) {
     const auto skip = [&](xbox::Counter counter) {
         device_->count(counter);
         count_work(Work::IndirectExecutionsSkipped);
+        if (counter == xbox::Counter::IndirectVertexIndexArgsSkipped) {
+            count_work(Work::IndirectVertexIndexArgsSkipped);
+        } else if (counter == xbox::Counter::IndirectRootViewArgsSkipped) {
+            count_work(Work::IndirectRootViewArgsSkipped);
+        }
         device_->note_skipped_draw();
     };
     auto signature_arg = InterfaceArg<ICommandSignatureHost>::resolve(ctx.int_arg(1));
