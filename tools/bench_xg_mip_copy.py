@@ -4,6 +4,15 @@
 Build identical tests/test_xbox_scarlett_guest.cpp harnesses against baseline and
 patch core libraries. Pass the resulting two binaries, then immutable commit IDs.
 No game files, GPU rendering or browser execution are used.
+
+Reproduce from the PR checkout (replace PATCH with the measured code commit):
+  git worktree add ../mip-base be4c597725345de8005196ef4b60c64b747208ba
+  cp tests/test_xbox_scarlett_guest.cpp ../mip-base/tests/test_xbox_scarlett_guest.cpp
+  cmake -S ../mip-base/runtime -B ../mip-base-build -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_OPUS=ON
+  cmake --build ../mip-base-build --parallel 4 --target test_xbox_scarlett_guest
+  cmake -S runtime -B work/mip-build -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_OPUS=ON
+  cmake --build work/mip-build --parallel 4 --target test_xbox_scarlett_guest
+  python3 tools/bench_xg_mip_copy.py ../mip-base-build/test_xbox_scarlett_guest work/mip-build/test_xbox_scarlett_guest --baseline-commit be4c597725345de8005196ef4b60c64b747208ba --patch-commit PATCH --samples 7 --iterations 3
 """
 import argparse
 import json

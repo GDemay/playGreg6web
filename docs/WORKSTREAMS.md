@@ -180,6 +180,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 ---
 
+- [x] **Performance #2090 — Selected non-tail XG mip snapshots** — `READY FOR REVIEW` (@GDemay; no game files required).
+  - Public XG CopyFromSubresource slot 9 snapshots validated small non-tail 2D mip spans: synthetic 4K RGBA call median 77.506 -> 1.401 ms, exact output/padding parity; unchanged mip0/large/tail/translated controls within 0.56%. Full-chain readability validation and fallback lanes retained. Browser/game FPS and call frequency unmeasured. GitHub assignment permission unavailable; ownership claimed on #2090.
+
 ## Track 3: GPU Command Bridge (`runtime/gpu/` + `web/workers/wgpu_worker.js`, C++20 + JS)
 **Goal:** Translate `d3d12_xs` command lists to binary packets executed on WebGPU.
 
@@ -450,6 +453,3 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 - [x] **Bootset coalescing-accounting CPU cost (#2049)** — `DONE` (GDemay; no game files required).
   - Bound per-span containment accounting to entries starting inside that span, preserving coalescing output and byte-savings counters. Scope: `web/workers/range_cache.js`, focused planner test and synthetic benchmark only; does not change HTTPFS cache-refetch policy or mailbox parallelism tracked by #1015.
-
-- [ ] **Performance #2090 — Selected non-tail XG mip snapshots** — `IN PROGRESS` (@GDemay; GitHub assignment permission unavailable).
-  - Scope: public XG CopyFromSubresource slot 9 avoids full-chain snapshots for validated small non-tail 2D mips, retaining original full-chain access validation and all fallback lanes. Correctness oracle and matched synthetic COM evidence required; real game FPS remains unmeasured. No DirectStorage, XMem, HTTPFS, shader or GPU ABI changes.

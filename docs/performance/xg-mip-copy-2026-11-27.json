@@ -1,0 +1,409 @@
+{
+  "baselineCommit": "be4c597725345de8005196ef4b60c64b747208ba",
+  "measuredPatchCommit": "7e2ec3453372245dbcdd3f4f914de74a07365056",
+  "measurementLane": "synthetic native Linux public XG CopyFromSubresource COM slot 9; no GPU/browser/game execution",
+  "environment": {
+    "system": "Linux",
+    "kernel": "6.8.0-1070-azure",
+    "arch": "x86_64",
+    "vcpus": 4,
+    "memoryBytes": 16770469888,
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "flags": [
+      "CXX_FLAGS = -O3 -DNDEBUG -std=c++20"
+    ],
+    "buildType": "Release",
+    "opus": "ON",
+    "environmentType": "GitHub Codespace",
+    "timingIsolation": "no concurrent builds, tests or benchmarks during matched timing"
+  },
+  "sampling": "separate prebuilt binaries; one untimed invocation per variant/workload; seven alternating A/B samples by default; each invocation constructs identical fixtures and warms one transfer before timing; full output/padding checks outside timing; wall_ms and cpu_ms are totals across iterations (CPU is process user+system)",
+  "primaryMetric": "median elapsed milliseconds per COM call: each raw wall_ms sample is a total across 3 calls",
+  "correctness": "all complete outputs including padding equal the full-chain oracle; every baseline/patch sample has the same synthetic output hash within each workload; baseline and patch complete COM regression suites pass",
+  "snapshotMetadata": "chainBytes and mipSpanBytes are calculated layout metadata, not measured RSS or runtime allocation counters; the validated optimized branch snapshots mipSpanBytes instead of chainBytes",
+  "unmeasured": "real title call frequency, browser/Wasm execution, real assets and game FPS",
+  "cases": [
+    {
+      "workload": "4096 RGBA mip 4",
+      "unchangedControl": false,
+      "width": 4096,
+      "height": 4096,
+      "format": 28,
+      "mips": 13,
+      "mip": 4,
+      "translated": false,
+      "chainBytes": 89481216,
+      "mipSpanBytes": 262144,
+      "inTail": false,
+      "outputBytesIncludingPadding": 265489,
+      "iterationsPerSample": 3,
+      "syntheticOutputHash": "0ecdd378bbbd0af0",
+      "baselineWallMs": [
+        229.403061,
+        234.412101,
+        243.236,
+        231.747888,
+        231.11081,
+        232.641457,
+        232.519349
+      ],
+      "patchWallMs": [
+        4.238131,
+        4.230597,
+        4.150768,
+        7.15745,
+        4.203536,
+        4.13598,
+        4.172308
+      ],
+      "baselineCpuMs": [
+        229.382,
+        234.382,
+        243.08,
+        231.705,
+        231.103,
+        232.621,
+        232.495
+      ],
+      "patchCpuMs": [
+        4.241,
+        4.234,
+        4.153,
+        7.161,
+        4.205,
+        4.138,
+        4.175
+      ]
+    },
+    {
+      "workload": "4096 BC1 mip 4",
+      "unchangedControl": false,
+      "width": 4096,
+      "height": 4096,
+      "format": 71,
+      "mips": 13,
+      "mip": 4,
+      "translated": false,
+      "chainBytes": 11186176,
+      "mipSpanBytes": 32768,
+      "inTail": false,
+      "outputBytesIncludingPadding": 33617,
+      "iterationsPerSample": 3,
+      "syntheticOutputHash": "7b0d82d65cdcbc9c",
+      "baselineWallMs": [
+        7.603362,
+        7.456888,
+        7.385476,
+        7.509738,
+        7.619241,
+        9.811153,
+        7.949008
+      ],
+      "patchWallMs": [
+        0.233466,
+        0.232284,
+        0.233085,
+        0.230671,
+        0.229027,
+        0.233535,
+        0.499452
+      ],
+      "baselineCpuMs": [
+        7.606,
+        7.441,
+        7.388,
+        7.513,
+        7.622,
+        9.718,
+        7.954
+      ],
+      "patchCpuMs": [
+        0.236,
+        0.235,
+        0.236,
+        0.233,
+        0.232,
+        0.236,
+        0.503
+      ]
+    },
+    {
+      "workload": "odd 4093x2163 RGBA mip 4",
+      "unchangedControl": false,
+      "width": 4093,
+      "height": 2163,
+      "format": 28,
+      "mips": 12,
+      "mip": 4,
+      "translated": false,
+      "chainBytes": 47620096,
+      "mipSpanBytes": 163840,
+      "inTail": false,
+      "outputBytesIncludingPadding": 139472,
+      "iterationsPerSample": 3,
+      "syntheticOutputHash": "005ffe451b9f63f8",
+      "baselineWallMs": [
+        125.019475,
+        123.324461,
+        124.676525,
+        123.577062,
+        140.188587,
+        126.411153,
+        121.864987
+      ],
+      "patchWallMs": [
+        2.261331,
+        2.196219,
+        2.1591,
+        2.166253,
+        2.192072,
+        2.186741,
+        3.875203
+      ],
+      "baselineCpuMs": [
+        125.023,
+        123.329,
+        124.681,
+        123.581,
+        138.816,
+        126.415,
+        121.825
+      ],
+      "patchCpuMs": [
+        2.264,
+        2.199,
+        2.162,
+        2.169,
+        2.194,
+        2.189,
+        3.878
+      ]
+    },
+    {
+      "workload": "3840x2160 RGBA mip 0 control",
+      "unchangedControl": true,
+      "width": 3840,
+      "height": 2160,
+      "format": 28,
+      "mips": 12,
+      "mip": 0,
+      "translated": false,
+      "chainBytes": 44658688,
+      "mipSpanBytes": 33423360,
+      "inTail": false,
+      "outputBytesIncludingPadding": 33205697,
+      "iterationsPerSample": 3,
+      "syntheticOutputHash": "77e335af5db34194",
+      "baselineWallMs": [
+        208.713825,
+        209.546752,
+        213.448922,
+        210.797444,
+        210.285749,
+        214.850349,
+        220.322052
+      ],
+      "patchWallMs": [
+        210.822641,
+        208.065965,
+        209.510011,
+        205.60939,
+        213.24627,
+        213.90824,
+        213.038747
+      ],
+      "baselineCpuMs": [
+        208.718,
+        209.519,
+        213.453,
+        210.732,
+        210.29,
+        214.828,
+        220.005
+      ],
+      "patchCpuMs": [
+        210.754,
+        207.995,
+        209.503,
+        205.602,
+        213.042,
+        213.853,
+        213.043
+      ]
+    },
+    {
+      "workload": "4096 RGBA mip 3 above-cap control",
+      "unchangedControl": true,
+      "width": 4096,
+      "height": 4096,
+      "format": 28,
+      "mips": 13,
+      "mip": 3,
+      "translated": false,
+      "chainBytes": 89481216,
+      "mipSpanBytes": 1048576,
+      "inTail": false,
+      "outputBytesIncludingPadding": 1055249,
+      "iterationsPerSample": 3,
+      "syntheticOutputHash": "a7a6ec9a26036299",
+      "baselineWallMs": [
+        228.887299,
+        230.129879,
+        233.219786,
+        231.33082,
+        228.188766,
+        240.951368,
+        236.807893
+      ],
+      "patchWallMs": [
+        224.02359,
+        235.061383,
+        231.789657,
+        236.786073,
+        228.638966,
+        236.150015,
+        232.027791
+      ],
+      "baselineCpuMs": [
+        228.79,
+        230.094,
+        233.224,
+        231.282,
+        228.146,
+        240.955,
+        236.772
+      ],
+      "patchCpuMs": [
+        223.992,
+        235.018,
+        231.756,
+        236.734,
+        228.643,
+        236.144,
+        232.02
+      ]
+    },
+    {
+      "workload": "4096 RGBA tail mip 12 control",
+      "unchangedControl": true,
+      "width": 4096,
+      "height": 4096,
+      "format": 28,
+      "mips": 13,
+      "mip": 12,
+      "translated": false,
+      "chainBytes": 89481216,
+      "mipSpanBytes": 256,
+      "inTail": true,
+      "outputBytesIncludingPadding": 34,
+      "iterationsPerSample": 3,
+      "syntheticOutputHash": "d0ed732f4b02ab35",
+      "baselineWallMs": [
+        233.29702,
+        234.894603,
+        252.716437,
+        232.979818,
+        237.487562,
+        234.599632,
+        236.780364
+      ],
+      "patchWallMs": [
+        233.141901,
+        230.305307,
+        235.56855,
+        232.77729,
+        236.699221,
+        233.588725,
+        237.8455
+      ],
+      "baselineCpuMs": [
+        233.301,
+        234.899,
+        252.646,
+        232.919,
+        237.472,
+        234.591,
+        236.754
+      ],
+      "patchCpuMs": [
+        233.126,
+        230.251,
+        235.573,
+        232.781,
+        236.689,
+        233.594,
+        237.85
+      ]
+    },
+    {
+      "workload": "1024 RGBA translated mip 3 control",
+      "unchangedControl": true,
+      "width": 1024,
+      "height": 1024,
+      "format": 28,
+      "mips": 11,
+      "mip": 3,
+      "translated": true,
+      "chainBytes": 5595136,
+      "mipSpanBytes": 65536,
+      "inTail": false,
+      "outputBytesIncludingPadding": 67217,
+      "iterationsPerSample": 3,
+      "syntheticOutputHash": "ff99dc740fd11cd4",
+      "baselineWallMs": [
+        3.750751,
+        3.778693,
+        5.026813,
+        3.922381,
+        3.807857,
+        3.955353,
+        3.816413
+      ],
+      "patchWallMs": [
+        3.897475,
+        3.770127,
+        3.808368,
+        3.906201,
+        3.752905,
+        4.008292,
+        3.775006
+      ],
+      "baselineCpuMs": [
+        3.752,
+        3.781,
+        5.03,
+        3.925,
+        3.811,
+        3.958,
+        3.819
+      ],
+      "patchCpuMs": [
+        3.9,
+        3.773,
+        3.81,
+        3.909,
+        3.755,
+        4.012,
+        3.777
+      ]
+    }
+  ],
+  "sourceVerification": {
+    "baselineCheckoutHead": "be4c597725345de8005196ef4b60c64b747208ba",
+    "modifiedTrackedPathsAfterPatchBuild": [
+      "runtime/os/xbox_scarlett_guest_input.cpp",
+      "tests/test_xbox_scarlett_guest.cpp"
+    ],
+    "allOtherProductionFilesMatchBaseline": true,
+    "patchedWrapperMatchesMeasuredCommit": true,
+    "identicalBenchmarkHarnessMatchesMeasuredCommit": true,
+    "baselineWrapperSha256": "cbc5b3bb750981e022e3ce06ca28036544f52fd36d637b0ac1566eac2791f0a7",
+    "patchedWrapperSha256": "87d8e328cb7775c29ddce2541cc042b47c097b6382f93560fe8fcfb444eb1297",
+    "harnessSha256": "6e890054aef6dbf32c45af3a64c2d0a89c4176138b896601aad62412a9d0c833",
+    "gfx10DetileSha256": "fd78c08f4ca12c80f144580f7f8bd268ab1b047bc663b799bd000a98d711f106",
+    "baselineBinarySha256": "7e1fdca44fbfe0f7c53847f6ab1f65d10b73197b13e64db5ab38dd84f77553af",
+    "patchBinarySha256": "0d06eefa90ed10ed6e27e01300d0d8e8be32bb4c12bfa597ac58e89f7ce6ab98",
+    "buildProcedure": "reset --hard exact baseline; copy measured harness; build+copy baseline binary; replace only wrapper with measured source; rebuild+copy patch binary; run correctness before matched timing"
+  }
+}
