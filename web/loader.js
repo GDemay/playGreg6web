@@ -2088,7 +2088,7 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     telemetry.gpuStallWarnCount = toNonNegativeInt(gpuStallWarnField.value, 0);
   }
   if (rawDeviceStats) {
-    telemetry.deviceStats = {
+    const cleanDeviceStats = {
       deviceLostCount: toNonNegativeInt(rawDeviceStats.deviceLostCount, 0),
       deviceRecoveredCount: toNonNegativeInt(rawDeviceStats.deviceRecoveredCount, 0),
       lastDeviceLostReason:
@@ -2100,6 +2100,20 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
       replayedResourceCount: toNonNegativeInt(rawDeviceStats.replayedResourceCount, 0),
       replayedBufferWriteCount: toNonNegativeInt(rawDeviceStats.replayedBufferWriteCount, 0),
     };
+    if (
+      rawDeviceStats.replayBindGroupEvictions !== undefined ||
+      rawDeviceStats.replayLogOverflowCount !== undefined
+    ) {
+      cleanDeviceStats.replayBindGroupEvictions = toNonNegativeInt(
+        rawDeviceStats.replayBindGroupEvictions,
+        0,
+      );
+      cleanDeviceStats.replayLogOverflowCount = toNonNegativeInt(
+        rawDeviceStats.replayLogOverflowCount,
+        0,
+      );
+    }
+    telemetry.deviceStats = cleanDeviceStats;
   }
   const rangedPackActiveField = pickTelemetryBoolean(extendedSources, [
     'rangedPackActive',
@@ -9280,6 +9294,28 @@ function createMemfsPipelineDumpSyncer(options = {}) {
             resp.ok !== false &&
             (typeof resp.status !== 'number' || (resp.status >= 200 && resp.status < 300)),
         );
+        // Drain the small JSON response body to EOF so HTTP/1.1 keep-alive returns the TCP
+        // socket to Chrome's idle pool instead of tearing it down on GC and exhausting
+        // Windows's 16,384 ephemeral TCP ports during large pipeline dumps (#663, #1077).
+        if (resp && !resp.bodyUsed) {
+          try {
+            if (typeof resp.arrayBuffer === 'function') {
+              await resp.arrayBuffer();
+            } else if (typeof resp.text === 'function') {
+              await resp.text();
+            } else if (resp.body && typeof resp.body.cancel === 'function') {
+              await resp.body.cancel();
+            }
+          } catch {
+            try {
+              if (resp.body && typeof resp.body.cancel === 'function') {
+                await resp.body.cancel();
+              }
+            } catch {
+              // Ignore response body cleanup errors on aborted or mocked streams.
+            }
+          }
+        }
         if (!ok) {
           uploadErrors += 1;
           failedInPass += 1;

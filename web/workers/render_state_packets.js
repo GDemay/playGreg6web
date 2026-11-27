@@ -4013,6 +4013,7 @@ class RenderStatePackets {
       rtArenaGroup3Binds: 0,
       missingResourceFallbacks: 0,
       bindGroupValidationFallbacks: 0,
+      unknownBindGroupErrors: 0,
       skippedUnboundPassOps: 0,
       skippedInvalidIndirectOps: 0,
       warnings: [],
@@ -4214,6 +4215,7 @@ class RenderStatePackets {
       rtArenaGroup3Binds: this.telemetry.rtArenaGroup3Binds,
       missingResourceFallbacks: this.telemetry.missingResourceFallbacks,
       bindGroupValidationFallbacks: this.telemetry.bindGroupValidationFallbacks,
+      unknownBindGroupErrors: this.telemetry.unknownBindGroupErrors,
       skippedUnboundPassOps: this.telemetry.skippedUnboundPassOps,
       skippedInvalidIndirectOps: this.telemetry.skippedInvalidIndirectOps,
     };
@@ -4260,6 +4262,7 @@ class RenderStatePackets {
       rtArenaGroup3Binds: this.telemetry.rtArenaGroup3Binds,
       missingResourceFallbacks: this.telemetry.missingResourceFallbacks,
       bindGroupValidationFallbacks: this.telemetry.bindGroupValidationFallbacks,
+      unknownBindGroupErrors: this.telemetry.unknownBindGroupErrors,
       skippedUnboundPassOps: this.telemetry.skippedUnboundPassOps,
       skippedInvalidIndirectOps: this.telemetry.skippedInvalidIndirectOps,
       warnings: this.telemetry.warnings.slice(),
@@ -9179,10 +9182,22 @@ class RenderStatePackets {
               `bind group ${id}: createBindGroup threw (${String(err && err.message ? err.message : err)}); retried with all-dummy entries`
             );
           } catch (err2) {
+            if (
+              this.processor &&
+              typeof this.processor._maybeSignalDeviceLostFromError === 'function'
+            ) {
+              this.processor._maybeSignalDeviceLostFromError(err2, 'createBindGroup');
+            }
             this._packetError = `bind group ${id}: ${String(err2 && err2.message ? err2.message : err2)}`;
             return false;
           }
         } else {
+          if (
+            this.processor &&
+            typeof this.processor._maybeSignalDeviceLostFromError === 'function'
+          ) {
+            this.processor._maybeSignalDeviceLostFromError(err, 'createBindGroup');
+          }
           this._packetError = `bind group ${id}: ${String(err && err.message ? err.message : err)}`;
           return false;
         }
@@ -9283,8 +9298,26 @@ class RenderStatePackets {
         _rsInvalidBindGroup: { groupIndex: index, bindGroupId },
         run() {},
       });
+      this.telemetry.unknownBindGroupErrors += 1;
+      const replayEvictions =
+        this.processor && typeof this.processor._replayBindGroupEvictions === 'number'
+          ? this.processor._replayBindGroupEvictions
+          : 0;
+      const replayOverflows =
+        this.processor && typeof this.processor._replayLogOverflowCount === 'number'
+          ? this.processor._replayLogOverflowCount
+          : 0;
+      if (replayEvictions > 0 || replayOverflows > 0) {
+        this._recordTelemetryWarningOnce(
+          `sbg-unknown-after-replay-pressure:${this._cachedDeviceGeneration}`,
+          `SetBindGroup2: unknown bind group ${bindGroupId} observed with replay pressure (bindGroupEvictions=${replayEvictions}, logOverflows=${replayOverflows})`
+        );
+      }
       this._packetError = `unknown bind group ${bindGroupId}`;
       return false;
+    }
+    if (this.processor && typeof this.processor._touchReplayBindGroup === 'function') {
+      this.processor._touchReplayBindGroup(bindGroupId);
     }
     const bindGroupDesc = this.bindGroupDescriptors.get(bindGroupId) || null;
     const layoutRec =
