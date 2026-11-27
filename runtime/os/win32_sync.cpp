@@ -1,4 +1,5 @@
 #include "os/win32_sync.h"
+#include "os/host_sleep.h"
 #include "os/thread_name.h"
 
 #include <algorithm>
@@ -1722,7 +1723,10 @@ uint32_t pg6_win32_wait_for_single_object_ex(Pg6Handle handle,
                                              uint32_t timeout_ms,
                                              int32_t alertable) {
     const playgta6::os::ThreadSpan frame_span(timeout_ms != 0 ? playgta6::os::SpanKind::Wait : playgta6::os::SpanKind::Count);
-    return playgta6::os::win32::WaitForSingleObjectEx(handle, timeout_ms, alertable != 0);
+    const playgta6::os::host_sleep::GuestTimedWait tw(timeout_ms);
+    const uint32_t r = playgta6::os::win32::WaitForSingleObjectEx(handle, timeout_ms, alertable != 0);
+    tw.done(r == playgta6::os::win32::WAIT_TIMEOUT);
+    return r;
 }
 
 uint32_t pg6_win32_wait_for_multiple_objects(uint32_t count,
@@ -1730,7 +1734,10 @@ uint32_t pg6_win32_wait_for_multiple_objects(uint32_t count,
                                              int32_t wait_all,
                                              uint32_t timeout_ms) {
     const playgta6::os::ThreadSpan frame_span(timeout_ms != 0 ? playgta6::os::SpanKind::Wait : playgta6::os::SpanKind::Count);
-    return playgta6::os::win32::WaitForMultipleObjects(count, handles, wait_all != 0, timeout_ms);
+    const playgta6::os::host_sleep::GuestTimedWait tw(timeout_ms);
+    const uint32_t r = playgta6::os::win32::WaitForMultipleObjects(count, handles, wait_all != 0, timeout_ms);
+    tw.done(r == playgta6::os::win32::WAIT_TIMEOUT);
+    return r;
 }
 
 uint32_t pg6_win32_wait_for_multiple_objects_ex(uint32_t count,
@@ -1739,8 +1746,11 @@ uint32_t pg6_win32_wait_for_multiple_objects_ex(uint32_t count,
                                                 uint32_t timeout_ms,
                                                 int32_t alertable) {
     const playgta6::os::ThreadSpan frame_span(timeout_ms != 0 ? playgta6::os::SpanKind::Wait : playgta6::os::SpanKind::Count);
-    return playgta6::os::win32::WaitForMultipleObjectsEx(
+    const playgta6::os::host_sleep::GuestTimedWait tw(timeout_ms);
+    const uint32_t r = playgta6::os::win32::WaitForMultipleObjectsEx(
         count, handles, wait_all != 0, timeout_ms, alertable != 0);
+    tw.done(r == playgta6::os::win32::WAIT_TIMEOUT);
+    return r;
 }
 
 void pg6_win32_initialize_condition_variable(Pg6ConditionVariable* condition_variable) {
@@ -1752,20 +1762,22 @@ int32_t pg6_win32_sleep_condition_variable_srw(Pg6ConditionVariable* condition_v
                                                uint32_t timeout_ms,
                                                uint32_t flags) {
     const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::CondVar);
-    return playgta6::os::win32::SleepConditionVariableSRW(
-               condition_variable, srw_lock, timeout_ms, flags)
-               ? 1
-               : 0;
+    const playgta6::os::host_sleep::GuestTimedWait tw(timeout_ms);
+    const bool ok = playgta6::os::win32::SleepConditionVariableSRW(
+        condition_variable, srw_lock, timeout_ms, flags);
+    tw.done(!ok);  // a failed timed condvar wait is the timeout
+    return ok ? 1 : 0;
 }
 
 int32_t pg6_win32_sleep_condition_variable_cs(Pg6ConditionVariable* condition_variable,
                                               Pg6CriticalSection* critical_section,
                                               uint32_t timeout_ms) {
     const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::CondVar);
-    return playgta6::os::win32::SleepConditionVariableCS(
-               condition_variable, critical_section, timeout_ms)
-               ? 1
-               : 0;
+    const playgta6::os::host_sleep::GuestTimedWait tw(timeout_ms);
+    const bool ok = playgta6::os::win32::SleepConditionVariableCS(
+        condition_variable, critical_section, timeout_ms);
+    tw.done(!ok);  // a failed timed condvar wait is the timeout
+    return ok ? 1 : 0;
 }
 
 void pg6_win32_wake_condition_variable(Pg6ConditionVariable* condition_variable) {

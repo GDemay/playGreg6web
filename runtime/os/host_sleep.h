@@ -7,6 +7,7 @@
 // which ignores the timer tick; elsewhere (and if that timer cannot be created) the standard sleep.
 
 #include <chrono>
+#include <cstdint>
 #include <string>
 
 namespace playgta6::os::host_sleep {
@@ -37,5 +38,29 @@ void record_guest_sleep(std::chrono::steady_clock::duration requested, std::chro
 void reset_guest_sleep_stats();
 // JSON object for the boot report: mode, count, mean/max requested and actual ms, overshoot buckets.
 std::string guest_sleep_stats_json();
+
+// Guest timed waits (WaitForSingleObject[Ex] / WaitForMultipleObjects[Ex] / SleepConditionVariable*) with a
+// finite non-zero timeout, split by outcome. Timed-out waits get the overshoot histogram (actual - requested);
+// signalled waits get count / mean requested / mean actual. Infinite and zero timeouts are not recorded.
+void record_guest_timed_wait(uint32_t requested_ms, std::chrono::steady_clock::duration actual, bool timed_out);
+void reset_guest_timed_wait_stats();
+std::string guest_timed_wait_stats_json();
+
+// Construct before the wait, call done() with the outcome afterwards.
+class GuestTimedWait {
+public:
+    explicit GuestTimedWait(uint32_t timeout_ms)
+        : timeout_ms_(timeout_ms), active_(timeout_ms != 0 && timeout_ms != 0xFFFFFFFFu) {
+        if (active_) t0_ = std::chrono::steady_clock::now();
+    }
+    void done(bool timed_out) const {
+        if (active_) record_guest_timed_wait(timeout_ms_, std::chrono::steady_clock::now() - t0_, timed_out);
+    }
+
+private:
+    uint32_t timeout_ms_;
+    bool active_;
+    std::chrono::steady_clock::time_point t0_{};
+};
 
 }  // namespace playgta6::os::host_sleep
