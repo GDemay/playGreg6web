@@ -16,8 +16,8 @@ const loadAverageStart = os.loadavg();
 const cases = [];
 for (const { size, algorithm, control } of [
   { size: 1024 * 1024, algorithm: 'sha256', control: true },
+  { size: 64 * 1024, algorithm: 'fnv1a64', control: false },
   { size: 1024 * 1024, algorithm: 'fnv1a64', control: false },
-  { size: 16 * 1024 * 1024, algorithm: 'fnv1a64', control: false },
 ]) {
   const bytes = new Uint8Array(size);
   let seed = 12345;
