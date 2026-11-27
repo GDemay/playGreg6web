@@ -149,8 +149,6 @@ if ($busy) {
     Write-Host "[prebuilt] $Dir is in use (pid $($busy.Id -join ',')); new build kept at $tmp. Close the game, then: Rename-Item '$Dir' '$(Split-Path -Leaf $old)'; Rename-Item '$tmp' '$(Split-Path -Leaf $Dir)'; Remove-Item -Recurse -Force '$old'"
     exit 2
 }
-if (Test-Path -LiteralPath $Dir) { Rename-Item -LiteralPath $Dir -NewName (Split-Path -Leaf $old) -ErrorAction Stop }
-try { Rename-Item -LiteralPath $tmp -NewName (Split-Path -Leaf $Dir) -ErrorAction Stop }
-catch { if (Test-Path -LiteralPath $old) { Rename-Item -LiteralPath $old -NewName (Split-Path -Leaf $Dir) -ErrorAction Stop }; throw }
-if (Test-Path -LiteralPath $old) { Remove-Item -Recurse -Force -LiteralPath $old -ErrorAction Stop }
+. (Join-Path $PSScriptRoot "prebuilt_swap.ps1")
+Invoke-PrebuiltSwap -Dir $Dir -Tmp $tmp -Old $old
 Write-Host "[prebuilt] updated $Dir from $commit. Play: `$env:PLAYGTA6_PREBUILT_DIR='$Dir'; .\tools\play_native.ps1 -Prebuilt"
