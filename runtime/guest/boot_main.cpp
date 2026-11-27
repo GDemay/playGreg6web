@@ -319,6 +319,7 @@ struct Options {
     std::vector<playgta6::guest::WatchRange> watch;  // --watch-guest-va <addr>[:len] (repeatable)
     bool present_honor_interval = false;  // --present-interval honor|min1 (default min1)
     bool test_stall = false;  // --test-stall: test seam, the boot thread hangs once the boot is active
+    bool test_stall_report = false;  // --test-stall-report: also hang the report path (exit backstop, 2 s)
     bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
 
@@ -446,6 +447,8 @@ bool parse(int argc, char** argv, Options& o) {
             }
         } else if (a == "--test-stall") {
             o.test_stall = true;
+        } else if (a == "--test-stall-report") {  // implies --test-stall
+            o.test_stall = o.test_stall_report = true;
         } else if (a == "--overlay") {
             o.overlay = true;
         } else if (a == "--skip-shader" && i + 1 < argc) {
@@ -1534,7 +1537,7 @@ void start_exit_backstop() {
     guest::minidump::Writer::init();
     const std::string path = guest::minidump::select_path(g_options.report, "host", "report_stuck",
                                                           static_cast<uint32_t>(GetCurrentProcessId()));
-    guest::backstop::start(path.c_str(), kExitWatchdog);
+    guest::backstop::start(path.c_str(), kExitWatchdog, g_options.test_stall_report ? 2000 : 30000);
 }
 
 void arm_exit_backstop(int code) { guest::backstop::arm(code); }
@@ -1854,6 +1857,9 @@ void start_watchdog() {
     std::thread([] {
         std::this_thread::sleep_for(std::chrono::milliseconds(g_options.watchdog_ms));
         arm_exit_backstop(kExitWatchdog);
+        if (g_options.test_stall_report) {  // tests/test_boot_watchdog_e2e.cpp: only the backstop can end this
+            for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+        }
 #ifdef _WIN32
         // First, before touching any runtime state (a hang may hold any lock): every thread's
         // stack on stderr and a dump of all threads, both written by the helper process.
