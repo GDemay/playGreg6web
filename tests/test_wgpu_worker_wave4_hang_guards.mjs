@@ -22,6 +22,7 @@ const {
   DEFAULT_MAX_CONCURRENT_SHADER_COMPILES,
   DEFAULT_SHADER_COMPILE_SLICE_BUDGET_MS,
   DEFAULT_MAX_PENDING_RANGED_PIPELINES,
+  DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES,
   OPCODES,
   SHADER_STAGE,
   BUFFER_USAGE,
@@ -412,7 +413,7 @@ const SMALL_CS_WGSL = '@compute @workgroup_size(1, 1, 1) fn cs_main() {}\n';
 // ---------------------------------------------------------------------------
 
 test('Wave-4 #1: oversized WGSL shaders never reach device.createShaderModule, route to safe fallback, and surface oversizedWgslFallbacks telemetry', async () => {
-  assert.equal(DEFAULT_MAX_WGSL_COMPILE_BYTES, 1024 * 1024);
+  assert.equal(DEFAULT_MAX_WGSL_COMPILE_BYTES, 256 * 1024);
 
   const oversizedCode = `@fragment fn fs_main() -> @location(0) vec4<f32> {\n// ${'x'.repeat(2048)}\nreturn vec4<f32>(1.0);\n}`;
   assert.ok(oversizedCode.length > 1024);
@@ -610,13 +611,14 @@ test('Wave-4 #2: compactWgslForMetadata runs in linear O(N) time on 512 KB WGSL 
 });
 
 // ---------------------------------------------------------------------------
-// 3. Bounded/time-sliced createShaderModule concurrency + deferred fallback PSO + 4096 pending cap
+// 3. Bounded/time-sliced createShaderModule concurrency + deferred fallback PSO + 2048 pending cap
 // ---------------------------------------------------------------------------
 
-test('Wave-4 #3a: ranged createShaderModule compilation caps concurrency at maxConcurrentShaderCompiles=2 and yields on >=8ms slices', async () => {
-  assert.equal(DEFAULT_MAX_CONCURRENT_SHADER_COMPILES, 2);
+test('Wave-4 #3a: ranged createShaderModule compilation caps concurrency at maxConcurrentShaderCompiles=1 (configurable) and yields on >=8ms slices', async () => {
+  assert.equal(DEFAULT_MAX_CONCURRENT_SHADER_COMPILES, 1);
   assert.equal(DEFAULT_SHADER_COMPILE_SLICE_BUDGET_MS, 8);
-  assert.equal(DEFAULT_MAX_PENDING_RANGED_PIPELINES, 4096);
+  assert.equal(DEFAULT_MAX_PENDING_RANGED_PIPELINES, 2048);
+  assert.equal(DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES, 2);
 
   const count = 8;
   const entries = [];
@@ -630,7 +632,7 @@ test('Wave-4 #3a: ranged createShaderModule compilation caps concurrency at maxC
   const packBuf = buildWgslPackBuffer(entries);
   const dataStart = 16 + count * 20;
 
-  // Part A: deferred getCompilationInfo() verifies hard concurrency cap = 2.
+  // Part A: deferred getCompilationInfo() verifies default hard concurrency cap = 1.
   const netA = createSyntheticRangePackServer(packBuf, { dataStartOffset: dataStart });
   const mockA = createMockWebGpu({ deferCompilationInfo: true });
   const procA = new WgpuCommandProcessor(mockA.device, mockA.ctx, {
@@ -649,14 +651,14 @@ test('Wave-4 #3a: ranged createShaderModule compilation caps concurrency at maxC
 
   // Wait for HTTP fetches to complete and enqueue compile jobs.
   await new Promise((r) => setTimeout(r, 15));
-  assert.equal(mockA.shaderModulesCreated.length, 2, 'At most 2 concurrent createShaderModule calls active');
-  assert.equal(procA.getStats().activeRangedShaderCompiles, 2);
-  assert.equal(procA.getStats().peakConcurrentRangedShaderCompiles, 2);
+  assert.equal(mockA.shaderModulesCreated.length, 1, 'At most 1 concurrent createShaderModule call active by default');
+  assert.equal(procA.getStats().activeRangedShaderCompiles, 1);
+  assert.equal(procA.getStats().peakConcurrentRangedShaderCompiles, 1);
 
-  // Drain compilation info resolvers step-by-step and verify concurrency never exceeds 2.
+  // Drain compilation info resolvers step-by-step and verify concurrency never exceeds 1.
   while (mockA.compilationInfoResolvers.length > 0 || procA.asyncShaderPendingCount > 0) {
     assert.ok(
-      procA.getStats().activeRangedShaderCompiles <= 2,
+      procA.getStats().activeRangedShaderCompiles <= 1,
       `Active compiles exceeded cap: ${procA.getStats().activeRangedShaderCompiles}`
     );
     const next = mockA.compilationInfoResolvers.shift();
@@ -668,7 +670,7 @@ test('Wave-4 #3a: ranged createShaderModule compilation caps concurrency at maxC
   await procA.flushPendingRangedShaders();
 
   assert.equal(mockA.shaderModulesCreated.length, count);
-  assert.equal(procA.getStats().peakConcurrentRangedShaderCompiles, 2);
+  assert.equal(procA.getStats().peakConcurrentRangedShaderCompiles, 1);
   assert.equal(procA.getStats().activeRangedShaderCompiles, 0);
   assert.equal(procA.getStats().rangedShaderReady, count);
   procA.destroy();
@@ -706,7 +708,7 @@ test('Wave-4 #3a: ranged createShaderModule compilation caps concurrency at maxC
   procB.destroy();
 });
 
-test('Wave-4 #3b: ranged index match defers throwaway builtin fallback PSO compilation (1 pipeline/PSO, not 2) and _pendingRangedPipelines cap is 4096', async () => {
+test('Wave-4 #3b: ranged index match defers throwaway builtin fallback PSO compilation (1 pipeline/PSO, not 2) and _pendingRangedPipelines cap is 2048', async () => {
   const vsHash = wgpkFormatHashHex(wgpkFnv1a64(SMALL_VS_WGSL));
   const fsHash = wgpkFormatHashHex(wgpkFnv1a64(SMALL_FS_WGSL));
   const csHash = wgpkFormatHashHex(wgpkFnv1a64(SMALL_CS_WGSL));
@@ -762,26 +764,26 @@ test('Wave-4 #3b: ranged index match defers throwaway builtin fallback PSO compi
   assert.equal(proc.isAsyncPipelinePending(20), true);
   assert.equal(proc.isAsyncPipelinePending(30), true);
 
-  // Also test _pendingRangedPipelines cap raised from 2048 to 4096: enqueue 2500 pending pipelines!
+  // Also verify _pendingRangedPipelines default cap is restored to 2048: enqueue 1500 pending pipelines!
   const manyBuilder = new BinaryCommandBuilder();
-  for (let pid = 1000; pid < 3500; pid += 1) {
+  for (let pid = 1000; pid < 2500; pid += 1) {
     manyBuilder.createRenderPipeline(pid, 1, 2, 0);
   }
   proc.executeCommandBuffer(manyBuilder.finish());
   assert.equal(
     proc.getStats().pendingRangedPipelinesCount,
-    2503,
-    'Pending ranged pipelines must exceed old 2048 cap up to 4096'
+    1503,
+    'Pending ranged pipelines retain all entries below 2048 cap'
   );
-  assert.equal(proc.isAsyncPipelinePending(10), true, 'Earliest pending pipeline not evicted at 2503 (< 4096)');
+  assert.equal(proc.isAsyncPipelinePending(10), true, 'Earliest pending pipeline not evicted at 1503 (< 2048)');
 
-  // Now push past 4096 to verify the new 4096 bound evicts oldest cleanly.
+  // Now push past 2048 to verify the 2048 bound evicts oldest cleanly.
   const overflowBuilder = new BinaryCommandBuilder();
-  for (let pid = 3500; pid < 5200; pid += 1) {
+  for (let pid = 2500; pid < 3600; pid += 1) {
     overflowBuilder.createRenderPipeline(pid, 1, 2, 0);
   }
   proc.executeCommandBuffer(overflowBuilder.finish());
-  assert.equal(proc.getStats().pendingRangedPipelinesCount, 4096);
+  assert.equal(proc.getStats().pendingRangedPipelinesCount, 2048);
 
   // Clean up bulk test entries and verify the 3 core PSOs compile exactly once on settle.
   proc._pendingRangedPipelines.clear();
@@ -944,4 +946,346 @@ test('Wave-4 #5: wgsl_pack_loader defaults DEFAULT_MAX_CONCURRENT_RANGE_FETCHES 
   const results = await Promise.all(fetches);
   assert.equal(results.length, count);
   assert.equal(net.peakDataFetches, 3);
+});
+
+// ---------------------------------------------------------------------------
+// 6. Wave-5 (#663, #1077): 256 KiB cap, priority compile queue, global Dawn cap, coalescePresent
+// ---------------------------------------------------------------------------
+
+test('Wave-5 #1: DEFAULT_MAX_WGSL_COMPILE_BYTES (256 KiB) quarantines a 300 KiB shader before _rangedShaderCompileQueue and createShaderModule', async () => {
+  assert.equal(DEFAULT_MAX_WGSL_COMPILE_BYTES, 256 * 1024);
+
+  const wgsl300KiB = `@fragment fn fs_main() -> @location(0) vec4<f32> {\n// ${'a'.repeat(300 * 1024)}\nreturn vec4<f32>(1.0);\n}`;
+  assert.ok(wgsl300KiB.length > 300 * 1024);
+
+  // 1a. Inline 300 KiB shader with default options (enableShaderFallback: false) never reaches createShaderModule.
+  const mockInline = createMockWebGpu({
+    onCreateShaderModule(desc) {
+      assert.ok(
+        desc.code.length <= 256 * 1024,
+        `300 KiB WGSL (${desc.code.length}B) must never reach createShaderModule under default 256 KiB cap`
+      );
+    },
+  });
+  const procInline = new WgpuCommandProcessor(mockInline.device, mockInline.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+  });
+  procInline.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(1, SHADER_STAGE.FRAGMENT, wgsl300KiB)
+      .finish()
+  );
+  assert.equal(mockInline.shaderModulesCreated.length, 0);
+  assert.equal(procInline.validationErrorCount, 0);
+  assert.equal(procInline.getStats().oversizedWgslFallbacks, 1);
+  assert.equal(procInline.getStats().maxWgslCompileBytes, 256 * 1024);
+  procInline.destroy();
+
+  // 1b. Ranged 300 KiB shader without getShaderMetadata is quarantined BEFORE _rangedShaderCompileQueue and createShaderModule.
+  const hugeHash = wgpkFormatHashHex(wgpkFnv1a64(wgsl300KiB));
+  const mockRanged = createMockWebGpu({
+    onCreateShaderModule(desc) {
+      assert.ok(desc.code.length <= 256 * 1024, 'Oversized ranged shader must never reach createShaderModule');
+    },
+  });
+  const procRanged = new WgpuCommandProcessor(mockRanged.device, mockRanged.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+  });
+  let enqueueCalls = 0;
+  const origEnqueue = procRanged._enqueueRangedShaderCompile.bind(procRanged);
+  procRanged._enqueueRangedShaderCompile = (...args) => {
+    enqueueCalls += 1;
+    return origEnqueue(...args);
+  };
+  procRanged.wgslPackCache = {
+    has: (h) => h === hugeHash,
+    getWgslAsync: async () => ({ wgsl: wgsl300KiB, entryPoint: 'fs_main' }),
+  };
+
+  procRanged.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, hugeHash)
+      .finish()
+  );
+  await procRanged.flushPendingRangedShaders();
+
+  assert.equal(enqueueCalls, 0, 'Oversized ranged shader must never enter _rangedShaderCompileQueue');
+  assert.equal(mockRanged.shaderModulesCreated.length, 0);
+  assert.equal(procRanged.validationErrorCount, 0);
+  assert.equal(procRanged.getStats().oversizedWgslFallbacks, 1);
+  procRanged.destroy();
+
+  // 1c. Explicit maxWgslCompileBytes override still permits compiling the 300 KiB shader.
+  const mockOverride = createMockWebGpu();
+  const procOverride = new WgpuCommandProcessor(mockOverride.device, mockOverride.ctx, {
+    format: 'bgra8unorm',
+    maxWgslCompileBytes: 512 * 1024,
+  });
+  procOverride.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(3, SHADER_STAGE.FRAGMENT, wgsl300KiB)
+      .finish()
+  );
+  assert.equal(mockOverride.shaderModulesCreated.length, 1);
+  assert.equal(procOverride.getStats().oversizedWgslFallbacks, 0);
+  procOverride.destroy();
+});
+
+test('Wave-5 #2: _rangedShaderCompileQueue prioritizes graphics over compute and smallest WGSL byte length first (FIFO ties)', async () => {
+  const blockerWgsl = '@vertex fn vs_blocker() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }\n';
+  const bigVsWgsl = `@vertex fn vs_big() -> @builtin(position) vec4<f32> {\n// ${'v'.repeat(200 * 1024)}\nreturn vec4<f32>(0.0);\n}`;
+  const tinyCsWgsl = `@compute @workgroup_size(1) fn cs_tiny() {\n// ${'c'.repeat(2 * 1024)}\n}`;
+  const smallFsWgsl = `@fragment fn fs_small() -> @location(0) vec4<f32> {\n// ${'f'.repeat(4 * 1024)}\nreturn vec4<f32>(1.0);\n}`;
+  const smallVsWgsl = `@vertex fn vs_small() -> @builtin(position) vec4<f32> {\n// ${'s'.repeat(4 * 1024)}\nreturn vec4<f32>(0.0);\n}`;
+  // Pad smallVsWgsl to exact same byte length as smallFsWgsl to verify FIFO tie-breaking.
+  const padDiff = smallFsWgsl.length - smallVsWgsl.length;
+  const tiedVsWgsl = padDiff >= 0 ? smallVsWgsl + ' '.repeat(padDiff) : smallVsWgsl;
+  const tiedFsWgsl = padDiff < 0 ? smallFsWgsl + ' '.repeat(-padDiff) : smallFsWgsl;
+  assert.equal(tiedVsWgsl.length, tiedFsWgsl.length);
+
+  const hashBlocker = wgpkFormatHashHex(wgpkFnv1a64(blockerWgsl));
+  const hashBigVs = wgpkFormatHashHex(wgpkFnv1a64(bigVsWgsl));
+  const hashTinyCs = wgpkFormatHashHex(wgpkFnv1a64(tinyCsWgsl));
+  const hashSmallFs = wgpkFormatHashHex(wgpkFnv1a64(tiedFsWgsl));
+  const hashSmallVs = wgpkFormatHashHex(wgpkFnv1a64(tiedVsWgsl));
+
+  const wgslByHash = new Map([
+    [hashBlocker, { wgsl: blockerWgsl, entryPoint: 'vs_blocker' }],
+    [hashBigVs, { wgsl: bigVsWgsl, entryPoint: 'vs_big' }],
+    [hashTinyCs, { wgsl: tinyCsWgsl, entryPoint: 'cs_tiny' }],
+    [hashSmallFs, { wgsl: tiedFsWgsl, entryPoint: 'fs_small' }],
+    [hashSmallVs, { wgsl: tiedVsWgsl, entryPoint: 'vs_small' }],
+  ]);
+  const fetchResolvers = new Map();
+
+  const compiledOrder = [];
+  const mock = createMockWebGpu({
+    deferCompilationInfo: true,
+    onCreateShaderModule(desc) {
+      const m = /fn\s+([A-Za-z0-9_]+)/.exec(desc.code);
+      compiledOrder.push(m ? m[1] : 'unknown');
+    },
+  });
+  const proc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+  });
+  proc.wgslPackCache = {
+    has: (h) => wgslByHash.has(h),
+    getWgslAsync: (h) =>
+      new Promise((resolve) => {
+        fetchResolvers.set(h, () => resolve(wgslByHash.get(h)));
+      }),
+  };
+
+  proc.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(1, SHADER_STAGE.VERTEX, hashBlocker)
+      .createShaderModule(2, SHADER_STAGE.VERTEX, hashBigVs)
+      .createShaderModule(3, SHADER_STAGE.COMPUTE, hashTinyCs)
+      .createShaderModule(4, SHADER_STAGE.FRAGMENT, hashSmallFs)
+      .createShaderModule(5, SHADER_STAGE.VERTEX, hashSmallVs)
+      .finish()
+  );
+
+  // 1. Occupy the single compile slot with blockerWgsl.
+  fetchResolvers.get(hashBlocker)();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.deepEqual(compiledOrder, ['vs_blocker']);
+  assert.equal(proc.getStats().activeRangedShaderCompiles, 1);
+
+  // 2. Enqueue big 200 KiB VS first, then tiny 2 KiB CS, then small 4 KiB FS, then tied 4 KiB VS.
+  fetchResolvers.get(hashBigVs)();
+  await Promise.resolve();
+  fetchResolvers.get(hashTinyCs)();
+  await Promise.resolve();
+  fetchResolvers.get(hashSmallFs)();
+  await Promise.resolve();
+  fetchResolvers.get(hashSmallVs)();
+  await new Promise((r) => setTimeout(r, 5));
+
+  // Still only blocker active; 4 jobs waiting in priority queue.
+  assert.deepEqual(compiledOrder, ['vs_blocker']);
+  assert.equal(proc._rangedShaderCompileQueue.length, 4);
+
+  // 3. Drain compilation info resolvers one at a time and verify priority order.
+  while (mock.compilationInfoResolvers.length > 0 || proc.asyncShaderPendingCount > 0) {
+    const next = mock.compilationInfoResolvers.shift();
+    if (next) {
+      next();
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  await proc.flushPendingRangedShaders();
+
+  assert.deepEqual(
+    compiledOrder,
+    ['vs_blocker', 'fs_small', 'vs_small', 'vs_big', 'cs_tiny'],
+    '4 KiB fragment must compile ahead of 200 KiB vertex and 2 KiB compute, with FIFO ties'
+  );
+  proc.destroy();
+});
+
+test('Wave-5 #3: ranged shader compile queue yields when AsyncPipelineCache is at capacity and yields between heavy (>64 KiB) compiles', async () => {
+  // Part A: yield while AsyncPipelineCache has active compiles at capacity (default 2).
+  const pipelineResolvers = [];
+  const mock = createMockWebGpu();
+  mock.device.createRenderPipelineAsync = (desc) =>
+    new Promise((resolve) => {
+      pipelineResolvers.push(() =>
+        resolve({
+          kind: 'GPURenderPipeline',
+          desc,
+          getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+        })
+      );
+    });
+
+  const proc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+  });
+  installRenderStatePackets(proc);
+  assert.equal(proc.asyncPipelineCache.maxConcurrentCompiles, 2);
+
+  // Start 2 async render pipelines so AsyncPipelineCache is at full capacity (2/2 in-flight).
+  proc.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(1, SHADER_STAGE.VERTEX, SMALL_VS_WGSL)
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, SMALL_FS_WGSL)
+      .createRenderPipeline2(101, 1, 2, 0)
+      .createRenderPipeline2(102, 1, 2, 0)
+      .finish()
+  );
+  assert.equal(pipelineResolvers.length, 2);
+  assert.equal(mock.shaderModulesCreated.length, 2);
+
+  // Now issue a ranged shader while AsyncPipelineCache is saturated.
+  const rangedFs = '@fragment fn fs_after_pso() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.4, 0.6, 1.0); }\n';
+  const rangedHash = wgpkFormatHashHex(wgpkFnv1a64(rangedFs));
+  proc.wgslPackCache = {
+    has: (h) => h === rangedHash,
+    getWgslAsync: async () => ({ wgsl: rangedFs, entryPoint: 'fs_after_pso' }),
+  };
+
+  proc.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(3, SHADER_STAGE.FRAGMENT, rangedHash)
+      .finish()
+  );
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(
+    mock.shaderModulesCreated.length,
+    2,
+    'Ranged shader compile must yield while AsyncPipelineCache is at capacity (2/2)'
+  );
+  assert.equal(proc._rangedShaderCompileQueue.length, 1);
+
+  // Resolve both async pipelines -> ranged shader compile wakes up and completes!
+  while (pipelineResolvers.length > 0) {
+    pipelineResolvers.shift()();
+  }
+  await proc.asyncPipelineCache.whenIdle();
+  await proc.flushPendingRangedShaders();
+
+  assert.equal(mock.shaderModulesCreated.length, 3);
+  assert.equal(proc.shaderModules.get(3).entryPoint, 'fs_after_pso');
+  proc.destroy();
+
+  // Part B: heavy (>64 KiB) shader compiles force an inter-compile macrotask yield even with slice budget disabled.
+  const heavy1 = `@fragment fn fs_h1() -> @location(0) vec4<f32> {\n// ${'h'.repeat(70 * 1024)}\nreturn vec4<f32>(1.0);\n}`;
+  const heavy2 = `@fragment fn fs_h2() -> @location(0) vec4<f32> {\n// ${'k'.repeat(70 * 1024)}\nreturn vec4<f32>(0.5);\n}`;
+  const h1 = wgpkFormatHashHex(wgpkFnv1a64(heavy1));
+  const h2 = wgpkFormatHashHex(wgpkFnv1a64(heavy2));
+  const mockHeavy = createMockWebGpu();
+  const procHeavy = new WgpuCommandProcessor(mockHeavy.device, mockHeavy.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+    shaderCompileSliceBudgetMs: 0,
+  });
+  procHeavy.wgslPackCache = {
+    has: (h) => h === h1 || h === h2,
+    getWgslAsync: async (h) =>
+      h === h1 ? { wgsl: heavy1, entryPoint: 'fs_h1' } : { wgsl: heavy2, entryPoint: 'fs_h2' },
+  };
+  procHeavy.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(10, SHADER_STAGE.FRAGMENT, h1)
+      .createShaderModule(11, SHADER_STAGE.FRAGMENT, h2)
+      .finish()
+  );
+  await procHeavy.flushPendingRangedShaders();
+  assert.equal(mockHeavy.shaderModulesCreated.length, 2);
+  assert.ok(
+    procHeavy.getStats().rangedShaderCompileYields >= 1,
+    `Expected >= 1 inter-compile macrotask yield for >64 KiB shaders, got ${procHeavy.getStats().rangedShaderCompileYields}`
+  );
+  procHeavy.destroy();
+});
+
+test('Wave-5 #4: handleMessage({ cmdBuffer, coalescePresent: true }) forwards coalescePresents: true into executeCommandBuffer', async () => {
+  // 4a. Spy processor verifies exact option forwarding for singular coalescePresent: true (with and without byteLength).
+  const calls = [];
+  const spyProcessor = {
+    frameCount: 0,
+    executeCommandBuffer(input, opts) {
+      calls.push({ input, opts: opts ? { ...opts } : null });
+      return { frameCount: 1, presents: 1 };
+    },
+  };
+  const posted = [];
+  const spyHandler = createWgpuWorkerHandler({
+    processor: spyProcessor,
+    postMessage: (m) => posted.push(m),
+  });
+  const dummyBuf = new ArrayBuffer(32);
+  await spyHandler.handleMessage({ cmdBuffer: dummyBuf, coalescePresent: true });
+  await spyHandler.handleMessage({ cmdBuffer: dummyBuf, coalescePresents: true });
+  await spyHandler.handleMessage({ cmdBuffer: dummyBuf });
+
+  assert.equal(calls.length, 3);
+  assert.equal(calls[0].opts.coalescePresents, true);
+  assert.equal(calls[1].opts.coalescePresents, true);
+  assert.equal(calls[2].opts.coalescePresents, undefined);
+
+  // 4b. Real WgpuCommandProcessor: 2-Present batch coalesces when coalescePresent: true (both direct-byteLength and plain paths).
+  const mock = createMockWebGpu();
+  const proc = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+  });
+  const realHandler = createWgpuWorkerHandler({
+    processor: proc,
+    postMessage: () => {},
+  });
+
+  const twoFrameBuf = new BinaryCommandBuilder()
+    .beginFrame()
+    .createBuffer(501, 64)
+    .present()
+    .beginFrame()
+    .createBuffer(502, 128)
+    .present()
+    .finish();
+
+  await realHandler.handleMessage({ cmdBuffer: twoFrameBuf, coalescePresent: true });
+  assert.equal(proc.frameCount, 1, 'coalescePresent: true must coalesce the 1st of 2 Presents');
+  assert.equal(mock.currentTextureCalls, 1);
+  assert.equal(proc.getStats().coalescedPresents, 1);
+  assert.equal(proc.buffers.has(501), true);
+  assert.equal(proc.buffers.has(502), true);
+
+  // Also test canPassDirectByteLength path (explicit byteLength + coalescePresent: true).
+  const padded = new ArrayBuffer(twoFrameBuf.byteLength + 64);
+  new Uint8Array(padded, 0, twoFrameBuf.byteLength).set(new Uint8Array(twoFrameBuf));
+  await realHandler.handleMessage({
+    cmdBuffer: padded,
+    byteLength: twoFrameBuf.byteLength,
+    coalescePresent: true,
+  });
+  assert.equal(proc.frameCount, 2);
+  assert.equal(mock.currentTextureCalls, 2);
+  assert.equal(proc.getStats().coalescedPresents, 2);
+  proc.destroy();
 });
