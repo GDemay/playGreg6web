@@ -148,10 +148,15 @@ public:
             return false;
         }
         uint32_t v = 0u;
-        for (uint32_t i = 0u; i < n; ++i) {
+        // The guards above prove the whole request is available. Consume at most
+        // five byte fragments for a 32-bit field, without reading beyond its last byte.
+        for (uint32_t left = n; left != 0;) {
+            const uint32_t available = 8u - (pos_ & 7u);
+            const uint32_t take = std::min(left, available);
             const uint8_t byte = data_[pos_ >> 3u];
-            v = (v << 1u) | ((byte >> (7u - (pos_ & 7u))) & 1u);
-            ++pos_;
+            v = (v << take) | ((byte >> (available - take)) & ((1u << take) - 1u));
+            pos_ += take;
+            left -= take;
         }
         out = v;
         return true;

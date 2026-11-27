@@ -5,6 +5,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <chrono>
+#include <cstdlib>
+#include <ctime>
+#include <string>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1285,7 +1289,73 @@ void test_xapu_opus_lifecycle_and_mixing() {
 
 }  // namespace
 
-int main() {
+// Public decoder API benchmark; fixture encoding and PCM hashing are outside timing.
+int benchmark_wmapro(int argc, char** argv) {
+    if (argc != 6) return 2;
+    const uint32_t n = static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 10));
+    const uint32_t channels = static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 10));
+    const uint32_t frames = static_cast<uint32_t>(std::strtoul(argv[4], nullptr, 10));
+    const std::string kind = argv[5];
+    if ((n != 64 && n != 128 && n != 256 && n != 512) || channels < 1 || channels > 2 ||
+        frames < 1 || frames > 100000 || (kind != "nonzero" && kind != "silence" && kind != "malformed")) return 2;
+    std::array<std::vector<float>, 2> signal;
+    uint32_t seed = 0x4817u;
+    for (uint32_t c = 0; c < channels; ++c) {
+        signal[c].resize(3 * x::kFrameSamples);
+        for (float& v : signal[c]) {
+            seed = seed * 1664525u + 1013904223u;
+            v = static_cast<float>(static_cast<int32_t>(seed >> 16) - 32768) * 0.25f;
+        }
+    }
+    EncodeFrameOpts opts;
+    opts.channels = channels;
+    opts.subframe_lens.assign(x::kFrameSamples / n, n);
+    opts.prev_subframe_len = n;
+    opts.next_frame_first_len = n;
+    opts.exercise_vec_stages = true;
+    const x::Frame frame = kind == "malformed" ? x::Frame{} : encode_wmapro_frame(signal, x::kFrameSamples, opts);
+    auto decoder = kind == "silence" ? x::make_silence_decoder() : x::make_wmapro_decoder();
+    const bool expected_ok = kind == "nonzero";
+    std::vector<int16_t> first(x::kFrameSamples * channels);
+    std::vector<int16_t> pcm(size_t{frames} * x::kFrameSamples * channels);
+    const auto cold_cpu_start = std::clock();
+    const auto cold_start = std::chrono::steady_clock::now();
+    const bool first_ok = decoder->decode(frame, channels, 48000, first.data());
+    const double cold_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - cold_start).count();
+    const double cold_cpu_us = 1000000.0 * (std::clock() - cold_cpu_start) / CLOCKS_PER_SEC;
+    CHECK(first_ok == expected_ok);
+    const auto first_decode_pcm = first;
+    for (int i = 0; i < 3; ++i) CHECK(decoder->decode(frame, channels, 48000, first.data()) == expected_ok);
+    decoder->reset();
+    const auto cpu_start = std::clock();
+    const auto start = std::chrono::steady_clock::now();
+    bool flags_ok = true;
+    for (uint32_t f = 0; f < frames; ++f) {
+        flags_ok = (decoder->decode(frame, channels, 48000, pcm.data() + size_t{f} * x::kFrameSamples * channels) == expected_ok) && flags_ok;
+    }
+    const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const double cpu_ms = 1000.0 * (std::clock() - cpu_start) / CLOCKS_PER_SEC;
+    const auto hash_pcm = [](const std::vector<int16_t>& data) {
+        uint64_t hash = 0xcbf29ce484222325ull;
+        for (int16_t s : data) {
+            hash = (hash ^ static_cast<uint8_t>(s)) * 0x100000001b3ull;
+            hash = (hash ^ static_cast<uint8_t>(static_cast<uint16_t>(s) >> 8)) * 0x100000001b3ull;
+        }
+        return hash;
+    };
+    const bool nonzero = std::any_of(pcm.begin(), pcm.end(), [](int16_t v) { return v != 0; });
+    CHECK(flags_ok && nonzero == expected_ok);
+    std::printf("{\"subframe\":%u,\"channels\":%u,\"frames\":%u,\"kind\":\"%s\",\"decoded_seconds\":%.9f,"
+                "\"wall_ms\":%.6f,\"cpu_ms\":%.6f,\"first_decode_us\":%.6f,\"first_decode_cpu_us\":%.6f,"
+                "\"pcm_hash\":\"%016llx\",\"first_pcm_hash\":\"%016llx\",\"correct\":%s}\n",
+                n, channels, frames, kind.c_str(), static_cast<double>(frames) * x::kFrameSamples / 48000,
+                wall_ms, cpu_ms, cold_us, cold_cpu_us, static_cast<unsigned long long>(hash_pcm(pcm)),
+                static_cast<unsigned long long>(hash_pcm(first_decode_pcm)), g_failures == 0 ? "true" : "false");
+    return g_failures == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench-wmapro") return benchmark_wmapro(argc, argv);
     test_packet_header();
     test_frame_walk();
     test_padding_and_skip();
