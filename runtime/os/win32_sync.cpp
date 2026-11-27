@@ -356,6 +356,7 @@ public:
     void wake_waiters_locked() {
         // Lets a spinning waiter (see wait_for_objects) notice a state change without the lock.
         signal_seq.fetch_add(1, std::memory_order_release);
+        note_signal();
         for (size_t i = 0; i < waiters.size();) {
             WaitBlock* block = waiters[i].block;
             if (!is_signaled_for(block->thread_id)) {
@@ -379,10 +380,16 @@ public:
         }
     }
 
+    // Who signaled last and when (blocked_waits_json): set by every wake_waiters_locked().
+    void note_signal();
+
     const Type type;
     std::mutex lock;
     std::vector<WaiterLink> waiters;  // FIFO
     std::atomic<uint32_t> signal_seq{0};
+    std::atomic<int64_t> last_signal_ns{0};  // steady clock, 0 = never
+    std::atomic<uint32_t> last_signal_tid{0};
+    std::atomic<uint64_t> last_signal_caller{0};
 };
 
 namespace {
@@ -587,6 +594,94 @@ Handle create_mutex(bool initial_owner, std::string_view name) {
         }
         return mutex;
     });
+}
+
+// ---------------------------------------------------------------------------
+// Blocked-wait census: every thread parked in a WaitFor* call, with the state of the objects it
+// waits on (boot report "blocked_waits"). A waiter still parked on an object that is signaled for
+// it is a lost wakeup in this file; an object never signaled during the wait is the title's.
+// ---------------------------------------------------------------------------
+
+int64_t steady_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+}
+
+}  // namespace
+
+void DispatcherObject::note_signal() {
+    last_signal_ns.store(steady_ns(), std::memory_order_relaxed);
+    last_signal_tid.store(current_thread_info().id, std::memory_order_relaxed);
+    const auto caller_fn = g_event_trace_caller.load(std::memory_order_relaxed);
+    last_signal_caller.store(caller_fn != nullptr ? caller_fn() : 0, std::memory_order_relaxed);
+}
+
+namespace {
+
+constexpr uint32_t kCensusObjects = 4;  // objects described per wait (a wait-any/all may have 64)
+
+struct BlockedWait {
+    const WaitBlock* block = nullptr;
+    uint32_t count = 0;
+    bool wait_all = false;
+    uint32_t timeout_ms = 0;
+    int64_t since_ns = 0;
+    std::array<Handle, kCensusObjects> handles{};
+    std::array<std::shared_ptr<DispatcherObject>, kCensusObjects> objects{};
+    std::array<uint32_t, kCensusObjects> seq_at_park{};
+};
+
+struct BlockedWaits {
+    std::mutex mutex;
+    std::unordered_map<uint32_t, BlockedWait> by_thread;  // a thread parks in one wait at a time
+};
+
+BlockedWaits& blocked_waits() {
+    static BlockedWaits* census = new BlockedWaits();  // never destroyed: threads may park at exit
+    return *census;
+}
+
+// Registered right before a waiter parks, removed when it returns; never held with an object lock.
+class ScopedBlockedWait {
+public:
+    ScopedBlockedWait(uint32_t thread_id, const WaitBlock& block, const Handle* handles,
+                      const std::shared_ptr<DispatcherObject>* objects, uint32_t count, bool wait_all,
+                      uint32_t timeout_ms)
+        : thread_id_(thread_id) {
+        BlockedWait w;
+        w.block = &block;
+        w.count = count;
+        w.wait_all = wait_all;
+        w.timeout_ms = timeout_ms;
+        w.since_ns = steady_ns();
+        for (uint32_t i = 0; i < count && i < kCensusObjects; ++i) {
+            w.handles[i] = handles[i];
+            w.objects[i] = objects[i];
+            w.seq_at_park[i] = objects[i]->signal_seq.load(std::memory_order_acquire);
+        }
+        BlockedWaits& census = blocked_waits();
+        std::lock_guard<std::mutex> guard(census.mutex);
+        census.by_thread[thread_id_] = std::move(w);
+    }
+    ~ScopedBlockedWait() {
+        BlockedWaits& census = blocked_waits();
+        std::lock_guard<std::mutex> guard(census.mutex);
+        census.by_thread.erase(thread_id_);
+    }
+    ScopedBlockedWait(const ScopedBlockedWait&) = delete;
+    ScopedBlockedWait& operator=(const ScopedBlockedWait&) = delete;
+
+private:
+    uint32_t thread_id_;
+};
+
+const char* object_type_name(ObjectType type) {
+    switch (type) {
+        case ObjectType::Event: return "event";
+        case ObjectType::Semaphore: return "semaphore";
+        case ObjectType::Mutex: return "mutex";
+        case ObjectType::Thread: return "thread";
+    }
+    return "unknown";
 }
 
 // ---------------------------------------------------------------------------
@@ -803,6 +898,8 @@ uint32_t wait_for_single_object(Handle handle, uint32_t timeout_ms) {
     }
 
     {
+        const std::shared_ptr<DispatcherObject> census_object = object;
+        const ScopedBlockedWait census(thread_id, block, &handle, &census_object, 1, false, timeout_ms);
         std::unique_lock<std::mutex> guard(block.mutex);
         const auto done = [&]() {
             return block.state.load(std::memory_order_acquire) == WaitBlock::kSatisfied;
@@ -827,7 +924,7 @@ uint32_t wait_for_single_object(Handle handle, uint32_t timeout_ms) {
     return block.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0;
 }
 
-uint32_t wait_any(const ObjectArray& objects, uint32_t count, uint32_t thread_id,
+uint32_t wait_any(const ObjectArray& objects, const Handle* handles, uint32_t count, uint32_t thread_id,
                   uint32_t timeout_ms, bool infinite, Clock::time_point deadline) {
     ScopedWaitBlock scoped_block(thread_id, false);
     WaitBlock& block = scoped_block.get();
@@ -858,6 +955,7 @@ uint32_t wait_any(const ObjectArray& objects, uint32_t count, uint32_t thread_id
     }
 
     if (claimed || registered != 0) {
+        const ScopedBlockedWait census(thread_id, block, handles, objects.data(), count, false, timeout_ms);
         std::unique_lock<std::mutex> guard(block.mutex);
         const auto done = [&]() {
             return block.state.load(std::memory_order_acquire) == WaitBlock::kSatisfied;
@@ -881,7 +979,7 @@ uint32_t wait_any(const ObjectArray& objects, uint32_t count, uint32_t thread_id
     return (block.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0) + block.index;
 }
 
-uint32_t wait_all(const ObjectArray& objects, uint32_t count, uint32_t thread_id,
+uint32_t wait_all(const ObjectArray& objects, const Handle* handles, uint32_t count, uint32_t thread_id,
                   uint32_t timeout_ms, bool infinite, Clock::time_point deadline) {
     std::array<uint32_t, MAXIMUM_WAIT_OBJECTS> lock_order{};
     for (uint32_t i = 0; i < count; ++i) {
@@ -916,6 +1014,7 @@ uint32_t wait_all(const ObjectArray& objects, uint32_t count, uint32_t thread_id
             spin_for_signal(objects, count, infinite, deadline);
             continue;
         }
+        const ScopedBlockedWait census(thread_id, block, handles, objects.data(), count, true, timeout_ms);
         std::unique_lock<std::mutex> guard(block.mutex);
         const auto woken = [&]() { return block.wake_seq.load(std::memory_order_acquire) != seen; };
         if (infinite) {
@@ -968,8 +1067,8 @@ uint32_t wait_for_objects(uint32_t count,
     const Clock::time_point deadline =
         (infinite || timeout_ms == 0) ? Clock::time_point::min()
                                       : Clock::now() + std::chrono::milliseconds(timeout_ms);
-    return wait_all_objects ? wait_all(objects, count, thread_id, timeout_ms, infinite, deadline)
-                            : wait_any(objects, count, thread_id, timeout_ms, infinite, deadline);
+    return wait_all_objects ? wait_all(objects, handles, count, thread_id, timeout_ms, infinite, deadline)
+                            : wait_any(objects, handles, count, thread_id, timeout_ms, infinite, deadline);
 }
 
 // ---------------------------------------------------------------------------
@@ -1285,6 +1384,77 @@ Handle CreateEventW(void* security_attributes,
                     const char16_t* name) {
     (void)security_attributes;
     return create_event(manual_reset, initial_state, widen_name(name));
+}
+
+std::string blocked_waits_json(uint32_t min_blocked_ms) {
+    struct Entry {
+        uint32_t thread_id;
+        BlockedWait wait;
+    };
+    std::vector<Entry> entries;
+    {
+        BlockedWaits& census = blocked_waits();
+        std::lock_guard<std::mutex> guard(census.mutex);
+        for (const auto& [tid, w] : census.by_thread) {
+            entries.push_back({tid, w});
+        }
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const Entry& a, const Entry& b) { return a.thread_id < b.thread_id; });
+    const int64_t now = steady_ns();
+    std::string o = "[";
+    bool first = true;
+    char buf[512];
+    for (const Entry& e : entries) {
+        const BlockedWait& w = e.wait;
+        const double blocked_ms = static_cast<double>(now - w.since_ns) / 1e6;
+        if (blocked_ms < static_cast<double>(min_blocked_ms)) {
+            continue;
+        }
+        std::snprintf(buf, sizeof(buf),
+                      "%s\n    {\"thread_id\": %u, \"blocked_ms\": %.1f, \"timeout_ms\": %d, \"wait_all\": %s, "
+                      "\"handle_count\": %u, \"objects\": [",
+                      first ? "" : ",", e.thread_id, blocked_ms, static_cast<int32_t>(w.timeout_ms),
+                      w.wait_all ? "true" : "false", w.count);
+        o += buf;
+        first = false;
+        for (uint32_t i = 0; i < w.count && i < kCensusObjects; ++i) {
+            DispatcherObject& object = *w.objects[i];
+            bool signaled_for_waiter = false;
+            bool queued = false;
+            size_t queue = 0;
+            int64_t state = 0;  // event: signaled, semaphore: count, mutex: owner, thread: exited
+            {
+                std::lock_guard<std::mutex> guard(object.lock);
+                signaled_for_waiter = object.is_signaled_for(e.thread_id);
+                queue = object.waiters.size();
+                queued = std::any_of(object.waiters.begin(), object.waiters.end(),
+                                     [&](const WaiterLink& link) { return link.block == w.block; });
+                switch (object.type) {
+                    case ObjectType::Event: state = static_cast<EventObject&>(object).signaled ? 1 : 0; break;
+                    case ObjectType::Semaphore: state = static_cast<SemaphoreObject&>(object).count; break;
+                    case ObjectType::Mutex: state = static_cast<MutexObject&>(object).owner; break;
+                    case ObjectType::Thread: state = static_cast<ThreadObject&>(object).exited ? 1 : 0; break;
+                }
+            }
+            const uint32_t signals = object.signal_seq.load(std::memory_order_acquire) - w.seq_at_park[i];
+            const int64_t last_ns = object.last_signal_ns.load(std::memory_order_relaxed);
+            const double last_ago_ms = last_ns != 0 ? static_cast<double>(now - last_ns) / 1e6 : -1.0;
+            std::snprintf(buf, sizeof(buf),
+                          "%s{\"handle\": \"0x%" PRIx64 "\", \"type\": \"%s\", \"state\": %" PRId64
+                          ", \"signaled_for_waiter\": %s, \"queued\": %s, \"queue\": %zu, "
+                          "\"signals_during_wait\": %u, \"last_signal_ms_ago\": %.1f, \"last_signal_tid\": %u, "
+                          "\"last_signal_caller\": \"0x%" PRIx64 "\"}",
+                          i == 0 ? "" : ", ", static_cast<uint64_t>(w.handles[i]), object_type_name(object.type),
+                          state, signaled_for_waiter ? "true" : "false", queued ? "true" : "false", queue, signals,
+                          last_ago_ms, object.last_signal_tid.load(std::memory_order_relaxed),
+                          object.last_signal_caller.load(std::memory_order_relaxed));
+            o += buf;
+        }
+        o += "]}";
+    }
+    o += first ? "]" : "\n  ]";
+    return o;
 }
 
 bool SetEvent(Handle event_handle) {
