@@ -1163,17 +1163,13 @@ void persist_auto_quarantine(const std::vector<uint64_t>& failed) {
     static size_t written = 0;
     if (g_options.auto_quarantine.empty() || failed.size() <= written) return;
     written = failed.size();
-    std::string existing;
-    {
-        std::ifstream f(g_options.auto_quarantine, std::ios::binary);
-        if (f) existing.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    }
-    const std::string out = playgta6::gpu::native_exec::ShaderQuarantine::merge_auto_file(existing, failed);
-    if (out.empty()) return;
-    std::ofstream o(g_options.auto_quarantine, std::ios::binary | std::ios::trunc);
-    o << out;
-    std::fprintf(stderr, "auto-quarantine: %zu failed pipeline hash(es) recorded in %s\n", failed.size(),
-                 g_options.auto_quarantine.c_str());
+    const int r = playgta6::gpu::native_exec::ShaderQuarantine::persist_auto_file(g_options.auto_quarantine, failed);
+    if (r > 0)
+        std::fprintf(stderr, "auto-quarantine: %zu failed pipeline hash(es) recorded in %s\n", failed.size(),
+                     g_options.auto_quarantine.c_str());
+    else if (r < 0)
+        std::fprintf(stderr, "auto-quarantine: cannot write %s (failed hashes are not recorded)\n",
+                     g_options.auto_quarantine.c_str());
 }
 
 // Window title on the pump thread, about 4 times a second: fps, frames presented, draws per frame
