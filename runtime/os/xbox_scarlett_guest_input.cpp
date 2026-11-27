@@ -965,7 +965,11 @@ public:
     // passes element coordinates (for BC formats it divides texel coordinates by 4 itself). Tiled
     // and console linear layouts use the GFX10 address the detiler and CopyIntoSubresource use;
     // other layouts the host computer's linear mips. Elements are whole bytes: *bitOffset = 0.
-    // UINT64_MAX for an invalid plane, mip or coordinate.
+    // UINT64_MAX for an invalid plane, mip or coordinate. Backlog item 15 suggested 0 instead; kept
+    // as UINT64_MAX because the only evidence found points that way: the sibling
+    // GetMipLevelOffsetBytes returns ~0 for bad input, OpenScarlett's XG shim returns UINT64_MAX
+    // here, and no public/GDK text or title call-site evidence supports 0 (0 is also a valid
+    // offset, so it could not signal failure). Revisit only with a title call site that depends on 0.
     uint64_t GetTexelElementOffsetBytes(uint32_t plane, uint32_t mip, uint64_t x, uint32_t y, uint32_t z,
                                         uint32_t /*sample*/, GuestPtr<uint32_t> bit_offset) {
         if (!bit_offset.is_null()) {
