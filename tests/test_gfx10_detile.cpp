@@ -737,6 +737,24 @@ void verify_element_offsets(TextureLayoutDesc desc, uint32_t layers, uint32_t se
     CHECK(surface_element_offset(desc, desc.mip_levels, 0u, 0u, 0u) == UINT64_MAX);
 }
 
+void test_contiguous_run_edges() {
+    // Odd widths and tail X placements exercise partial/unaligned copy runs. The reference
+    // computes each source element separately, rather than sharing the tile/detile walker.
+    uint32_t seed = 18000;
+    for (uint32_t format : {61u, 56u, 28u, 10u, 2u, 71u, 98u}) {
+        for (uint32_t mode : {1u, 2u, 3u, 5u, 6u, 7u, 9u, 10u, 11u, 25u, 26u, 27u}) {
+            TextureLayoutDesc desc{format, 67u, 35u, 1u, 7u, 0x100u | mode, 0u};
+            desc.pipe_bank_xor = 0xA5;
+            verify_element_offsets(desc, 2u, seed++);
+        }
+    }
+    for (uint32_t format : {61u, 56u, 28u}) {
+        TextureLayoutDesc desc{format, 33u, 19u, 17u, 6u, 0x105u, 0u};
+        desc.pipe_bank_xor = 0xA5;
+        verify_element_offsets(desc, 1u, seed++);
+    }
+}
+
 void test_element_offsets() {
     verify_element_offsets({28u, 64u, 64u, 1u, 7u, 0x101u, 0u}, 2u, 14100u);    // 256B_S RGBA8
     verify_element_offsets({28u, 64u, 32u, 1u, 7u, 0x102u, 0u}, 1u, 14200u);    // 256B_D
@@ -1274,6 +1292,7 @@ int main() {
     test_subresource_round_trips();
     test_tail_coordinates();
     test_element_offsets();
+    test_contiguous_run_edges();
     test_linear_subresources();
     test_linear_custom_pitch();
     test_bounds_and_error_rejection();
