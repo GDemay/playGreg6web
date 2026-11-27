@@ -2,7 +2,8 @@
 // cmake -S runtime -B work/build -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release
 // cmake --build work/build --config Release --target bench_buffer_shadows
 // bench_buffer_shadows BUFFERS FLUSHES DIRTY_BUFFERS PATTERN
-// PATTERN: sparse-first, sparse-resident, dense-first (FLUSHES=1), dense-resident
+// PATTERN: sparse-first, sparse-resident (first page warm), sparse-fully-resident,
+// dense-first (FLUSHES=1), dense-resident
 #include "gpu/d3d12_guest_resources.h"
 #include "guest/com_bridge.h"
 #include "os/vmem.h"
@@ -50,7 +51,9 @@ int main(int argc, char** argv) {
     const size_t frames = std::strtoull(argv[2], nullptr, 0);
     const size_t dirty = std::strtoull(argv[3], nullptr, 0);
     const bool dense = std::strncmp(argv[4], "dense-", 6) == 0;
-    const bool resident = std::strcmp(argv[4], "sparse-resident") == 0 || std::strcmp(argv[4], "dense-resident") == 0;
+    const bool fully_resident_sparse = std::strcmp(argv[4], "sparse-fully-resident") == 0;
+    const bool resident = fully_resident_sparse || std::strcmp(argv[4], "sparse-resident") == 0 || std::strcmp(argv[4], "dense-resident") == 0;
+    const bool warm_all_pages = dense || fully_resident_sparse;
     const bool known = resident || std::strcmp(argv[4], "sparse-first") == 0 || std::strcmp(argv[4], "dense-first") == 0;
     if (!known || !count || !frames || dirty > count || (dense && !resident && frames != 1)) return 2;
     try {
@@ -77,7 +80,7 @@ int main(int argc, char** argv) {
         std::unordered_map<uint32_t, size_t> ids;
         std::vector<uint8_t> zero(bytes, 0);
         if (resident) {
-            for (size_t page = 0; page < (dense ? 12u : 1u); ++page) zero[page * page_bytes] = 0xA5;
+            for (size_t page = 0; page < (warm_all_pages ? 12u : 1u); ++page) zero[page * page_bytes] = 0xA5;
         }
         for (size_t i = 0; i < count; ++i) {
             const uint64_t va = mem + (i + i / 20) * gran;
@@ -108,7 +111,7 @@ int main(int argc, char** argv) {
         for (const auto& r : resources) resident_before += r->shadow_resident_bytes();
         std::vector<std::array<uint32_t, 12>> expected(count);
         if (resident) for (auto& words : expected)
-            for (size_t page = 0; page < (dense ? 12u : 1u); ++page) words[page] = 0xA5;
+            for (size_t page = 0; page < (warm_all_pages ? 12u : 1u); ++page) words[page] = 0xA5;
         std::vector<size_t> selected(count, SIZE_MAX);
         uint64_t digest = 0xcbf29ce484222325ull, writes = 0;
         double wall_ms = 0, cpu_ms = 0;
