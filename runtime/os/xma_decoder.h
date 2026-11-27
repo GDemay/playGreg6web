@@ -122,6 +122,7 @@ uint32_t ring_room(uint32_t write, uint32_t read, uint32_t ring, bool writable);
 // One frame found in an input buffer.
 struct Frame {
     uint32_t start = 0;      // bit position of its length field
+    uint32_t end = 0;        // bit position immediately after this frame in its buffer
     uint32_t length = 0;     // bits, the length field included
     uint32_t next = 0;       // bit position of the next frame in this buffer (valid if has_next)
     bool has_next = false;

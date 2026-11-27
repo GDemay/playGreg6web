@@ -101,6 +101,7 @@ OnceFlags& once() {
     static OnceFlags f;
     return f;
 }
+std::atomic<DStorageFenceSignalHook> g_fence_signal_hook{nullptr};
 void diag_once(std::atomic<bool>& flag, const std::string& message) {
     if (!flag.exchange(true, std::memory_order_relaxed)) {
         diag(message);
@@ -1198,9 +1199,13 @@ bool DStorageQueue::run_batch(HostReader& reader) {
             item.status->complete(item.index, hr_since_fence_);
             hr_since_fence_ = kOk;
         } else {
-            if (item.signal == 0 || !win32::SetEvent(item.signal)) {
+            const DStorageFenceSignalHook fence_hook = g_fence_signal_hook.load(std::memory_order_acquire);
+            const bool signaled = item.signal != 0 &&
+                                  (win32::SetEvent(item.signal) ||
+                                   (fence_hook != nullptr && fence_hook(item.signal, item.value)));
+            if (!signaled) {
                 diag_once(once().bad_signal, "XCRDAPI: EnqueueSignal target " + hex64(item.signal) +
-                                                 " is not a Win32 event (ID3D12Fence signals are not supported)");
+                                                 " is not a Win32 event or registered ID3D12Fence");
             }
         }
     }
@@ -1770,6 +1775,10 @@ std::string dstorage_debug_state() {
     return o;
 }
 
+void set_dstorage_fence_signal_hook(DStorageFenceSignalHook hook) {
+    g_fence_signal_hook.store(hook, std::memory_order_release);
+}
+
 void set_dstorage_worker_threads(uint32_t count) {
     counters().worker_threads.store(std::clamp<uint32_t>(count, 1, 16), std::memory_order_relaxed);
 }
@@ -1844,6 +1853,7 @@ void reset_xbox_scarlett_guest() {
     f.bcpack_failed = false;
     f.bad_signal = false;
     f.closed_queue = false;
+    g_fence_signal_hook.store(nullptr, std::memory_order_release);
 }
 
 }  // namespace playgta6::os::scarlett::guest_api

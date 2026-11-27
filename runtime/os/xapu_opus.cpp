@@ -208,7 +208,30 @@ int VoiceDecoder::decode(const uint8_t* packet, size_t bytes, uint32_t sample_ra
         ++failed_packets_;
         return -1;
     }
-    const size_t n = std::min(static_cast<size_t>(frames), safe_max_frames);
+    const size_t decoded_frames = static_cast<size_t>(frames);
+    if (sample_rate != 0u && sample_rate != rate && decoded_frames > 0u) {
+        // Linearly resample from libopus's native rate to the requested non-Opus target rate
+        // (e.g., 44.1 kHz / 32 kHz / 22.05 kHz) so callers do not get pitch-shifted truncated frames.
+        const size_t target_frames = std::min(
+            safe_max_frames,
+            std::max<size_t>(1u, static_cast<size_t>(
+                                     (static_cast<uint64_t>(decoded_frames) * sample_rate + (rate / 2u)) / rate)));
+        const double ratio = static_cast<double>(rate) / static_cast<double>(sample_rate);
+        for (size_t i = 0u; i < target_frames; ++i) {
+            const double src_pos = static_cast<double>(i) * ratio;
+            const size_t idx0 = std::min(static_cast<size_t>(src_pos), decoded_frames - 1u);
+            const size_t idx1 = std::min(idx0 + 1u, decoded_frames - 1u);
+            const float frac = static_cast<float>(src_pos - static_cast<double>(idx0));
+            for (uint32_t c = 0u; c < channels; ++c) {
+                const float s0 = sanitize_sample(pcm[idx0 * channels + c]);
+                const float s1 = sanitize_sample(pcm[idx1 * channels + c]);
+                out[i * channels + c] = sanitize_sample(s0 + (s1 - s0) * frac);
+            }
+        }
+        ++decoded_packets_;
+        return static_cast<int>(target_frames);
+    }
+    const size_t n = std::min(decoded_frames, safe_max_frames);
     const size_t sample_count = n * channels;
     for (size_t i = 0u; i < sample_count; ++i) {
         out[i] = sanitize_sample(pcm[i]);
@@ -217,6 +240,10 @@ int VoiceDecoder::decode(const uint8_t* packet, size_t bytes, uint32_t sample_ra
     return static_cast<int>(n);
 #else
     (void)sample_rate;
+    if (!inspect_packet(packet, bytes, nullptr)) {
+        ++failed_packets_;
+        return -1;
+    }
     std::memset(out, 0, safe_max_frames * channels * sizeof(float));
     ++decoded_packets_;
     return static_cast<int>(safe_max_frames);

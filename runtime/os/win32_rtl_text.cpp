@@ -315,13 +315,36 @@ bool name_equals_ci(const char16_t* name, const char16_t* lower_ascii) {
     return name[i] == 0;
 }
 
-// The locales GetLocaleInfoEx has data for.
+std::u16string active_user_locale_name() {
+    char16_t buf[85]{};
+    const int32_t n = pg6_win32_get_user_default_locale_name(buf, 85);
+    if (n > 1) {
+        return std::u16string(buf, static_cast<size_t>(n - 1));
+    }
+    return u"en-US";
+}
+
+bool u16_equals_ci(const char16_t* a, const std::u16string& b) {
+    size_t i = 0;
+    for (; i < b.size(); ++i) {
+        if (a[i] == 0 || cd::fold_char(a[i]) != cd::fold_char(b[i])) {
+            return false;
+        }
+    }
+    return a[i] == 0;
+}
+
+// The locales GetLocaleInfoEx has data for: en-US, invariant/default, and the active host locale
+// returned by GetUserDefaultLocaleName so non-US machines can query metadata for their own locale.
 bool locale_has_data(const char16_t* name) {
     if (name == nullptr || name[0] == 0) {
         return true;
     }
-    return name_equals_ci(name, u"en-us") || name_equals_ci(name, u"en") ||
-           name_equals_ci(name, u"!x-sys-default-locale");
+    if (name_equals_ci(name, u"en-us") || name_equals_ci(name, u"en") ||
+        name_equals_ci(name, u"!x-sys-default-locale")) {
+        return true;
+    }
+    return u16_equals_ci(name, active_user_locale_name());
 }
 
 // A locale name LCMapStringEx / CompareStringEx accept: the served ones plus the names of the
@@ -617,6 +640,12 @@ int32_t pg6_win32_get_locale_info_ex(const char16_t* locale_name,
     if (!locale_item(type, &text, &number)) {
         win32::SetLastError(kErrorInvalidFlags);
         return 0;
+    }
+    if (type == win32::LOCALE_SNAME && locale_name != nullptr && locale_name[0] != 0) {
+        const std::u16string host_name = active_user_locale_name();
+        if (u16_equals_ci(locale_name, host_name) && !name_equals_ci(locale_name, u"en-us")) {
+            text = host_name;
+        }
     }
     if (return_number) {
         if (number < 0) {

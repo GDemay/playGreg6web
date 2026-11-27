@@ -1804,17 +1804,32 @@ Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts) {
     return gdk::S_OK_HR;
 }
 
+namespace {
+std::atomic<Pg6XmaContextsReleasedCallback> g_xma_contexts_released_cb{nullptr};
+}  // namespace
+
+void pg6_mw_set_xma_contexts_released_callback(Pg6XmaContextsReleasedCallback cb) {
+    g_xma_contexts_released_cb.store(cb, std::memory_order_release);
+}
+
 Pg6HResult pg6_mw_acp_hal_release_shape_contexts(void) {
-    auto& g = mw::apu_globals();
-    std::lock_guard<std::mutex> lock(g.mutex);
-    for (uint64_t va : g.shape_context_arrays) {
-        playgta6::os::default_guest_heap().free(va);
+    std::vector<uint64_t> to_free;
+    {
+        auto& g = mw::apu_globals();
+        std::lock_guard<std::mutex> lock(g.mutex);
+        to_free.swap(g.shape_context_arrays);
+        g.xma_contexts = 0;
+        g.xma_context_count = 0;
+        if (g.shape_context_allocs > 0) {
+            --g.shape_context_allocs;
+        }
     }
-    g.shape_context_arrays.clear();
-    g.xma_contexts = 0;
-    g.xma_context_count = 0;
-    if (g.shape_context_allocs > 0) {
-        --g.shape_context_allocs;
+    // Quiesce any active XMA worker pass before freeing the guest context memory.
+    if (const auto cb = g_xma_contexts_released_cb.load(std::memory_order_acquire); cb != nullptr) {
+        cb();
+    }
+    for (uint64_t va : to_free) {
+        playgta6::os::default_guest_heap().free(va);
     }
     return gdk::S_OK_HR;
 }
@@ -1843,10 +1858,19 @@ Pg6XmaContextCensus pg6_mw_xma_context_census(void) {
     c.contexts = g.xma_context_count;
     for (uint32_t i = 0; i < g.xma_context_count; ++i) {
         const uint8_t* ctx = base + size_t{i} * kShapeContextBytes[kShapeContextKindXma];
-        uint32_t d0 = 0, d9 = 0;
-        std::memcpy(&d0, ctx, 4);
-        std::memcpy(&d9, ctx + 0x24, 4);
-        if (std::any_of(ctx, ctx + kShapeContextBytes[kShapeContextKindXma], [](uint8_t v) { return v != 0; })) {
+        auto* words = reinterpret_cast<uint32_t*>(const_cast<uint8_t*>(ctx));
+        const uint32_t d0 = std::atomic_ref<uint32_t>(words[0]).load(std::memory_order_acquire);
+        const uint32_t d9 = std::atomic_ref<uint32_t>(words[9]).load(std::memory_order_acquire);
+        bool touched = (d0 != 0 || d9 != 0);
+        if (!touched) {
+            for (unsigned w = 1; w < kShapeContextBytes[kShapeContextKindXma] / 4; ++w) {
+                if (w != 9 && std::atomic_ref<uint32_t>(words[w]).load(std::memory_order_relaxed) != 0) {
+                    touched = true;
+                    break;
+                }
+            }
+        }
+        if (touched) {
             ++c.touched;
         }
         if ((d0 & (3u << 20)) != 0) {
@@ -2046,7 +2070,11 @@ int32_t pg6_mw_apu_is_virtual_address_valid(const void* virtual_address,
 }
 
 void* pg6_mw_apu_map_apu_address(Pg6ApuAddress apu_address) {
-    if (apu_address == 0u) {
+    return pg6_mw_apu_map_apu_range(apu_address, 1u);
+}
+
+void* pg6_mw_apu_map_apu_range(Pg6ApuAddress apu_address, size_t bytes) {
+    if (apu_address == 0u || bytes == 0u || uint64_t{apu_address} + bytes > 0x100000000ull) {
         return nullptr;
     }
     auto& g = mw::apu_globals();
@@ -2059,7 +2087,7 @@ void* pg6_mw_apu_map_apu_address(Pg6ApuAddress apu_address) {
     }
     --it;
     const uint64_t offset = uint64_t{apu_address} - uint64_t{it->apu_addr};
-    if (offset < uint64_t{it->size}) {
+    if (offset < uint64_t{it->size} && bytes <= uint64_t{it->size} - offset) {
         return it->aligned_ptr + offset;
     }
     return nullptr;

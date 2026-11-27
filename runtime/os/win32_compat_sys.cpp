@@ -454,14 +454,11 @@ int32_t pg6_win32_set_thread_priority(Pg6Handle thread, int32_t priority) {
 }
 
 Pg6Handle pg6_win32_open_thread(uint32_t, int32_t, uint32_t thread_id) {
-    // Only the calling thread can be named: other threads have no id -> handle index. The
-    // pseudo-handle is returned (CloseHandle on it fails like on any pseudo-handle).
     if (thread_id != 0 && thread_id == win32::GetCurrentThreadId()) {
         win32::SetLastError(win32::ERROR_SUCCESS);
         return win32::kCurrentThreadPseudoHandle;
     }
-    win32::SetLastError(win32::ERROR_INVALID_PARAMETER);
-    return win32::kNullHandle;
+    return win32::OpenThreadById(thread_id);
 }
 
 uint32_t pg6_win32_suspend_thread(Pg6Handle thread) {
@@ -555,11 +552,14 @@ int32_t pg6_win32_get_thread_group_affinity(Pg6Handle thread, Pg6GroupAffinity* 
         return 0;
     }
     std::memset(out, 0, sizeof(*out));
-    if (!win32::is_thread_handle(thread)) {
-        win32::SetLastError(win32::ERROR_INVALID_HANDLE);
+    uint64_t mask = 0;
+    if (!win32::GetThreadAffinityMask(thread, &mask)) {
         return 0;
     }
-    out->mask = win32::active_mask(win32::processor_count()) & win32::get_process_affinity_mask();
+    out->mask = mask & win32::active_mask(win32::processor_count());
+    if (out->mask == 0) {
+        out->mask = win32::active_mask(win32::processor_count()) & win32::get_process_affinity_mask();
+    }
     out->group = 0;
     return 1;
 }

@@ -61,13 +61,16 @@ inline uint64_t steady_now_us() {
 class Resampler {
 public:
     void configure(uint32_t in_rate, uint32_t out_rate) {
-        step_ = out_rate ? static_cast<double>(in_rate) / static_cast<double>(out_rate) : 1.0;
-        passthrough_ = in_rate == out_rate;
+        passthrough_ = (in_rate == out_rate || in_rate == 0 || out_rate == 0);
+        step_ = passthrough_ ? 1.0 : static_cast<double>(in_rate) / static_cast<double>(out_rate);
         pos_ = 0.0;
         prev_[0] = prev_[1] = 0.0f;
     }
     // Appends the resampled frames to `out`.
     void process(const float* in, uint32_t frames, std::vector<float>& out) {
+        if (in == nullptr || frames == 0) {
+            return;
+        }
         if (passthrough_) {
             out.insert(out.end(), in, in + static_cast<size_t>(frames) * 2);
             return;
@@ -127,7 +130,14 @@ public:
 
     void push(const float* stereo, uint32_t frames) { push(stereo, frames, steady_now_us()); }
     void push(const float* stereo, uint32_t frames, uint64_t now_us) {
+        if (stereo == nullptr || frames == 0) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(m_);
+        if (cap_ == 0 || buf_.empty()) {
+            stats_.overrun_frames += frames;
+            return;
+        }
         const uint32_t room = cap_ - count_;
         const uint32_t n = std::min(frames, room);
         for (uint32_t i = 0; i < n; ++i) {
@@ -159,10 +169,13 @@ public:
     // Returns the number of real frames written.
     uint32_t pop(float* out, uint32_t frames) { return pop(out, frames, steady_now_us()); }
     uint32_t pop(float* out, uint32_t frames, uint64_t now_us) {
+        if (out == nullptr || frames == 0) {
+            return 0;
+        }
         std::lock_guard<std::mutex> lock(m_);
         uint32_t n = 0;
         const uint32_t fill_before = count_;
-        if (primed_) {
+        if (primed_ && cap_ != 0 && !buf_.empty()) {
             n = std::min(frames, count_);
             for (uint32_t i = 0; i < n; ++i) {
                 const size_t slot = (static_cast<size_t>(head_) + i) % cap_;
@@ -218,7 +231,7 @@ public:
 private:
     mutable std::mutex m_;
     std::vector<float> buf_;
-    uint32_t cap_ = 1, prebuffer_ = 0, head_ = 0, count_ = 0;
+    uint32_t cap_ = 0, prebuffer_ = 0, head_ = 0, count_ = 0;
     bool primed_ = false, was_playing_ = false;
     uint64_t last_push_us_ = 0;
     uint32_t rate_ = kSourceRate, fill_at_push_ = 0;
@@ -230,9 +243,13 @@ private:
 class Feed {
 public:
     void configure(uint32_t device_rate, uint32_t capacity_ms, uint32_t prebuffer_ms) {
+        std::lock_guard<std::mutex> lock(m_);
         rate_ = device_rate;
         rs_.configure(kSourceRate, device_rate);
-        jb_.configure(device_rate * capacity_ms / 1000, device_rate * prebuffer_ms / 1000, device_rate);
+        const uint64_t cap_frames = (static_cast<uint64_t>(device_rate) * capacity_ms) / 1000u;
+        const uint64_t pre_frames = (static_cast<uint64_t>(device_rate) * prebuffer_ms) / 1000u;
+        jb_.configure(static_cast<uint32_t>(std::min<uint64_t>(cap_frames, UINT32_MAX)),
+                      static_cast<uint32_t>(std::min<uint64_t>(pre_frames, UINT32_MAX)), device_rate);
     }
     // Optional producer-side present counter (the guest frame index) for underrun classification.
     void set_present_source(uint64_t (*fn)()) { present_fn_ = fn; }

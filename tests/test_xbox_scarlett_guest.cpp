@@ -3374,6 +3374,232 @@ void test_dstorage_debug_state() {
     CHECK(fx.vcall(factory, 2) == 1);
 }
 
+// Orch-24: DStorageQueue::EnqueueSignal forwards non-event fence targets to the registered hook.
+void test_dstorage_fence_signal_hook() {
+    Fixture fx;
+    static std::atomic<uint64_t> s_fence{0};
+    static std::atomic<uint64_t> s_value{0};
+    static std::atomic<int> s_calls{0};
+    s_fence.store(0);
+    s_value.store(0);
+    s_calls.store(0);
+    ga::set_dstorage_fence_signal_hook([](uint64_t fence, uint64_t value) -> bool {
+        s_fence.store(fence, std::memory_order_release);
+        s_value.store(value, std::memory_order_release);
+        s_calls.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    });
+
+    const uint64_t factory = fx.factory();
+    const uint64_t queue = fx.create_queue(factory, 8);
+    const uint64_t status = fx.create_status(factory, 4);
+    const uint64_t fake_fence = 0x1234567800ULL;
+    const uint64_t want_value = 42ULL;
+    fx.vcall(queue, 5, {I(fake_fence), I(want_value)});  // EnqueueSignal
+    fx.vcall(queue, 4, {I(status), I(0)});               // EnqueueStatus
+    fx.vcall(queue, 6);                                  // Submit
+    CHECK(fx.wait_complete(status, 0));
+    CHECK(s_calls.load(std::memory_order_acquire) == 1);
+    CHECK(s_fence.load(std::memory_order_acquire) == fake_fence);
+    CHECK(s_value.load(std::memory_order_acquire) == want_value);
+
+    ga::set_dstorage_fence_signal_hook(nullptr);
+    fx.vcall(queue, 8);
+    CHECK(fx.vcall(status, 2) == 0);
+    CHECK(fx.vcall(queue, 2) == 0);
+    CHECK(fx.vcall(factory, 2) == 1);
+}
+
+// Orch-24: IGameInputDevice slots 5-8 (battery & FFB) and IGameInput slots 10-11 (guide/keyboard callbacks).
+void test_game_input_battery_ffb_and_callbacks() {
+    InputFixture fx;
+    const uint64_t gi = fx.game_input();
+    HResult hr = 0;
+    const uint64_t r = fx.reading(gi, ga::kGameInputKindGamepad, 0, &hr);
+    CHECK(hr == 0 && r != 0);
+    const uint64_t dev_out = fx.out_slot();
+    fx.vcall(r, 6, {I(dev_out)});
+    const uint64_t pad = load64(dev_out);
+    CHECK(pad != 0);
+
+    // Slot 5: GetBatteryState writes wired battery defaults (remaining/full=1.0, status=NotPresent=0).
+    const uint64_t bat_va = com::guest_alloc(20);
+    std::vector<uint8_t> sentinel(20, 0xCC);
+    CHECK(com::write_guest(bat_va, sentinel.data(), sentinel.size()));
+    fx.vcall(pad, 5, {I(bat_va)});
+    struct BatteryState {
+        float charge_rate;
+        float max_charge_rate;
+        float remaining_capacity;
+        float full_charge_capacity;
+        uint32_t status;
+    } bat{};
+    CHECK(com::read_guest(bat_va, bat));
+    CHECK(bat.remaining_capacity == 1.0f && bat.full_charge_capacity == 1.0f && bat.status == 0u);
+
+    // Slot 6: CreateForceFeedbackEffect clears out pointer and returns E_NOTIMPL.
+    const uint64_t ffb_out = fx.out_slot();
+    CHECK(com::write_guest(ffb_out, uint64_t{0xDEADBEEFULL}));
+    CHECK(as_hr(fx.vcall(pad, 6, {I(0), I(0), I(ffb_out)})) == com::E_NOTIMPL_HR);
+    CHECK(load64(ffb_out) == 0);
+
+    // Slot 7 & 8: IsForceFeedbackMotorPoweredOn -> false; SetForceFeedbackMotorGain -> safe no-op.
+    CHECK((fx.vcall(pad, 7, {I(0)}) & 0xFFu) == 0u);
+    fx.vcall(pad, 8, {I(0), F(0.5f)});
+
+    // IGameInput slots 10 & 11: RegisterGuideButtonCallback / RegisterKeyboardLayoutCallback.
+    const uint64_t tok1 = fx.out_slot();
+    const uint64_t tok2 = fx.out_slot();
+    CHECK(as_hr(fx.vcall(gi, 10, {I(0), I(0), I(kGuestDeviceCallback), I(tok1)})) == 0);
+    CHECK(as_hr(fx.vcall(gi, 11, {I(0), I(0), I(kGuestDeviceCallback), I(tok2)})) == 0);
+    CHECK(load64(tok1) != 0 && load64(tok2) != 0 && load64(tok1) != load64(tok2));
+    CHECK(as_hr(fx.vcall(gi, 10, {I(0), I(0), I(0), I(tok1)})) == com::E_INVALIDARG_HR);
+    CHECK((fx.vcall(gi, 13, {I(load64(tok1)), I(0)}) & 0xFFu) == 1u);
+    fx.vcall(gi, 12, {I(load64(tok2))});
+    CHECK((fx.vcall(gi, 13, {I(load64(tok2)), I(0)}) & 0xFFu) == 0u);
+
+    CHECK(fx.vcall(pad, 2) >= 1);
+    CHECK(fx.vcall(r, 2) == 0);
+}
+
+// Orch-24: XApu 10 ms (480-frame) stereo decode, command-5 reset, and dequeue invalid-output preservation.
+void test_xapu_10ms_command5_and_dequeue_error() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("xapu.dll", "XApuConnect");
+    const uint64_t enqueue = fx.export_address("xapu.dll", "XApuEnqueueCommand");
+    const uint64_t count = fx.export_address("xapu.dll", "XApuGetResultCount");
+    const uint64_t dequeue = fx.export_address("xapu.dll", "XApuDequeueResult");
+    const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
+    const uint64_t params = com::guest_alloc(0x18);
+    const uint64_t p2 = com::guest_alloc(0x10);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(p2), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    const uint64_t shared = load64(p2);
+
+    // Encode a 10 ms (480-frame) stereo Opus packet when libopus is present.
+    std::vector<uint8_t> pkt10 = {0xFC, 0xFF, 0xFE};
+#if defined(PLAYGTA6_HAVE_OPUS)
+    {
+        int err = 0;
+        OpusEncoder* enc = opus_encoder_create(48000, 2, OPUS_APPLICATION_AUDIO, &err);
+        CHECK(enc != nullptr && err == OPUS_OK);
+        std::vector<float> pcm(480 * 2, 0.25f);
+        pkt10.assign(0x280, 0);
+        const int n = opus_encode_float(enc, pcm.data(), 480, pkt10.data(), static_cast<opus_int32>(pkt10.size()));
+        CHECK(n > 0);
+        pkt10.resize(n > 0 ? n : 1);
+        opus_encoder_destroy(enc);
+    }
+#endif
+
+    const uint64_t c = com::guest_alloc(0x40);
+    const uint64_t input = shared + 0x280;
+    const uint64_t output = shared + 0x14000 + 0x1E00;
+    CHECK(com::write_guest(input, pkt10.data(), pkt10.size()));
+    uint8_t cmd[0x40] = {};
+    const uint32_t type = 3;
+    const uint32_t voice = 11;
+    const float rate = 48000.0f;
+    const uint32_t skip = 0;
+    const uint32_t frames = 480;
+    const uint32_t bytes = static_cast<uint32_t>(pkt10.size());
+    const uint32_t capacity = 2 * 480 * sizeof(float);  // 2 channels * 480 frames = 3840 bytes
+    std::memcpy(cmd + 0x00, &type, 4);
+    std::memcpy(cmd + 0x04, &voice, 4);
+    std::memcpy(cmd + 0x1C, &rate, 4);
+    std::memcpy(cmd + 0x20, &skip, 4);
+    std::memcpy(cmd + 0x24, &frames, 4);
+    std::memcpy(cmd + 0x28, &bytes, 4);
+    std::memcpy(cmd + 0x2C, &input, 8);
+    std::memcpy(cmd + 0x34, &capacity, 4);
+    std::memcpy(cmd + 0x38, &output, 8);
+    CHECK(com::write_guest(c, cmd, sizeof(cmd)));
+    CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
+
+    // Command 5 resets the voice decoder state cleanly and posts a result.
+    const uint32_t reset_head[2] = {5, voice};
+    CHECK(com::write_guest(c, reset_head, sizeof(reset_head)));
+    CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 2);
+
+    // Invalid destination VA must return E_POINTER without popping the queued result.
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(0x10)})) == com::E_POINTER_HR);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 2);
+
+    const uint64_t result = com::guest_alloc(0x38);
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
+    CHECK(load32(result) == 3 && load32(result + 4) == voice);
+    if (xapu_opus_available()) {
+        CHECK(load32(result + 0x34) == capacity);
+    }
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
+    CHECK(load32(result) == 5 && load32(result + 4) == voice);
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
+}
+
+// Orch-24: SpatialAudio SetEndOfStream(frameCount) mixes partial tail zero-padded to 480 frames,
+// SpatialStreamObj::Reset enforces stopped state and clears objects, and min==0 dynamic objects succeed.
+void test_mmdevice_end_of_stream_and_reset() {
+    namespace ad = playgta6::os::audio_downmix;
+    AudioFixture fx;
+    const uint64_t dev = fx.default_endpoint(fx.enumerator());
+    const uint64_t sac = fx.activate(dev, kIidSpatialAudioClient);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.vcall(sac, 6, {I(out)})) == 0);  // GetSupportedAudioObjectFormatEnumerator
+    const uint64_t formats = load64(out);
+    CHECK(as_hr(fx.vcall(formats, 4, {I(0), I(out)})) == 0);
+    const uint64_t fmt = load64(out);
+
+    const win32::Handle event = win32::CreateEventW(nullptr, false, false, nullptr);
+    const uint64_t params = com::guest_alloc(0x28);
+    // static mask FrontLeft (0x2), minDynamic=0, maxDynamic=8 (optional dynamic objects allowed)
+    CHECK(com::write_guest(params, fmt) && com::write_guest(params + 8, uint32_t{0x2}) &&
+          com::write_guest(params + 12, uint32_t{0}) && com::write_guest(params + 16, uint32_t{8}) &&
+          com::write_guest(params + 20, uint32_t{6}) && com::write_guest(params + 24, uint64_t{event}));
+    const uint64_t pv = com::guest_alloc(24);
+    CHECK(com::write_guest(pv, uint16_t{65}) && com::write_guest(pv + 8, uint32_t{0x28}) &&
+          com::write_guest(pv + 16, params));
+    CHECK(as_hr(fx.vcall(sac, 10, {I(pv), I(fx.guid(kIidSpatialStream)), I(out)})) == 0);
+    const uint64_t stream = load64(out);
+    CHECK(as_hr(fx.vcall(stream, 5)) == 0);  // Start
+
+    // Reset while started must fail (AUDCLNT_E_NOT_STOPPED).
+    CHECK(as_hr(fx.vcall(stream, 7)) < 0);
+
+    const uint64_t frames = com::guest_alloc(8);
+    const uint64_t buf = com::guest_alloc(16);
+    CHECK(as_hr(fx.vcall(stream, 8, {I(frames), I(frames + 4)})) == 0);  // Begin
+    CHECK(as_hr(fx.vcall(stream, 10, {I(0x2), I(out)})) == 0);           // Activate FrontLeft
+    const uint64_t obj = load64(out);
+    CHECK(as_hr(fx.vcall(obj, 3, {I(buf), I(buf + 8)})) == 0);           // GetBuffer
+    std::vector<float> samples(480, 0.5f);
+    CHECK(com::write_guest(load64(buf), samples.data(), samples.size() * sizeof(float)));
+    CHECK(as_hr(fx.vcall(obj, 4, {I(100)})) == 0);  // SetEndOfStream(100)
+    const uint64_t active_va = com::guest_alloc(4);
+    CHECK(as_hr(fx.vcall(obj, 5, {I(active_va)})) == 0 && load32(active_va) == 1u);  // active until End
+    CHECK(as_hr(fx.vcall(stream, 9)) == 0);  // EndUpdatingAudioObjects mixes 100 frames + 380 zeros
+    CHECK(as_hr(fx.vcall(obj, 5, {I(active_va)})) == 0 && load32(active_va) == 0u);  // now inactive
+
+    ga::audio_engine_tick();
+    std::vector<float> pcm(480 * 2);
+    CHECK(ad::ring_pop(ad::runtime_ring(), pcm.data(), pcm.size()) == pcm.size());
+    CHECK(std::fabs(pcm[0] - 0.5f) < 1e-5f && std::fabs(pcm[99 * 2] - 0.5f) < 1e-5f);
+    CHECK(pcm[100 * 2] == 0.0f && pcm[479 * 2] == 0.0f);
+
+    // Stop then Reset succeeds and clears active objects so FrontLeft can be re-activated.
+    CHECK(as_hr(fx.vcall(stream, 6)) == 0);  // Stop
+    CHECK(as_hr(fx.vcall(stream, 7)) == 0);  // Reset
+    CHECK(as_hr(fx.vcall(stream, 10, {I(0x2), I(out)})) == 0);
+    const uint64_t obj2 = load64(out);
+    CHECK(obj2 != 0 && obj2 != obj);
+
+    for (const uint64_t o : {obj2, obj, stream, formats, sac, dev}) {
+        fx.vcall(o, 2);
+    }
+    win32::CloseHandle(event);
+}
+
 int main() {
     test_inflate();
     test_inflate_lz77_fast_paths();
@@ -3384,6 +3610,7 @@ int main() {
     test_physical_page_scatter();
     test_requests_wait_for_submit();
     test_dstorage_debug_state();
+    test_dstorage_fence_signal_hook();
     test_compressed_and_memory_sources();
     test_bcpack_requests();
     test_errors_and_error_record();
@@ -3394,6 +3621,7 @@ int main() {
     test_game_input_readings();
     test_game_input_devices();
     test_game_input_stable_pad();
+    test_game_input_battery_ffb_and_callbacks();
     test_xg();
     test_acp_hal();
     test_acp_hal_xma_commands();
@@ -3403,7 +3631,9 @@ int main() {
     test_xapu_connect_params();
     test_xapu_bounded_queue();
     test_xapu_decode();
+    test_xapu_10ms_command5_and_dequeue_error();
     test_mmdevice();
+    test_mmdevice_end_of_stream_and_reset();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xbox_scarlett_guest: %d failure(s)\n", g_failures);
         return 1;

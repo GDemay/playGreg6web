@@ -49,7 +49,9 @@ struct Windows {
                                 std::chrono::steady_clock::now().time_since_epoch()).count();
         int64_t expected = -1;
         start_ms.compare_exchange_strong(expected, now);
-        record_at(static_cast<uint64_t>(now - start_ms.load()), n_frames, non_silent);
+        const int64_t start = start_ms.load();
+        const uint64_t elapsed = now > start ? static_cast<uint64_t>(now - start) : 0u;
+        record_at(elapsed, n_frames, non_silent);
     }
     void reset() {
         for (auto& a : frames) a = 0;

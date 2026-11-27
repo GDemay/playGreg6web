@@ -595,6 +595,7 @@ void reset() {
 
 void set_stereo_sink(StereoSink sink, void* user) {
     Staged& s = staged();
+    std::lock_guard<std::mutex> flush_lock(s.flush_mutex);
     std::lock_guard<std::mutex> lock(s.mutex);
     s.sink = sink;
     s.sink_user = user;

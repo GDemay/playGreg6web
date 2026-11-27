@@ -158,12 +158,14 @@ public:
             ++counts_[handle];
         }
     }
-    void remove(const void* handle) {
+    bool remove(const void* handle) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = counts_.find(handle);
         if (it != counts_.end() && --it->second == 0) {
             counts_.erase(it);
+            return true;
         }
+        return false;
     }
     bool contains(const void* handle) const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -428,6 +430,52 @@ public:
         cv_.notify_all();
     }
 
+    void cancel_queue(Pg6XTaskQueueHandle target) {
+        if (target == nullptr) {
+            return;
+        }
+        std::vector<Item> canceled;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto it = items_.begin(); it != items_.end();) {
+                if (it->second.queue == target) {
+                    canceled.push_back(it->second);
+                    it = items_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (!canceled.empty()) {
+                cv_.notify_all();
+            }
+        }
+        for (Item& item : canceled) {
+            if (item.callback.function != nullptr) {
+                item.callback.function(item.callback.context, true);
+            } else {
+                cbk::destroy_trampoline(item.callback.trampoline);
+            }
+            pg6_gdk_xtask_queue_close_handle(item.queue);
+        }
+    }
+
+    void reset() {
+        std::vector<Item> dropped;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto& [due, item] : items_) {
+                (void)due;
+                dropped.push_back(item);
+            }
+            items_.clear();
+            cv_.notify_all();
+        }
+        for (Item& item : dropped) {
+            cbk::destroy_trampoline(item.callback.trampoline);
+            pg6_gdk_xtask_queue_close_handle(item.queue);
+        }
+    }
+
     ~DelayScheduler() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -545,9 +593,26 @@ public:
 
     void CloseHandle(uint64_t queue) {
         if (check_handle(queues(), queue, "XTaskQueue handle")) {
-            queues().remove(from_guest<void>(queue));
-            pg6_gdk_xtask_queue_close_handle(from_guest<Pg6XTaskQueue>(queue));
+            auto* host_queue = from_guest<Pg6XTaskQueue>(queue);
+            if (queues().remove(host_queue)) {
+                std::lock_guard<std::mutex> lock(meta_mutex_);
+                composite_queues_.erase(host_queue);
+                auto pit = owned_ports_.find(host_queue);
+                if (pit != owned_ports_.end()) {
+                    for (const void* p : pit->second) {
+                        if (p != nullptr) {
+                            ports().remove(p);
+                        }
+                    }
+                    owned_ports_.erase(pit);
+                }
+            }
+            pg6_gdk_xtask_queue_close_handle(host_queue);
         }
+    }
+
+    int32_t SubmitCallback(uint64_t queue, uint32_t port, uint64_t context, uint64_t callback) {
+        return SubmitDelayedCallback(queue, port, 0, context, callback);
     }
 
     int32_t SubmitDelayedCallback(uint64_t queue, uint32_t port, uint32_t delay_ms, uint64_t context,
@@ -569,11 +634,33 @@ public:
         return S_OK_HR;
     }
 
+    int32_t RegisterMonitor(uint64_t queue, uint64_t /*context*/, uint64_t callback, GuestPtr<uint64_t> token) {
+        if (!check_handle(queues(), queue, "XTaskQueue handle") || callback == 0 || token.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        uint64_t t = 0;
+        {
+            std::lock_guard<std::mutex> lock(meta_mutex_);
+            t = next_monitor_token_++;
+            monitor_tokens_.insert(t);
+        }
+        return token.write(t) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+
+    void UnregisterMonitor(uint64_t queue, uint64_t token) {
+        if (!check_handle(queues(), queue, "XTaskQueue handle")) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(meta_mutex_);
+        monitor_tokens_.erase(token);
+    }
+
     int32_t Terminate(uint64_t queue, bool wait, uint64_t context, uint64_t callback) {
         if (!check_handle(queues(), queue, "XTaskQueue handle")) {
             return E_INVALIDARG_HR;
         }
         auto* host_queue = from_guest<Pg6XTaskQueue>(queue);
+        delay_scheduler().cancel_queue(host_queue);
         if (callback == 0) {
             return pg6_gdk_xtask_queue_terminate(host_queue, wait ? 1 : 0, nullptr, nullptr);
         }
@@ -639,7 +726,11 @@ public:
             return E_OUTOFMEMORY_HR;
         }
         const std::string name = guest_string(identity_name, 128);
-        return XAsyncBeginWith(shadow, std::move(adapter), identity, name.c_str());
+        const int32_t hr = XAsyncBeginWith(shadow, std::move(adapter), identity, name.c_str());
+        if (hr < 0) {
+            end_async(block);
+        }
+        return hr;
     }
 
     int32_t Schedule(uint64_t block, uint32_t delay_ms) {
@@ -682,7 +773,11 @@ public:
         Pg6XTaskQueueHandle handle = nullptr;
         const int32_t hr = pg6_gdk_xtask_queue_create_composite(from_guest<Pg6XTaskQueuePort>(work_port),
                                                                 from_guest<Pg6XTaskQueuePort>(completion_port), &handle);
-        queues().add(handle);
+        if (handle != nullptr) {
+            queues().add(handle);
+            std::lock_guard<std::mutex> lock(meta_mutex_);
+            composite_queues_.insert(handle);
+        }
         queue.write(to_guest(handle));
         return hr;
     }
@@ -695,14 +790,30 @@ public:
         if (!check_handle(queues(), queue, "XTaskQueue handle")) {
             return E_INVALIDARG_HR;
         }
+        auto* host_queue = from_guest<Pg6XTaskQueue>(queue);
         Pg6XTaskQueuePortHandle handle = nullptr;
-        const int32_t hr = pg6_gdk_xtask_queue_get_port(from_guest<Pg6XTaskQueue>(queue), port, &handle);
-        if (handle != nullptr && !ports().contains(handle)) {
-            ports().add(handle);
+        const int32_t hr = pg6_gdk_xtask_queue_get_port(host_queue, port, &handle);
+        if (handle != nullptr) {
+            if (!ports().contains(handle)) {
+                ports().add(handle);
+            }
+            if (port <= 1) {
+                std::lock_guard<std::mutex> lock(meta_mutex_);
+                if (composite_queues_.count(host_queue) == 0) {
+                    owned_ports_[host_queue][port] = handle;
+                }
+            }
         }
         port_handle.write(to_guest(handle));
         return hr;
     }
+
+private:
+    std::mutex meta_mutex_;
+    std::unordered_set<const void*> composite_queues_;
+    std::unordered_map<const void*, std::array<const void*, 2>> owned_ports_;
+    std::unordered_set<uint64_t> monitor_tokens_;
+    uint64_t next_monitor_token_ = 1;
 };
 
 // {01acd177-91f9-4763-a38e-ccbb55ce32e0}: XUser.
@@ -1392,6 +1503,8 @@ class PackageApi : public com::ComObject {
     };
     // Equal non-zero byte counts: their ratio is 1, never 0/0.
     static constexpr uint64_t kInstalledBytes = 1;
+    std::mutex progress_tokens_mutex_;
+    std::unordered_set<uint64_t> progress_tokens_;
     std::atomic<uint64_t> next_progress_token_{1};
 
 public:
@@ -1448,8 +1561,22 @@ public:
             callback == 0 || token.is_null()) {
             return E_INVALIDARG_HR;
         }
-        token.write(next_progress_token_.fetch_add(1, std::memory_order_relaxed));
+        const uint64_t t = next_progress_token_.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(progress_tokens_mutex_);
+            progress_tokens_.insert(t);
+        }
+        token.write(t);
         return S_OK_HR;
+    }
+
+    // s10: XPackageUnregisterInstallationProgressChanged(monitor, token, wait) -> bool.
+    bool UnregisterInstallationProgressChanged(uint64_t monitor, uint64_t token, bool /*wait*/) {
+        if (!check_handle(installation_monitors(), monitor, "XPackageInstallationMonitorHandle")) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(progress_tokens_mutex_);
+        return progress_tokens_.erase(token) != 0;
     }
 
     // XPackageEnumeratePackages(kind, scope, context, callback). Content packages (kind 1): none
@@ -1614,6 +1741,17 @@ public:
         }
         com::write_guest(mount, uint64_t{0});
         return finish_ready_async(async, &kPkgMountIdentity, sizeof(uint64_t), mount);
+    }
+
+    // s24: XPackageGetMountPathSize(mount, size_t* pathSize): bytes with the terminator.
+    int32_t GetMountPathSize(uint64_t mount, GuestPtr<uint64_t> size) {
+        if (size.is_null()) {
+            return E_POINTER_HR;
+        }
+        if (!check_handle(package_mounts(), mount, "XPackageMountHandle")) {
+            return E_INVALIDARG_HR;
+        }
+        return size.write(sizeof(kMountPath)) ? S_OK_HR : E_INVALIDARG_HR;
     }
 
     // s25: XPackageGetMountPath(mount, pathSize, path): the game-data root, NUL-terminated.
@@ -2797,7 +2935,10 @@ constexpr auto kAsyncQueueTable = slot_table<27>({
     {15, AQ::method<&AsyncQueueApi::DuplicateHandle>("XTaskQueueDuplicateHandle")},
     {16, AQ::method<&AsyncQueueApi::Dispatch>("XTaskQueueDispatch")},
     {17, AQ::method<&AsyncQueueApi::CloseHandle>("XTaskQueueCloseHandle")},
+    {18, AQ::method<&AsyncQueueApi::SubmitCallback>("XTaskQueueSubmitCallback")},
     {19, AQ::method<&AsyncQueueApi::SubmitDelayedCallback>("XTaskQueueSubmitDelayedCallback")},
+    {20, AQ::method<&AsyncQueueApi::RegisterMonitor>("XTaskQueueRegisterMonitor")},
+    {21, AQ::method<&AsyncQueueApi::UnregisterMonitor>("XTaskQueueUnregisterMonitor")},
     {22, AQ::method<&AsyncQueueApi::Terminate>("XTaskQueueTerminate")},
     {25, AQ::method<&AsyncQueueApi::GetCurrentProcessTaskQueue>("XTaskQueueGetCurrentProcessTaskQueue")},
     {29, AQ::method<&AsyncQueueApi::AssertNotTimeSensitive>("XThreadAssertNotTimeSensitive")},
@@ -2898,6 +3039,8 @@ constexpr auto kPackageTable = slot_table<37>({
     {7, PK::method<&PackageApi::GetInstallationProgress>("XPackageGetInstallationProgress")},
     {9, PK::method<&PackageApi::RegisterInstallationProgressChanged>(
             "XPackageRegisterInstallationProgressChanged")},
+    {10, PK::method<&PackageApi::UnregisterInstallationProgressChanged>(
+             "XPackageUnregisterInstallationProgressChanged")},
     {11, PK::method<&PackageApi::GetUserLocale>("XPackageGetUserLocale")},
     {12, PK::method<&PackageApi::FindChunkAvailability>("XPackageFindChunkAvailability")},
     {14, PK::method<&PackageApi::ChangeChunkInstallOrder>("XPackageChangeChunkInstallOrder")},
@@ -2905,6 +3048,7 @@ constexpr auto kPackageTable = slot_table<37>({
     {17, PK::method<&PackageApi::InstallChunksResult>("XPackageInstallChunksResult")},
     {18, PK::method<&PackageApi::EstimateDownloadSize>("XPackageEstimateDownloadSize")},
     {19, PK::method<&PackageApi::UninstallChunks>("XPackageUninstallChunks")},
+    {24, PK::method<&PackageApi::GetMountPathSize>("XPackageGetMountPathSize")},
     {25, PK::method<&PackageApi::GetMountPath>("XPackageGetMountPath")},
     {26, PK::method<&PackageApi::CloseMountHandle>("XPackageCloseMountHandle")},
     {34, PK::method<&PackageApi::IsPackageInstalled>("XPackage slot 34 (bool(name), installed query)")},
@@ -3329,6 +3473,7 @@ ProviderHandleCounts provider_handle_counts() {
 }
 
 void reset_xgameruntime_provider() {
+    delay_scheduler().reset();
     ProviderState& st = state();
     std::lock_guard<std::mutex> lock(st.mutex);
     for (auto& object : st.singletons) {

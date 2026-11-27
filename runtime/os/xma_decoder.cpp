@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -1258,11 +1259,11 @@ void write_packet_header(uint8_t* packet, const PacketHeader& h) {
 }
 
 uint32_t Context::word(unsigned i) const {
-    return static_cast<volatile const uint32_t*>(w_)[i];
+    return std::atomic_ref<uint32_t>(w_[i]).load(std::memory_order_acquire);
 }
 
 void Context::set_word(unsigned i, uint32_t v) {
-    static_cast<volatile uint32_t*>(w_)[i] = v;
+    std::atomic_ref<uint32_t>(w_[i]).store(v, std::memory_order_release);
 }
 
 uint32_t Context::field(unsigned w, unsigned shift, unsigned bits) const {
@@ -1272,7 +1273,15 @@ uint32_t Context::field(unsigned w, unsigned shift, unsigned bits) const {
 
 void Context::set_field(unsigned w, unsigned shift, unsigned bits, uint32_t v) {
     const uint32_t mask = (bits >= 32 ? ~0u : ((1u << bits) - 1u)) << shift;
-    set_word(w, (word(w) & ~mask) | ((v << shift) & mask));
+    const uint32_t masked_v = (v << shift) & mask;
+    std::atomic_ref<uint32_t> ref(w_[w]);
+    uint32_t cur = ref.load(std::memory_order_acquire);
+    for (;;) {
+        const uint32_t next = (cur & ~mask) | masked_v;
+        if (ref.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+    }
 }
 
 uint32_t Context::ring_blocks() const {
@@ -1318,8 +1327,9 @@ std::optional<Frame> read_frame(const uint8_t* data, uint32_t packets, uint32_t 
     if (data == nullptr || packets == 0u || packets > kMaxAddressablePackets) {
         return std::nullopt;
     }
-    if (at < kPacketHeaderBits) {
-        const auto first = first_frame_from(data, packets, 0u);
+    if (at < kPacketHeaderBits || (at % kPacketBits) < kPacketHeaderBits) {
+        const uint32_t pkt = at / kPacketBits;
+        const auto first = first_frame_from(data, packets, pkt);
         if (!first) {
             return std::nullopt;
         }
@@ -1354,6 +1364,7 @@ std::optional<Frame> read_frame(const uint8_t* data, uint32_t packets, uint32_t 
         while (f.bits_gathered < f.length && w.has_bits()) {
             put_bit(f, w.bit());
         }
+        f.end = w.position_fits_u32() ? w.position() : std::numeric_limits<uint32_t>::max();
         if (f.bits_gathered < f.length) {
             f.complete = false;
             return f;
@@ -1478,20 +1489,55 @@ bool step(Context ctx, Voice& v, const ApuMap& map) {
         ++v.stats.bad_frames;
         return true;
     }
+    if (v.partial && ctx.read_bit() >= kPacketHeaderBits) {
+        // The guest explicitly sought into a new bit offset: drop any stale partial frame.
+        v.partial.reset();
+    }
     if (v.partial && ctx.read_bit() < kPacketHeaderBits) {
         // The tail of a frame that began in the other buffer opens this one.
         Frame f = std::move(*v.partial);
         v.partial.reset();
-        if (continue_frame(data, packets, f.length - f.bits_gathered, f) && f.complete) {
+        const uint32_t before_gathered = f.bits_gathered;
+        const bool continued = continue_frame(data, packets, f.length - f.bits_gathered, f);
+        if (continued && f.complete) {
+            const auto first = first_frame_from(data, packets, 0);
+            const uint32_t loops = ctx.loop_count();
+            const uint32_t loop_end = ctx.loop_end_bit();
+            const uint32_t tail_limit = first ? *first : (packets * kPacketBits);
+            const bool tail_at_loop_end =
+                loops > 0 && loop_end >= kPacketHeaderBits && loop_end < tail_limit;
+            if (tail_at_loop_end) {
+                emit(ctx, v, f, (ctx.loop_end_subframe() + 1) * kSubframeSamples);
+                if (loops != kLoopForever) {
+                    ctx.set_field(0, 12, 8, loops - 1);
+                }
+                if (v.decoder != nullptr) {
+                    v.decoder->reset();
+                }
+                v.skip = ctx.loop_skip_subframes() * kSubframeSamples;
+                ctx.set_read_bit(ctx.loop_start_bit());
+                ++v.stats.loops;
+                return true;
+            }
             emit(ctx, v, f, 0);
+            if (first) {
+                ctx.set_read_bit(*first);
+            } else {
+                ctx.set_input_valid(cur, false);
+            }
+        } else if (!continued && f.bits_gathered > before_gathered && f.bits_gathered < f.length) {
+            // Buffer was too short to complete the spanning frame: preserve partial state into the next buffer.
+            v.partial = std::move(f);
+            ctx.set_input_valid(cur, false);
+            ctx.set_read_bit(0);
         } else {
             ++v.stats.bad_frames;
-        }
-        const auto first = first_frame_from(data, packets, 0);
-        if (first) {
-            ctx.set_read_bit(*first);
-        } else {
-            ctx.set_input_valid(cur, false);
+            const auto first = first_frame_from(data, packets, 0);
+            if (first) {
+                ctx.set_read_bit(*first);
+            } else {
+                ctx.set_input_valid(cur, false);
+            }
         }
         return true;
     }
@@ -1508,10 +1554,12 @@ bool step(Context ctx, Voice& v, const ApuMap& map) {
         return true;
     }
     // The loop end lies in this frame: cut it after the loop's end subframe and go back.
+    // Bounded by frame->end when !frame->has_next so a loop_end in the other buffer never triggers
+    // a premature loop on the last frame of the current buffer.
     const uint32_t loops = ctx.loop_count();
     const uint32_t loop_end = ctx.loop_end_bit();
-    const bool at_loop_end = loops > 0 && loop_end != 0 && loop_end >= frame->start &&
-                             (!frame->has_next || loop_end < frame->next);
+    const uint32_t frame_end = frame->has_next ? frame->next : frame->end;
+    const bool at_loop_end = loops > 0 && loop_end != 0 && loop_end >= frame->start && loop_end < frame_end;
     if (at_loop_end) {
         emit(ctx, v, *frame, (ctx.loop_end_subframe() + 1) * kSubframeSamples);
         if (loops != kLoopForever) {
@@ -1546,7 +1594,7 @@ void enable(Context ctx, Voice& voice, std::unique_ptr<FrameDecoder> decoder) {
     voice.pcm.clear();
     voice.partial.reset();
     voice.ended = false;
-    voice.skip = ctx.start_skip_subframes() * kSubframeSamples;
+    voice.skip = ctx.read_bit() < kPacketHeaderBits ? ctx.start_skip_subframes() * kSubframeSamples : 0u;
 }
 
 void advance_read(Context ctx, uint32_t blocks) {
@@ -1570,7 +1618,11 @@ uint32_t pump(Context ctx, Voice& v, const ApuMap& map) {
             break;  // wait for more input (a short tail is written once the stream has ended)
         }
         const uint32_t write = ctx.write_block();
-        uint8_t* out = map(ctx.output_address() + write * kBlockBytes, kBlockBytes);
+        const uint64_t out_addr = uint64_t{ctx.output_address()} + uint64_t{write} * kBlockBytes;
+        if (out_addr > 0xFFFFFFFFull || out_addr + kBlockBytes > 0x100000000ull) {
+            break;
+        }
+        uint8_t* out = map(static_cast<uint32_t>(out_addr), kBlockBytes);
         if (out == nullptr) {
             break;
         }

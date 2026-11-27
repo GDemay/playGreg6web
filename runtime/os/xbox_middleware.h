@@ -330,6 +330,9 @@ struct Pg6XmaContextCensus {
 Pg6XmaContextCensus pg6_mw_xma_context_census(void);
 // The live kind-4 (XMA) context array: its guest address (0 when none) and context count.
 uint64_t pg6_mw_xma_contexts(uint32_t* count);
+// Callback invoked right before shape contexts are freed so the XMA decode worker can quiesce.
+using Pg6XmaContextsReleasedCallback = void (*)(void);
+void pg6_mw_set_xma_contexts_released_callback(Pg6XmaContextsReleasedCallback cb);
 Pg6HResult pg6_mw_apu_create_heap(uint32_t cached_size_in_bytes,
                                   uint32_t non_cached_size_in_bytes);
 Pg6HResult pg6_mw_apu_alloc(void** virtual_address,
@@ -341,6 +344,8 @@ Pg6HResult pg6_mw_apu_free(void* virtual_address);
 int32_t pg6_mw_apu_is_virtual_address_valid(const void* virtual_address,
                                             uint32_t physical_address_in_bytes);
 void* pg6_mw_apu_map_apu_address(Pg6ApuAddress apu_address);
+// Maps a contiguous [apu_address, apu_address + bytes) range within a single live APU allocation.
+void* pg6_mw_apu_map_apu_range(Pg6ApuAddress apu_address, size_t bytes);
 Pg6ApuAddress pg6_mw_apu_map_virtual_address(const void* virtual_address);
 
 // ---------------------------------------------------------------------------

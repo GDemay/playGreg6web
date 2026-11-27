@@ -1467,10 +1467,19 @@ bool SleepConditionVariableCS(ConditionVariable* condition_variable,
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
+    const int32_t saved_recursion = critical_section->recursion_count;
     return sleep_on_condition_variable(
         condition_variable, timeout_ms,
-        [&]() { LeaveCriticalSection(critical_section); },
-        [&]() { EnterCriticalSection(critical_section); });
+        [&]() {
+            for (int32_t i = 0; i < saved_recursion; ++i) {
+                LeaveCriticalSection(critical_section);
+            }
+        },
+        [&]() {
+            for (int32_t i = 0; i < saved_recursion; ++i) {
+                EnterCriticalSection(critical_section);
+            }
+        });
 }
 
 void WakeConditionVariable(ConditionVariable* condition_variable) {
@@ -1489,6 +1498,17 @@ void WakeAllConditionVariable(ConditionVariable* condition_variable) {
 // Threads
 // ---------------------------------------------------------------------------
 
+// Live thread registry for OpenThread(thread_id) across threads.
+struct LiveThreads {
+    std::mutex mutex;
+    std::unordered_map<uint32_t, std::weak_ptr<ThreadObject>> by_id;
+};
+
+LiveThreads& live_threads() {
+    static auto* table = new LiveThreads();
+    return *table;
+}
+
 Handle CreateThread(void* security_attributes,
                     uint64_t stack_size,
                     Pg6ThreadStartRoutine start_address,
@@ -1506,6 +1526,20 @@ Handle CreateThread(void* security_attributes,
         allocate_thread_id(), g_process_affinity_mask.load(std::memory_order_relaxed));
     auto thread = std::make_shared<ThreadObject>(
         info, start_address, parameter, (creation_flags & CREATE_SUSPENDED) != 0);
+    {
+        auto& lt = live_threads();
+        std::lock_guard<std::mutex> lock(lt.mutex);
+        if (lt.by_id.size() > 64) {
+            for (auto it = lt.by_id.begin(); it != lt.by_id.end();) {
+                if (it->second.expired()) {
+                    it = lt.by_id.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        lt.by_id[info->id] = thread;
+    }
     const Handle handle = insert_dispatcher_object(thread);
 
     // Published before the thread starts, so the new thread may read it immediately.
@@ -1516,6 +1550,11 @@ Handle CreateThread(void* security_attributes,
     try {
         std::thread(thread_trampoline, std::move(thread)).detach();
     } catch (...) {
+        {
+            auto& lt = live_threads();
+            std::lock_guard<std::mutex> lock(lt.mutex);
+            lt.by_id.erase(info->id);
+        }
         CloseHandle(handle);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return kNullHandle;
@@ -1560,6 +1599,31 @@ uint32_t GetCurrentThreadId() {
     return current_thread_info().id;
 }
 
+Handle OpenThreadById(uint32_t thread_id) {
+    if (thread_id == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return kNullHandle;
+    }
+    std::shared_ptr<ThreadObject> found;
+    {
+        auto& lt = live_threads();
+        std::lock_guard<std::mutex> lock(lt.mutex);
+        auto it = lt.by_id.find(thread_id);
+        if (it != lt.by_id.end()) {
+            found = it->second.lock();
+            if (!found) {
+                lt.by_id.erase(it);
+            }
+        }
+    }
+    if (!found) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return kNullHandle;
+    }
+    SetLastError(ERROR_SUCCESS);
+    return insert_dispatcher_object(std::move(found));
+}
+
 uint64_t SetThreadAffinityMask(Handle thread, uint64_t affinity_mask) {
     ThreadInfo* info = nullptr;
     std::shared_ptr<ThreadObject> object;
@@ -1578,6 +1642,27 @@ uint64_t SetThreadAffinityMask(Handle thread, uint64_t affinity_mask) {
         return 0;
     }
     return info->affinity_mask.exchange(affinity_mask, std::memory_order_relaxed);
+}
+
+bool GetThreadAffinityMask(Handle thread, uint64_t* out_mask) {
+    if (out_mask == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    uint64_t mask = 0;
+    if (thread == kCurrentThreadPseudoHandle) {
+        mask = current_thread_info().affinity_mask.load(std::memory_order_relaxed);
+    } else {
+        auto object = lookup_as<ThreadObject>(thread, ObjectType::Thread);
+        if (!object) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        mask = object->info->affinity_mask.load(std::memory_order_relaxed);
+    }
+    const uint64_t proc = get_process_affinity_mask();
+    *out_mask = (mask & proc) != 0 ? (mask & proc) : proc;
+    return true;
 }
 
 // ---------------------------------------------------------------------------

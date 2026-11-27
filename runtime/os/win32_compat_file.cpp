@@ -592,7 +592,7 @@ int32_t pg6_win32_set_file_time(Pg6Handle file,
     if (!win32::query_file_handle(file, &info)) {
         return 0;
     }
-    if (!info.is_userdata || (info.desired_access & win32::GENERIC_WRITE) == 0) {
+    if (!info.is_userdata || !win32::has_write_access(info.desired_access)) {
         win32::SetLastError(win32::ERROR_ACCESS_DENIED);
         return 0;
     }
@@ -644,7 +644,7 @@ int32_t pg6_win32_flush_file_buffers(Pg6Handle file) {
     if (!win32::query_file_handle(file, &info)) {
         return 0;
     }
-    if ((info.desired_access & win32::GENERIC_WRITE) == 0) {
+    if (!win32::has_write_access(info.desired_access)) {
         win32::SetLastError(win32::ERROR_ACCESS_DENIED);
         return 0;
     }
