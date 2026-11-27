@@ -293,6 +293,21 @@ public:
 
     // Bounds- and protection-checked copies (thin wrappers over memcpy on the backing).
     bool read(uint64_t addr, void* dst, size_t len) const;
+
+    // Fault reporting reads guest memory (backtraces, the report) on the faulting thread, and that
+    // thread may hold this arena's lock: a host fault inside a GuestRangeView / host_ptr_const_held
+    // hold (content_hash in flush_cpu_buffers). A blocking lock there self-deadlocks (MSVC throws
+    // resource_deadlock_would_occur, the process terminates with exit 9 and no report). While a
+    // DiagnosticReads scope is alive on a thread, read() there only tries the lock, for a bounded
+    // time, and reads as "not readable" when it stays busy.
+    class DiagnosticReads {
+    public:
+        DiagnosticReads();
+        ~DiagnosticReads();
+        DiagnosticReads(const DiagnosticReads&) = delete;
+        DiagnosticReads& operator=(const DiagnosticReads&) = delete;
+        static bool active();
+    };
     bool write(uint64_t addr, const void* src, size_t len);
 
     // Host pointer for [addr, addr + len) if every page in it is committed and writable

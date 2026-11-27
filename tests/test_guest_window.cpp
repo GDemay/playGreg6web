@@ -1480,6 +1480,42 @@ void test_shared_view_unmap_never_faults_a_locked_reader() {
     release_shared_page(page_b);
 }
 
+// A host fault inside a held view (content_hash under a GuestRangeView hold) reports on the
+// faulting thread, which still holds the arena lock: under DiagnosticReads the report's guest reads
+// on that thread fail fast instead of self-deadlocking (MSVC: resource_deadlock_would_occur ->
+// terminate -> exit 9 with no report); other threads' reads are unaffected.
+void test_diagnostic_reads_do_not_block_on_a_held_arena_lock() {
+    Pages pages;
+    CHECK(pages.host != nullptr);
+    std::memcpy(pages.page(0), "diag", 4);
+    uint32_t word = 0;
+    {
+        std::unique_lock<std::mutex> hold;
+        CHECK(arena().host_ptr_const_held(pages.va, 64, hold) == pages.page(0));
+        CHECK(hold.owns_lock());
+        const VirtualMemoryArena::DiagnosticReads diagnostic;
+        CHECK(VirtualMemoryArena::DiagnosticReads::active());
+        const auto start = std::chrono::steady_clock::now();
+        CHECK(!arena().read(pages.va, &word, sizeof(word)));  // busy (this thread): not readable
+        CHECK(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+        // Another thread (no scope) still waits for the lock as usual and reads after release.
+        std::atomic<bool> other_read{false};
+        std::thread other([&] {
+            CHECK(!VirtualMemoryArena::DiagnosticReads::active());
+            uint32_t w = 0;
+            other_read.store(arena().read(pages.va, &w, sizeof(w)) && std::memcmp(&w, "diag", 4) == 0);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(!other_read.load());
+        hold.unlock();
+        other.join();
+        CHECK(other_read.load());
+        CHECK(arena().read(pages.va, &word, sizeof(word)));  // free again: the scope reads normally
+        CHECK(std::memcmp(&word, "diag", 4) == 0);
+    }
+    CHECK(!VirtualMemoryArena::DiagnosticReads::active());
+}
+
 int main() {
     std::printf("test_guest_window\n");
     test_table_translation_and_copies();
@@ -1500,6 +1536,7 @@ int main() {
     test_range_view_holds_the_arena_lock_in_the_window();
     test_xmem_mirrored_2mb_page_maps_all_32_slots();
     test_shared_view_unmap_never_faults_a_locked_reader();
+    test_diagnostic_reads_do_not_block_on_a_held_arena_lock();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;

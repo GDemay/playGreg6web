@@ -3583,6 +3583,9 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
     if (!b.active) {
         return false;
     }
+    // The faulting thread may hold the arena lock (a host fault inside a held guest view): the
+    // backtrace and report reads below must not block on it.
+    const VirtualMemoryArena::DiagnosticReads diagnostic_reads;
     t_observer.flush_dispatches();
     const char* name = kind != nullptr ? kind : "host_fault";
     if (b.fault.present && (std::strcmp(name, "host_terminate") == 0 || std::strcmp(name, "host_abort") == 0)) {
