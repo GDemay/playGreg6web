@@ -9293,6 +9293,26 @@ void test_native_flush_page_index() {
         CHECK(com::write_guest(uni, two));
         CHECK(flush().size() == 3);  // A, B, the uniform range in B
         CHECK(flush().empty());
+        // A uniform range relocated after the others were primed: compared at the next flush (it is
+        // unprimed, so the indexed flush visits it without a take naming its page), then skipped.
+        const uint64_t uni4 = mem + 3 * k64K + 0x400;
+        CHECK(com::write_guest(uni4, two));
+        flush();  // (the write's own page report)
+        uint32_t id_u4 = 0;
+        uint64_t off_u4 = 0;
+        CHECK(dev->relocate_uniform(uni4, 64, 64, &id_u4, &off_u4));
+        {
+            const auto w = flush();
+            CHECK(has_write(w, id_u4, off_u4));
+        }
+        flush();
+        CHECK(flush().empty());
+        CHECK(com::write_guest(uni4 + 8, one));
+        {
+            const auto w = flush();
+            CHECK(has_write(w, id_u4, off_u4));
+        }
+        CHECK(flush().empty());
         CHECK(dg::work_total(dg::Work::FlushCrosscheckMisses) == misses0);
         // A buffer released between flushes leaves the index (no stale key is visited), and the
         // uniform range inside it, no longer covered by a take, is compared again.

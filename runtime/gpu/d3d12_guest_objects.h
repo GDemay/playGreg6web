@@ -1294,6 +1294,9 @@ private:
     // --flush-crosscheck: skipped entries that uploaded anyway (each must be reported at the next flush).
     std::unordered_set<const void*> crosscheck_buffers_;   // under tracked_mutex_
     std::unordered_set<const void*> crosscheck_uniforms_;  // under relocation_mutex_
+    // The relocations_ entries with primed == false (under relocation_mutex_): with the ones a take
+    // reported, the only uniform ranges an indexed flush visits.
+    std::unordered_set<RelocatedUniform*> uniform_unprimed_;
     // Under flush_mutex_: the flush take's position, the flush sequence and whether the index is in use.
     os::WriteCursor flush_cursor_{};
     uint64_t flush_seq_ = 0;
