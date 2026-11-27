@@ -1,0 +1,67 @@
+name: Matched frame-path performance probes
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: true
+        default: '14d1b86644dbc35fbf32d9522c505972545a7d8a'
+      patch_ref:
+        required: true
+permissions:
+  contents: read
+jobs:
+  windows-flush:
+    name: Matched Windows indexed flush
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: PlayGreg6Web/playGreg6web
+          ref: ${{ inputs.base_ref }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.patch_ref }}
+          path: patch
+      - name: Prepare identical benchmark source and record environment
+        shell: pwsh
+        run: |
+          Copy-Item patch/tests/bench_native_flush.cpp baseline/tests/bench_native_flush.cpp
+          @'
+          option(PLAYGTA6_PERFORMANCE_BENCHMARKS "Build manual performance probes" OFF)
+          if(PLAYGTA6_PERFORMANCE_BENCHMARKS)
+            add_executable(bench_native_flush ../tests/bench_native_flush.cpp)
+            target_link_libraries(bench_native_flush PRIVATE playgta6_core)
+          endif()
+          '@ | Add-Content baseline/runtime/CMakeLists.txt
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $machine = Get-CimInstance Win32_ComputerSystem
+          @{ os = [System.Environment]::OSVersion.VersionString; cpu = $cpu.Name; logical_cpus = [System.Environment]::ProcessorCount; memory_bytes = $machine.TotalPhysicalMemory; compiler = 'MSVC Visual Studio 2022, Release /O2 /MP4'; flags = 'PLAYGTA6_OPUS=OFF; PLAYGTA6_PERFORMANCE_BENCHMARKS=ON'; baseline = (git -C baseline rev-parse HEAD); patch = (git -C patch rev-parse HEAD) } | ConvertTo-Json | Set-Content runner-environment.json
+      - name: Build baseline and patch separately
+        shell: pwsh
+        run: |
+          cmake -S baseline/runtime -B baseline-build -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON -DCMAKE_CXX_FLAGS=/MP4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build baseline-build --config Release --parallel 4 --target bench_native_flush
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake -S patch/runtime -B patch-build -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON -DCMAKE_CXX_FLAGS=/MP4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build patch-build --config Release --parallel 4 --target bench_native_flush test_d3d12_xs_exports
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./patch-build/Release/test_d3d12_xs_exports.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Matched measurements without concurrent builds
+        shell: pwsh
+        run: |
+          python runner/tools/perf_run_native_flush.py baseline-build/Release/bench_native_flush.exe patch-build/Release/bench_native_flush.exe --output results/windows-flush.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-frame-flush
+          path: results/*.json
+          if-no-files-found: ignore
