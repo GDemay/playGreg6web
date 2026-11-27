@@ -2,6 +2,7 @@
 // clear/present, buffers, textures, shaders, layouts, pipelines, draws and dispatches, v1 pipelines,
 // GPU -> CPU read-backs into (host) memory and GPU pass timestamps, with every result read back from the GPU. Exits 77
 // (CTest: skipped) when the host has no WebGPU adapter. Built with -DPLAYGTA6_NATIVE_EXECUTOR=ON.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <thread>
@@ -21,6 +22,7 @@
 #include "gpu/native_exec/native_executor.h"
 #include "gpu/state_bridge.h"
 #include "gpu/native_exec/reflection_model.h"
+#include "gpu/native_exec/shader_quarantine.h"
 #include "png_stored_decode.h"
 #include "gpu/native_exec/show_target_model.h"
 
@@ -1464,6 +1466,56 @@ void test_failed_async_pipeline_resolves(NativeExecutor& ex) {
     CHECK(ex.stats().pipeline_failed_skips > mid.pipeline_failed_skips);
 }
 
+// A failing pipeline whose fragment shader has a non-zero (pack) hash lands in failed_pipeline_hashes once
+// (inline test shaders have hash 0, which is never recorded) and in the --auto-quarantine file text.
+void test_failed_pipeline_records_hash(NativeExecutor& ex) {
+    const uint64_t kBadHash = 0x00bad0de0000f5a1ull;
+    const std::string wgsl = "this is not wgsl";
+    std::vector<uint8_t> pack = {'W', 'G', 'P', 'K', 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+    append(pack, kBadHash);
+    pack.push_back(1);  // fragment
+    pack.insert(pack.end(), 3, 0);
+    append(pack, static_cast<uint32_t>(16 + 20));
+    append(pack, static_cast<uint32_t>(wgsl.size()));
+    pack.insert(pack.end(), wgsl.begin(), wgsl.end());
+    const std::string path = "test_native_executor_failhash.wgsl.pack";
+    {
+        std::ofstream f(path, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(pack.data()), static_cast<std::streamsize>(pack.size()));
+    }
+    std::string err;
+    CHECK(ex.load_wgsl_pack(path, &err));
+    std::remove(path.c_str());
+    const size_t known = ex.stats().failed_pipeline_hashes.size();
+    gpu::CommandEncoder setup;
+    setup.create_shader_module(90, GpuShaderStage::Vertex, "this is not wgsl");
+    setup.create_shader_module(91, GpuShaderStage::Fragment, "0x00bad0de0000f5a1");
+    create_layouts(setup, 92, 93, {});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(94, 90, 91, 93)));
+    run(ex, setup);
+    for (int i = 0; i < 2; ++i) {  // twice: the hash is recorded once
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+        frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+        frame.set_pipeline(94);
+        frame.draw(3);
+        frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+        frame.present();
+        run(ex, frame);
+        ex.wait_idle();
+        ex.poll();
+    }
+    const auto& failed = ex.stats().failed_pipeline_hashes;
+    CHECK(failed.size() == known + 1);
+    CHECK(std::count(failed.begin(), failed.end(), kBadHash) == 1);
+    CHECK(ex.stats_json().find("\"failed_pipeline_hashes\"") != std::string::npos);
+    const std::string file =
+        gpu::native_exec::ShaderQuarantine::merge_auto_file("# my note\n", failed);
+    CHECK(file.find("# my note\n") == 0);
+    CHECK(file.find("0x00bad0de0000f5a1 pipeline_failed auto\n") != std::string::npos);
+}
+
 // Live-mode options: pipelines are created asynchronously (awaited at first use, same output) and
 // Dawn's compiled blobs persist in an on-disk cache that a second executor reuses.
 void test_async_pipelines_and_blob_cache() {
@@ -1495,7 +1547,10 @@ void test_async_pipelines_and_blob_cache() {
         CHECK(st.async_pipelines > 0);
         CHECK(st.async_pipeline_failures == 0);
         CHECK(st.device_errors == 0);
-        if (run_index == 0) test_failed_async_pipeline_resolves(*ex);
+        if (run_index == 0) {
+            test_failed_async_pipeline_resolves(*ex);
+            test_failed_pipeline_records_hash(*ex);
+        }
         CHECK(ex->stats_json().find("\"blob_cache\": {\"enabled\": true") != std::string::npos);
         std::printf("blob cache run %d: hits=%llu misses=%llu stores=%llu entries=%llu bytes=%llu (async waits %llu)\n",
                     run_index, static_cast<unsigned long long>(st.blob_hits), static_cast<unsigned long long>(st.blob_misses),
