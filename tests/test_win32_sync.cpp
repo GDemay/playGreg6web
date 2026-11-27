@@ -1993,6 +1993,87 @@ void test_open_thread_by_id_and_affinity_query() {
     CHECK(CloseHandle(gate));
 }
 
+// blocked_waits_json lists a parked waiter with the object's state, and drops it once satisfied.
+void test_blocked_wait_census() {
+    const Handle event = CreateEventW(nullptr, false, false, nullptr);
+    CHECK(valid(event));
+    std::atomic<uint32_t> waiter_tid{0};
+    std::atomic<uint32_t> result{0xffffffffu};
+    std::thread waiter([&] {
+        waiter_tid.store(GetCurrentThreadId());
+        result.store(WaitForSingleObject(event, kLongWait));
+    });
+    const std::string tid_key = [&] {
+        while (waiter_tid.load() == 0) {
+            std::this_thread::yield();
+        }
+        return "\"thread_id\": " + std::to_string(waiter_tid.load()) + ",";
+    }();
+    std::string parked;
+    for (int i = 0; i < 500 && parked.find(tid_key) == std::string::npos; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        parked = blocked_waits_json(0);
+    }
+    CHECK(parked.find(tid_key) != std::string::npos);
+    CHECK(parked.find("\"type\": \"event\", \"state\": 0, \"signaled_for_waiter\": false, \"queued\": true") !=
+          std::string::npos);
+    CHECK(parked.find("\"signals_during_wait\": 0") != std::string::npos);
+    CHECK(blocked_waits_json(60000).find(tid_key) == std::string::npos);  // not parked that long
+    CHECK(SetEvent(event));
+    waiter.join();
+    CHECK(result.load() == WAIT_OBJECT_0);
+    CHECK(blocked_waits_json(0).find(tid_key) == std::string::npos);
+    CHECK(CloseHandle(event));
+}
+
+// The title's job-counter wait (sub_145098940 and its workers): the waiter sets a flag bit in the
+// pending-job counter and parks on an auto-reset event only if jobs are left; the worker that
+// takes the counter to "flag only" sets the event. Jobs are handed to workers through a
+// semaphore. A lost wakeup anywhere in the event/semaphore handoff shows up as a timed-out wait.
+void test_job_counter_wait_pattern_stress() {
+    constexpr uint32_t kWaitFlag = 0x80000000u;
+    constexpr int kWorkers = 6;
+    constexpr int kRounds = 3000;
+    const Handle jobs = CreateSemaphoreW(nullptr, 0, 0x7fff, nullptr);
+    const Handle done = CreateEventW(nullptr, false, false, nullptr);
+    CHECK(valid(jobs) && valid(done));
+    std::atomic<uint32_t> pending{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> workers;
+    for (int w = 0; w < kWorkers; ++w) {
+        workers.emplace_back([&] {
+            for (;;) {
+                if (WaitForSingleObject(jobs, kLongWait) != WAIT_OBJECT_0 || stop.load()) {
+                    return;
+                }
+                if (pending.fetch_sub(1) == kWaitFlag + 1) {
+                    CHECK(SetEvent(done));
+                }
+            }
+        });
+    }
+    int lost = 0;
+    for (int round = 0; round < kRounds && lost == 0; ++round) {
+        const uint32_t n = 1 + static_cast<uint32_t>(round % 9);
+        pending.store(n);
+        CHECK(ReleaseSemaphore(jobs, static_cast<int32_t>(n), nullptr));
+        const uint32_t before = pending.fetch_add(kWaitFlag);
+        if ((before & ~kWaitFlag) != 0 && WaitForSingleObject(done, kLongWait) != WAIT_OBJECT_0) {
+            ++lost;
+            std::fprintf(stderr, "job-counter wait lost a wakeup in round %d: %s\n", round,
+                         blocked_waits_json(0).c_str());
+        }
+        CHECK(pending.load() == kWaitFlag);
+    }
+    CHECK(lost == 0);
+    stop.store(true);
+    CHECK(ReleaseSemaphore(jobs, kWorkers, nullptr));
+    for (std::thread& t : workers) {
+        t.join();
+    }
+    CHECK(CloseHandle(jobs) && CloseHandle(done));
+}
+
 int main() {
 #if defined(_WIN32)
     _putenv_s("PG6_EVENT_TRACE", "1");
@@ -2020,6 +2101,8 @@ int main() {
     test_threads();
     test_thread_pool();
     test_handle_errors();
+    test_blocked_wait_census();
+    test_job_counter_wait_pattern_stress();
     shutdown_thread_pool();
 
     if (g_failures != 0) {

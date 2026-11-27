@@ -3101,6 +3101,8 @@ std::string build_report() {
     }
     o += "  \"guest_sleep\": " + os::host_sleep::guest_sleep_stats_json() + ",\n";
     o += "  \"guest_timed_wait\": " + os::host_sleep::guest_timed_wait_stats_json() + ",\n";
+    // Threads parked in a WaitFor* call for over a second, with the state of what they wait on.
+    o += "  \"blocked_waits\": " + os::win32::blocked_waits_json(1000) + ",\n";
     // R40: per-present samples without a GPU capture (the last gpu::PresentSampleRing::kDefaultCapacity).
     {
         std::lock_guard<std::mutex> lock(b.mutex);

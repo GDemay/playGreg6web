@@ -60,6 +60,13 @@ The `bink` block of the report lists Bink export lookups that returned null (`lo
   fault record gives the address and call stack; usually a missing or wrong runtime behaviour earlier on.
 - **Host access violation**: a bug in the harness or runtime, not the game. Gives a minidump; use
   `minidump_stack.py`.
+- **Host access violation at address 0 in `sub_142215A60`** (host frames `sub_142215A60` <- `sub_142215EA0`,
+  the faulting thread only calls `Sleep(1000)` and `QueryPerformanceCounter`): the title's own hang watchdog. It
+  writes to address 0 on purpose after the main loop has not ticked for about 30 s, so the cause is whatever
+  the main thread was stuck on. Look at the report's `blocked_waits` (every thread parked over 1 s in a
+  `WaitFor*`, with the object's state, signals since it parked and the last signaler) and `streaming_drain`.
+  An object `signaled_for_waiter: true` with the waiter still parked is a lost wakeup in the runtime; an
+  object never signaled points at the producer (a job that never finishes, a streaming request never done).
 - **Unresolved indirect call**: rerun, then use `--seed-targets` (see `tools/run_native_boot.py`), or `triage_fault.py`.
 - **Watchdog / time limit**: the run hit `--max-ms` (not a crash) or `--watchdog-ms` (it did not stop in time:
   read the `[hang-stack]` lines and the watchdog dump).

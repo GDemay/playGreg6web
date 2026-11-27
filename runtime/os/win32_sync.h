@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "os/win32_kernel.h"
 
@@ -66,6 +67,12 @@ void set_event_trace_caller(uint64_t (*caller)());
 bool event_trace_enabled(Handle handle);
 // Extra trace line for a traced handle (e.g. a fence wait registered on it).
 void event_trace_note(const char* op, Handle handle, const char* detail);
+
+// Threads parked in a WaitFor* call for at least `min_blocked_ms`, as a JSON array: per object its
+// type and state (event signaled / semaphore count / mutex owner / thread exited), whether it is
+// signaled for the waiter while the waiter is still parked (a lost wakeup in this runtime), the
+// signals since the waiter parked, and the last signaler (thread, guest caller, how long ago).
+std::string blocked_waits_json(uint32_t min_blocked_ms);
 
 // SleepConditionVariableSRW flags.
 inline constexpr uint32_t CONDITION_VARIABLE_LOCKMODE_SHARED = 0x1u;
