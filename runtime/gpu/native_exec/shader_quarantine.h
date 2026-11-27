@@ -14,6 +14,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -125,6 +127,27 @@ public:
         if (out.empty()) out = "# Auto-quarantine: shaders whose pipeline creation failed on this title (delete the file to reset).\n";
         else if (out.back() != '\n') out += '\n';
         return out + add;
+    }
+
+    // Reads `path`, merges `failed` (merge_auto_file) and writes the file back, flushed and closed before it
+    // returns (a crash right after must not lose it). Returns 1 when the file was written, 0 when there was
+    // nothing to add (or the file is unparsable and left alone), -1 when it could not be written (the caller logs).
+    static int persist_auto_file(const std::string& path, const std::vector<uint64_t>& failed) {
+        std::string existing;
+        try {
+            std::ifstream f(path, std::ios::binary);
+            if (f) existing.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        } catch (...) {
+            return -1;  // e.g. the path is a directory (libstdc++ throws on read)
+        }
+        const std::string out = merge_auto_file(existing, failed);
+        if (out.empty()) return 0;
+        std::ofstream o(path, std::ios::binary | std::ios::trunc);
+        if (!o) return -1;
+        o << out;
+        o.flush();
+        o.close();
+        return o.fail() ? -1 : 1;
     }
 
     void add(uint64_t hash, const std::string& note) {
