@@ -1,0 +1,47 @@
+name: Matched descriptor range overlap detection
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: true
+      patch_ref:
+        required: true
+permissions:
+  contents: read
+jobs:
+  linux-descriptors:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: PlayGreg6Web/playGreg6web
+          ref: ${{ inputs.base_ref }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.patch_ref }}
+          path: patch
+      - name: Same test and benchmark sources, separate implementations
+        run: |
+          mkdir -p results
+          python3 runner/tools/perf_run_fragmented_flush.py --environment-only --flags '-std=c++20 -O3 -DNDEBUG -pthread; standalone descriptor implementation' --output results/environment.json --base "${{ inputs.base_ref }}" --patch "${{ inputs.patch_ref }}"
+          sha256sum patch/tools/bench_descriptor_ranges.cpp patch/tools/bench_descriptor_ranges.py patch/tests/test_descriptor_heap.cpp > results/source-hashes.txt
+          for tree in baseline patch; do
+            c++ -std=c++20 -O3 -DNDEBUG -pthread -I"$tree/runtime" patch/tests/test_descriptor_heap.cpp "$tree/runtime/gpu/descriptor_heap.cpp" -o "$tree-tests"
+            "./$tree-tests"
+            c++ -std=c++20 -O3 -DNDEBUG -pthread -I"$tree/runtime" patch/tools/bench_descriptor_ranges.cpp "$tree/runtime/gpu/descriptor_heap.cpp" -o "$tree-bin"
+          done
+      - name: Alternating seven-pair measurements after all builds
+        run: |
+          python3 patch/tools/bench_descriptor_ranges.py ./baseline-bin ./patch-bin --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.patch_ref }}" --samples 7 > results/descriptors.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: descriptor-range-controls
+          path: results/*
+          if-no-files-found: ignore
