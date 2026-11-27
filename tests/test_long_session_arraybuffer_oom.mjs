@@ -423,3 +423,89 @@ test('RenderStatePackets bounds _textureGenerations, _seenWarningKeys, and layou
     `layoutsByContent must stay <= 4096 (got ${ext.layoutsByContent.size})`,
   );
 });
+
+test('em-pthread early-return execution of loader.js has zero TDZ ReferenceErrors on shared Wasm stub path', async () => {
+  const vm = await import('node:vm');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const loaderSrc = fs.readFileSync(
+    path.resolve(process.cwd(), 'web/loader.js'),
+    'utf8',
+  );
+
+  // Build a real compiled WebAssembly.Module so customSections/instanceof behave like Chrome.
+  const minimalWasm = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+  const sharedMod = new WebAssembly.Module(minimalWasm);
+  let importScriptsCalls = 0;
+
+  const listeners = [];
+  const workerGlobal = {
+    name: 'em-pthread-1',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    TextDecoder,
+    TextEncoder,
+    ArrayBuffer,
+    Uint8Array,
+    DataView,
+    WebAssembly: {
+      Module: WebAssembly.Module,
+      Instance: WebAssembly.Instance,
+      Memory: WebAssembly.Memory,
+      Table: WebAssembly.Table,
+      compile: WebAssembly.compile.bind(WebAssembly),
+      instantiate: WebAssembly.instantiate.bind(WebAssembly),
+      compileStreaming: async () => sharedMod,
+      instantiateStreaming: async (_s, imports) => ({
+        module: sharedMod,
+        instance: new WebAssembly.Instance(sharedMod, imports),
+      }),
+    },
+    Response,
+    fetch: async () => {
+      throw new Error('unexpected network fetch in pthread stub TDZ test');
+    },
+    importScripts(url) {
+      importScriptsCalls += 1;
+      if (String(url).includes('runtime.js')) {
+        workerGlobal.onmessage = () => {};
+      }
+    },
+    addEventListener(type, fn) {
+      if (type === 'message' && typeof fn === 'function') {
+        listeners.push(fn);
+      }
+    },
+    removeEventListener() {},
+    postMessage() {},
+  };
+  workerGlobal.self = workerGlobal;
+  workerGlobal.globalThis = workerGlobal;
+
+  // Execute web/loader.js in an isolated VM context so the em-pthread branch runs line 123 and
+  // returns at line 129 BEFORE any later top-level const/let declarations execute.
+  vm.runInNewContext(loaderSrc, workerGlobal, { filename: 'web/loader.js' });
+  assert.ok(importScriptsCalls >= 1, 'pthread bootstrap must invoke importScripts');
+  assert.ok(listeners.length >= 1, 'pthread bootstrap must register message listener');
+
+  // Deliver precompiled side module via message listener, then exercise fetch -> arrayBuffer -> compile/instantiate.
+  for (const fn of listeners) {
+    fn({
+      data: {
+        __playgta6_shared_modules: [sharedMod],
+        __playgta6_shared_module_names: ['guest_part_0.wasm'],
+      },
+    });
+  }
+
+  const resp = await workerGlobal.fetch('http://127.0.0.1:8080/boot/guest_part_0.wasm');
+  const stubBuf = await resp.arrayBuffer();
+  assert.ok(stubBuf.byteLength > 0 && stubBuf.byteLength < 1024, 'expected tiny stub buffer');
+
+  // Calling compile() and instantiate() on a fresh copy of the stub exercises extractSharedWasmStubKey(),
+  // which previously threw ReferenceError: Cannot access 'SHARED_WASM_STUB_MAX_BYTES' before initialization!
+  const freshCopy = new Uint8Array(stubBuf).slice();
+  const compiled = await workerGlobal.WebAssembly.compile(freshCopy);
+  assert.ok(compiled === sharedMod, 'WebAssembly.compile on copied stub must return shared module without TDZ');
+  const instantiated = await workerGlobal.WebAssembly.instantiate(freshCopy, {});
+  assert.ok(instantiated.module === sharedMod, 'WebAssembly.instantiate on copied stub must return shared module');
+});

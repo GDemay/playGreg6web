@@ -104,6 +104,9 @@ const DEFAULT_MEMFS_PIPELINE_DUMP_MAX_CONCURRENT_UPLOADS = 4;
 const MAX_MEMFS_DUMP_WALK_DEPTH = 16;
 const utf8Decoder = new TextDecoder('utf-8', { fatal: false });
 const utf8Encoder = new TextEncoder();
+// Must stay above the em-pthread early-return bootstrap below so pthread workers never hit TDZ.
+const SHARED_WASM_STUB_CUSTOM_SECTION_NAME = 'pg6.shared.ref';
+const SHARED_WASM_STUB_MAX_BYTES = 16384;
 
 // Emscripten 7.0.1 `-pthread` spawns `new Worker(pthreadMainJs, { name: "em-pthread-" + id })`
 // (or legacy `{ name: "em-pthread" }`), which our coordinator Worker Proxy redirects to `loader.js`.
@@ -2940,9 +2943,6 @@ function patchPthreadWasmImports(wasmModuleOrBytes, rawImports, wasmNs, hostImpo
   patchedImports.env = patchedEnv;
   return patchedImports;
 }
-
-const SHARED_WASM_STUB_CUSTOM_SECTION_NAME = 'pg6.shared.ref';
-const SHARED_WASM_STUB_MAX_BYTES = 16384;
 
 function encodeWasmUleb128(value) {
   let n = value >>> 0;
