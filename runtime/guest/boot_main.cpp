@@ -318,6 +318,7 @@ struct Options {
     bool fault_record = true;    // --no-fault-record: no fault_record / entry ring (benchmarks)
     std::vector<playgta6::guest::WatchRange> watch;  // --watch-guest-va <addr>[:len] (repeatable)
     bool present_honor_interval = false;  // --present-interval honor|min1 (default min1)
+    bool test_stall = false;  // --test-stall: test seam, the boot thread hangs once the boot is active
     bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
 
@@ -443,6 +444,8 @@ bool parse(int argc, char** argv, Options& o) {
                 std::fprintf(stderr, "%s\n", err.c_str());
                 return false;
             }
+        } else if (a == "--test-stall") {
+            o.test_stall = true;
         } else if (a == "--overlay") {
             o.overlay = true;
         } else if (a == "--skip-shader" && i + 1 < argc) {
@@ -756,6 +759,9 @@ std::thread g_profile_thread;
 std::map<uint32_t, std::map<std::string, uint64_t>> g_profile_labels;  // sampler thread, then writer
 
 void profile_thread_started(uint32_t thread_id) {
+    if (g_options.test_stall) {  // tests/test_boot_watchdog_e2e.cpp: a stalled run for the watchdog path
+        for (;;) std::this_thread::sleep_for(std::chrono::hours(1));
+    }
     HANDLE h = nullptr;
     if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &h,
                         THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0)) {

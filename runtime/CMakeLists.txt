@@ -486,6 +486,12 @@ else()
         add_test(NAME playgta6_minidump_e2e_tests COMMAND test_minidump_e2e)
         set_tests_properties(playgta6_minidump_e2e_tests PROPERTIES
             ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+
+        # The real playgta6_boot watchdog path (stall seam --test-stall, synthetic image): stacks, dump, report.
+        add_executable(test_boot_watchdog_e2e ../tests/test_boot_watchdog_e2e.cpp)
+        target_include_directories(test_boot_watchdog_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME playgta6_boot_watchdog_e2e_tests COMMAND test_boot_watchdog_e2e $<TARGET_FILE:playgta6_boot>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py)
     endif()
 
     add_executable(test_host_marshallers ../tests/test_host_marshallers.cpp)
