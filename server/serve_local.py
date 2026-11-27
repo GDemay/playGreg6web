@@ -311,21 +311,23 @@ def parse_byte_range_status(header: str, file_size: int) -> tuple[str, tuple[int
 
     Returns:
         - `("ok", (start, end))` for a valid satisfiable single `bytes=` range.
-        - `("unsatisfiable", None)` for a syntactically valid single `bytes=` range
-          that cannot be satisfied against `file_size` (server responds `416`).
-        - `("ignore", None)` for unsupported range units (e.g. `items=0-5`),
-          multi-range specs (`bytes=0-10, 20-30`), or malformed syntax (server
-          ignores `Range` and responds `200 OK`).
+        - `("unsatisfiable", None)` for a single `bytes=` range that is malformed or
+          cannot be satisfied against `file_size` (server responds `416`).
+        - `("ignore", None)` for unsupported range units (e.g. `items=0-5`) or
+          multi-range specs (`bytes=0-10, 20-30`) (server ignores `Range` and
+          responds `200 OK`).
     """
     stripped = header.strip()
     if not stripped:
         return "ignore", None
+    if not stripped.lower().startswith("bytes=") or "," in stripped:
+        return "ignore", None
     match = RANGE_RE.match(stripped)
     if not match:
-        return "ignore", None
+        return "unsatisfiable", None
     start_s, end_s = match.groups()
     if not start_s and not end_s:
-        return "ignore", None
+        return "unsatisfiable", None
     if file_size <= 0:
         return "unsatisfiable", None
     if start_s and end_s:
@@ -1804,7 +1806,10 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
     def _drain_small_request_body(
         self, max_bytes: int = MAX_METHOD_NOT_ALLOWED_DRAIN_BYTES
     ) -> None:
-        """Drain a small unread request body before closing to avoid Windows TCP RST races."""
+        """Drain a small unread request body once before closing to avoid Windows TCP RST races."""
+        if getattr(self, "_request_body_consumed", False):
+            return
+        self._request_body_consumed = True
         headers = getattr(self, "headers", None)
         rfile = getattr(self, "rfile", None)
         if headers is None or rfile is None:
@@ -1854,6 +1859,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         """Handle a single HTTP request with quiet disconnect/timeout handling."""
         self._headers_sent = False
         self._connection_header_sent = False
+        self._request_body_consumed = False
         try:
             self.raw_requestline = self.rfile.readline(65537)
             if len(self.raw_requestline) > 65536:
@@ -2247,9 +2253,34 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
 
     def _serve_file(self, url_path: str, send_body: bool) -> None:
         path_cache = self._get_resolved_path_cache()
-        target, target_realpath, content_type, path_cache_key, from_path_cache, err_status = (
-            self._resolve_target_fast(url_path)
+        use_fast_resolve = (
+            type(self)._resolve_target is PlayGta6Handler._resolve_target
+            and "_resolve_target" not in self.__dict__
         )
+        if use_fast_resolve:
+            target, target_realpath, content_type, path_cache_key, from_path_cache, err_status = (
+                self._resolve_target_fast(url_path)
+            )
+        else:
+            resolved = self._resolve_target(url_path)
+            if isinstance(resolved, tuple):
+                target, target_realpath, content_type, path_cache_key, from_path_cache, err_status = (
+                    None,
+                    None,
+                    None,
+                    None,
+                    False,
+                    resolved[1],
+                )
+            else:
+                target = resolved
+                target_realpath = (
+                    str(target) if (isinstance(target, Path) and target.is_absolute()) else None
+                )
+                content_type = None
+                path_cache_key = None
+                from_path_cache = False
+                err_status = None
         if err_status is not None:
             self._send_empty(err_status)
             return
@@ -2479,7 +2510,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             with f:
                 try:
                     fstat = os.fstat(f.fileno())
-                except (OSError, ValueError, io.UnsupportedOperation):
+                except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
                     fstat = None
                 if fstat is not None and (
                     fstat.st_size != st.st_size or fstat.st_mtime_ns != st.st_mtime_ns
@@ -2668,6 +2699,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                 while remaining > 0:
                     chunk = self.rfile.read(min(chunk_bytes, remaining))
                     if not chunk:
+                        self._request_body_consumed = True
                         self._send_json(
                             HTTPStatus.BAD_REQUEST,
                             {"ok": False, "error": "incomplete request body"},
@@ -2676,6 +2708,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                         return
                     bytes_written += len(chunk)
                     if bytes_written > max_bytes:
+                        self._request_body_consumed = True
                         self._send_json(
                             HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                             {"ok": False, "error": "payload exceeds max dump file size"},
@@ -2686,6 +2719,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                     remaining -= len(chunk)
 
             # Request body is completely consumed; keep-alive is safe if the client wants it.
+            self._request_body_consumed = True
             if self.protocol_version >= "HTTP/1.1" and not getattr(
                 self, "_client_requested_close", False
             ):
