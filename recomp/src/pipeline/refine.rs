@@ -1014,23 +1014,22 @@ fn refined_rounds(
             break;
         }
         // A new no-return function that decoded code calls ends blocks that are already decoded:
-        // start over then (without taking the blocks back first).
-        let keep = continue_rounds
-            && !diverged
-            && session
-                .as_ref()
-                .is_some_and(|state| !state.calls_directly(&analysis, &new_thunks));
+        // the session cuts them back when the code after such a call derived nothing that a
+        // fresh run lacks, and starts over otherwise.
+        let keep = continue_rounds && !diverged && session.is_some();
         if diverged {
             timings.diverged_rounds += 1;
         }
         match session.as_mut() {
             Some(state) if keep => {
                 state.reclaim(analysis);
-                if !new_thunks.is_empty() {
-                    let added = state.add_no_return(&new_thunks);
-                    debug_assert!(added, "calls_directly and add_no_return disagree");
-                }
                 state.add_entries(new_entries.iter().copied());
+                if !new_thunks.is_empty()
+                    && !state.add_no_return(&new_thunks)
+                    && let Some(state) = session.take()
+                {
+                    state.discard();
+                }
             }
             _ => {
                 if let Some(state) = session.take() {
