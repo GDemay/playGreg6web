@@ -7409,6 +7409,564 @@ void test_view_format_color_fidelity_and_bc_subresource_extents() {
     }
 }
 
+void test_srgb_uav_hdr_storage_and_cpu_wideners() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+
+    // Part 1: R8G8B8A8_UNORM_SRGB & B8G8R8A8_UNORM_SRGB + ALLOW_UNORDERED_ACCESS
+    // Linear sibling base format + STORAGE_BINDING + *-srgb view_format, native linear UAV,
+    // explicit *-srgb default RTV/SRV, and intact CPU WriteTexture upload.
+    {
+        playgta6::os::VirtualMemoryArena mem;
+        com::reset_com_bridge();
+        com::set_guest_memory(&mem);
+        {
+            std::vector<uint8_t> stream;
+            dg::DeviceOptions opts{};
+            opts.sink = [&stream](const uint8_t* data, size_t size) {
+                stream.insert(stream.end(), data, data + size);
+            };
+            opts.bridge.features = pso::WgpuFeature::TextureFormatsTier1 | pso::WgpuFeature::Bgra8UnormStorage;
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+            CHECK(static_cast<bool>(device));
+
+            const uint64_t mem_va =
+                mem.virtual_alloc(0, 64u << 10, playgta6::os::kMemReserve | playgta6::os::kMemCommit,
+                                  playgta6::os::PageProtect::ReadWrite);
+            CHECK(mem_va != 0);
+            const std::array<uint8_t, 64> raw_rgba = {0x11, 0x22, 0x33, 0xFF, 0x44, 0x55, 0x66, 0x80};
+            CHECK(com::write_guest(mem_va, raw_rgba.data(), raw_rgba.size()));
+
+            // 1A: R8G8B8A8_UNORM_SRGB + AllowRenderTarget | AllowUnorderedAccess
+            dg::GuestResourceDesc desc{};
+            desc.Dimension = dg::ResourceDimension::Texture2D;
+            desc.Width = 4;
+            desc.Height = 4;
+            desc.DepthOrArraySize = 1;
+            desc.MipLevels = 1;
+            desc.Format = static_cast<uint32_t>(D::R8G8B8A8_UNORM_SRGB);
+            desc.SampleCount = 1;
+            desc.Flags = dg::ResourceFlags::AllowRenderTarget | dg::ResourceFlags::AllowUnorderedAccess;
+            dg::Resource::Placement pl{};
+            pl.address = mem_va;
+            auto srgb_uav = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                             dg::device_ref(device.get()), desc, pl, 0u);
+            CHECK(srgb_uav && srgb_uav->initialize());
+
+            bridge::TextureInfo info{};
+            CHECK(device->state_bridge().texture_info(srgb_uav->id(), &info));
+            CHECK(info.format == D::R8G8B8A8_UNORM_SRGB);
+            CHECK(info.created_format == F::Rgba8Unorm);
+            CHECK(info.storage);
+            CHECK(info.render_target);
+
+            // CPU texture memory upload must NOT be skipped by format_mismatch on linear-lowered sRGB.
+            gpu::CommandEncoder sync_enc;
+            CHECK(device->sync_bound_texture_memory(srgb_uav->id(), sync_enc));
+            bool saw_write = false;
+            for (const Packet& pk : decode(sync_enc)) {
+                if (pk.opcode == GpuOpcode::WriteTexture &&
+                    pod<GpuWriteTexturePayload>(pk).texture_id == srgb_uav->id()) {
+                    saw_write = true;
+                }
+            }
+            CHECK(saw_write);
+
+            // Trigger deferred texture create emission via present on the resource.
+            stream.clear();
+            const uint32_t present_id = srgb_uav->id();
+            CHECK(device->present(std::span<const uint32_t>(&present_id, 1)) == 1u);
+            bool saw_create = false;
+            for (const Packet& pk : decode_raw_stream(stream)) {
+                if (pk.opcode == GpuOpcode::CreateTexture2) {
+                    const auto ct = pod<GpuCreateTexture2Payload>(pk);
+                    if (ct.id == srgb_uav->id()) {
+                        CHECK(ct.format == static_cast<uint8_t>(F::Rgba8Unorm));
+                        CHECK((ct.usage_flags & GpuTextureUsage::StorageBinding) != 0);
+                        CHECK((ct.usage_flags & GpuTextureUsage::RenderAttachment) != 0);
+                        CHECK(ct.view_format_count == 1);
+                        CHECK(ct.view_formats[0] == static_cast<uint8_t>(F::Rgba8UnormSrgb));
+                        saw_create = true;
+                    }
+                }
+            }
+            CHECK(saw_create);
+
+            // Verify default RTV, default SRV (UNKNOWN -> Rgba8UnormSrgb), explicit UNORM SRV,
+            // and compute UAV dispatch (Rgba8Unorm native, zero dropped dispatches).
+            auto& bridge_dev = device->state_bridge();
+            auto& heaps = bridge_dev.heaps();
+            d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 2, false);
+            d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+            CHECK(heaps.create_render_target_view(srgb_uav->id(), nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+            pso::RenderTargetViewInfo rtv_info{};
+            CHECK(bridge_dev.resolve_rtv(rtv_heap->cpu_handle(0).ptr, &rtv_info));
+            CHECK(rtv_info.format == D::R8G8B8A8_UNORM_SRGB);
+            const bridge::ViewRecord* rtv_vr = bridge_dev.view(rtv_info.view_id);
+            CHECK(rtv_vr != nullptr && rtv_vr->view.format == static_cast<uint8_t>(F::Rgba8UnormSrgb));
+
+            // Slot 0: default SRV (format = 0 / UNKNOWN) -> must emit explicit Rgba8UnormSrgb
+            // Slot 1: explicit UNORM SRV -> must emit Rgba8Unorm
+            // Slot 2: UAV (format = 0 / UNKNOWN) -> must bind linear Rgba8Unorm natively
+            d3d::ViewDesc srv_def{};
+            srv_def.format = 0;
+            srv_def.dimension = d3d::ViewDimension::Texture2D;
+            CHECK(heaps.create_shader_resource_view(srgb_uav->id(), &srv_def, view_heap->cpu_handle(0)) ==
+                  d3d::Status::Ok);
+            d3d::ViewDesc srv_lin{};
+            srv_lin.format = static_cast<uint32_t>(D::R8G8B8A8_UNORM);
+            srv_lin.dimension = d3d::ViewDimension::Texture2D;
+            CHECK(heaps.create_shader_resource_view(srgb_uav->id(), &srv_lin, view_heap->cpu_handle(1)) ==
+                  d3d::Status::Ok);
+            d3d::ViewDesc uav_def{};
+            uav_def.format = 0;
+            uav_def.dimension = d3d::ViewDimension::Texture2D;
+            CHECK(heaps.create_unordered_access_view(srgb_uav->id(), 0, &uav_def, view_heap->cpu_handle(2)) ==
+                  d3d::Status::Ok);
+
+            constexpr uint64_t kCsSrgb = 0x5510;
+            bridge_dev.register_shader_module(kCsSrgb, 901);
+            d3d::RootSignatureDesc rs{};
+            d3d::RootParameterDesc p0{};
+            p0.parameter_type = d3d::RootParameterType::DescriptorTable;
+            d3d::DescriptorRangeDesc r_srv{};
+            r_srv.range_type = d3d::DescriptorRangeType::Srv;
+            r_srv.num_descriptors = 2;
+            r_srv.offset_in_descriptors_from_table_start = 0;
+            d3d::DescriptorRangeDesc r_uav{};
+            r_uav.range_type = d3d::DescriptorRangeType::Uav;
+            r_uav.num_descriptors = 1;
+            r_uav.offset_in_descriptors_from_table_start = 2;
+            p0.ranges = {r_srv, r_uav};
+            rs.parameters.push_back(p0);
+            d3d::RootSignature root;
+            CHECK(d3d::RootSignature::build(rs, &root).ok());
+
+            bridge::PipelineLayoutDesc pl_desc{};
+            pl_desc.content_id = 0x551001;
+            bridge::GroupLayoutDesc g0{};
+            g0.content_id = 0x551002;
+            g0.bindings.push_back({layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture,
+                                                static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                                static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                   join(0, d3d::DescriptorRangeType::Srv, 0)});
+            g0.bindings.push_back({layout_entry(1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Texture,
+                                                static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                                static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                   join(1, d3d::DescriptorRangeType::Srv, 1)});
+            GpuBindGroupLayoutEntry uav_e =
+                layout_entry(2, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                             static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly),
+                             static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+            uav_e.storage_format = static_cast<uint8_t>(F::Rgba8Unorm);
+            g0.bindings.push_back({uav_e, join(2, d3d::DescriptorRangeType::Uav, 0)});
+            pl_desc.groups.push_back(g0);
+            bridge_dev.register_pipeline_layout(kCsSrgb, 0, pl_desc);
+
+            pso::D3D12ComputePsoDesc cdesc{};
+            cdesc.cs = kCsSrgb;
+            auto cpso = bridge_dev.create_compute_pipeline_state(cdesc, &root);
+            gpu::CommandEncoder cs_enc;
+            bridge::CommandListBridge list(bridge_dev, cs_enc);
+            d3d::DescriptorHeap* visible[] = {view_heap};
+            CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+            CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+            list.SetComputePipelineState(cpso.get());
+            CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+            list.Dispatch(1, 1, 1);
+            list.Close();
+
+            CHECK(list.stats().dispatches == 1);
+            CHECK(list.stats().dispatches_dropped_null_storage == 0);
+            CHECK(list.stats().storage_views_without_usage == 0);
+            CHECK(list.stats().storage_views_format_mismatch == 0);
+            CHECK(list.stats().storage_views_converted == 0);
+
+            bool saw_bg = false;
+            for (const Packet& pk : decode(cs_enc)) {
+                if (pk.opcode == GpuOpcode::CreateBindGroup2 &&
+                    pk.payload.size() >= sizeof(GpuCreateBindGroup2Payload) + 3 * sizeof(GpuBindGroupEntry2)) {
+                    const auto e0 = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload));
+                    const auto e1 =
+                        pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+                    const auto e2 = pod<GpuBindGroupEntry2>(
+                        pk, sizeof(GpuCreateBindGroup2Payload) + 2 * sizeof(GpuBindGroupEntry2));
+                    CHECK(e0.resource_id == srgb_uav->id() &&
+                          e0.view.format == static_cast<uint8_t>(F::Rgba8UnormSrgb));
+                    CHECK(e1.resource_id == srgb_uav->id() &&
+                          e1.view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+                    CHECK(e2.resource_id == srgb_uav->id() &&
+                          e2.view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+                    saw_bg = true;
+                }
+            }
+            CHECK(saw_bg);
+
+            // 1B: B8G8R8A8_UNORM_SRGB + AllowUnorderedAccess with Bgra8UnormStorage -> Bgra8Unorm + StorageBinding
+            dg::GuestResourceDesc bgra_desc = desc;
+            bgra_desc.Format = static_cast<uint32_t>(D::B8G8R8A8_UNORM_SRGB);
+            auto bgra_srgb_uav = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                                  dg::device_ref(device.get()), bgra_desc,
+                                                                  dg::Resource::Placement{}, 0u);
+            CHECK(bgra_srgb_uav && bgra_srgb_uav->initialize());
+            bridge::TextureInfo binfo{};
+            CHECK(bridge_dev.texture_info(bgra_srgb_uav->id(), &binfo));
+            CHECK(binfo.format == D::B8G8R8A8_UNORM_SRGB);
+            CHECK(binfo.created_format == F::Bgra8Unorm);
+            CHECK(binfo.storage);
+        }
+        com::reset_com_bridge();
+        com::set_guest_memory(nullptr);
+    }
+
+    // Part 2: Non-quantizing Float / HDR / Tier1 Compute UAVs
+    // (a) Tier1 + Bgra8UnormStorage enabled: Rg11b10Ufloat, Rgb10a2Unorm, R16Float, Rg16Float,
+    //     Bgra8Unorm, R32Float bind natively when matched and redirect via Rgba16Float/Rgba32Float
+    //     (NOT Rgba8Unorm!) when mismatched -- zero dropped dispatches.
+    {
+        struct HdrCase {
+            D dxgi;
+            F expected_own;
+            F stage_format;
+            bool expect_redirect;
+        };
+        const HdrCase cases[] = {
+            {D::R16G16B16A16_FLOAT, F::Rgba16Float, F::Rgba16Float, false},
+            {D::R32_FLOAT, F::R32Float, F::R32Float, false},
+            {D::R11G11B10_FLOAT, F::Rg11b10Ufloat, F::Rg11b10Ufloat, false},
+            {D::R11G11B10_FLOAT, F::Rg11b10Ufloat, F::Rgba16Float, true},
+            {D::R10G10B10A2_UNORM, F::Rgb10a2Unorm, F::Rgba16Float, true},
+            {D::R16_FLOAT, F::R16Float, F::Rgba16Float, true},
+            {D::R16G16_FLOAT, F::Rg16Float, F::Rgba16Float, true},
+            {D::B8G8R8A8_UNORM, F::Bgra8Unorm, F::Rgba16Float, true},
+            {D::R32_FLOAT, F::R32Float, F::Rgba32Float, true},
+        };
+        for (const HdrCase& c : cases) {
+            d3d::DescriptorHeapRegistry heaps;
+            d3d::ResourceStateRegistry states;
+            bridge::BridgeOptions opts = counting_options(8000);
+            opts.features = pso::WgpuFeature::TextureFormatsTier1 | pso::WgpuFeature::Bgra8UnormStorage |
+                            pso::WgpuFeature::Rg11b10UfloatRenderable;
+            bridge::StateBridgeDevice device(heaps, opts, &states);
+            constexpr uint32_t kTex = 401;
+            constexpr uint64_t kCs = 0x5520;
+            bridge::TextureInfo tex{c.dxgi, 16, 16, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+            tex.storage = true;
+            tex.created_format = c.expected_own;
+            device.register_texture(kTex, tex);
+            device.register_shader_module(kCs, 10);
+            d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 2, true);
+            d3d::ViewDesc vd{};
+            vd.format = static_cast<uint32_t>(c.dxgi);
+            vd.dimension = d3d::ViewDimension::Texture2D;
+            CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+            d3d::RootSignatureDesc rs{};
+            d3d::RootParameterDesc tp{};
+            tp.parameter_type = d3d::RootParameterType::DescriptorTable;
+            d3d::DescriptorRangeDesc rg{};
+            rg.range_type = d3d::DescriptorRangeType::Uav;
+            rg.num_descriptors = 1;
+            tp.ranges.push_back(rg);
+            rs.parameters.push_back(tp);
+            d3d::RootSignature root;
+            CHECK(d3d::RootSignature::build(rs, &root).ok());
+            bridge::PipelineLayoutDesc layout{};
+            layout.content_id = 0x552001;
+            bridge::GroupLayoutDesc grp{};
+            grp.content_id = 0x552002;
+            GpuBindGroupLayoutEntry entry =
+                layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                             static_cast<uint8_t>(GpuStorageTextureAccess::ReadWrite),
+                             static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+            entry.storage_format = static_cast<uint8_t>(c.stage_format);
+            grp.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+            layout.groups.push_back(grp);
+            device.register_pipeline_layout(kCs, 0, layout);
+            pso::D3D12ComputePsoDesc pdesc{};
+            pdesc.cs = kCs;
+            auto cpso = device.create_compute_pipeline_state(pdesc, &root);
+            gpu::CommandEncoder enc;
+            bridge::CommandListBridge list(device, enc);
+            d3d::DescriptorHeap* visible[] = {view_heap};
+            CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+            CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+            list.SetComputePipelineState(cpso.get());
+            CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+            list.Dispatch(2, 2, 1);
+            list.Close();
+
+            CHECK(list.stats().dispatches == 1);
+            CHECK(list.stats().dispatches_dropped_null_storage == 0);
+            CHECK(list.stats().storage_views_without_usage == 0);
+            CHECK(list.stats().storage_views_format_mismatch == 0);
+            CHECK(list.stats().storage_views_converted == (c.expect_redirect ? 1u : 0u));
+            if (c.expect_redirect) {
+                bool saw_inter = false;
+                for (const Packet& pk : decode(enc)) {
+                    if (pk.opcode == GpuOpcode::CreateTexture2) {
+                        const auto ct = pod<GpuCreateTexture2Payload>(pk);
+                        CHECK(ct.format == static_cast<uint8_t>(c.stage_format));
+                        CHECK(ct.format != static_cast<uint8_t>(F::Rgba8Unorm));
+                        saw_inter = true;
+                    }
+                }
+                CHECK(saw_inter);
+            }
+        }
+    }
+
+    // (b) Without TextureFormatsTier1 / Bgra8UnormStorage: renderable HDR/color UAV textures
+    //     redirect through a non-quantizing Rgba16Float intermediate + fullscreen render-pass copy-out
+    //     instead of dropping the compute dispatch.
+    {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::BridgeOptions opts = counting_options(8500);
+        opts.features = pso::WgpuFeature::Rg11b10UfloatRenderable;  // NO Tier1, NO Bgra8UnormStorage
+        bridge::StateBridgeDevice device(heaps, opts, &states);
+        constexpr uint32_t kTex = 410;
+        constexpr uint64_t kCs = 0x5530;
+        bridge::TextureInfo tex{D::R11G11B10_FLOAT, 16, 16, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        tex.storage = false;
+        tex.render_target = true;
+        tex.created_format = F::Rg11b10Ufloat;
+        device.register_texture(kTex, tex);
+        device.register_shader_module(kCs, 11);
+        d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 2, true);
+        d3d::ViewDesc vd{};
+        vd.format = static_cast<uint32_t>(D::R11G11B10_FLOAT);
+        vd.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::RootSignatureDesc rs{};
+        d3d::RootParameterDesc tp{};
+        tp.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc rg{};
+        rg.range_type = d3d::DescriptorRangeType::Uav;
+        rg.num_descriptors = 1;
+        tp.ranges.push_back(rg);
+        rs.parameters.push_back(tp);
+        d3d::RootSignature root;
+        CHECK(d3d::RootSignature::build(rs, &root).ok());
+        bridge::PipelineLayoutDesc layout{};
+        layout.content_id = 0x553001;
+        bridge::GroupLayoutDesc grp{};
+        grp.content_id = 0x553002;
+        GpuBindGroupLayoutEntry entry =
+            layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                         static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly),
+                         static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+        entry.storage_format = 0;  // let bridge choose preferred non-quantizing HDR intermediate
+        grp.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+        layout.groups.push_back(grp);
+        device.register_pipeline_layout(kCs, 0, layout);
+        pso::D3D12ComputePsoDesc pdesc{};
+        pdesc.cs = kCs;
+        auto cpso = device.create_compute_pipeline_state(pdesc, &root);
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {view_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+        list.SetComputePipelineState(cpso.get());
+        CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.Dispatch(2, 2, 1);
+        list.Close();
+
+        CHECK(list.stats().dispatches == 1);
+        CHECK(list.stats().dispatches_dropped_null_storage == 0);
+        CHECK(list.stats().storage_views_without_usage == 0);
+        CHECK(list.stats().storage_views_converted == 1);
+        CHECK(list.stats().storage_conversions == 1);
+        bool saw_hdr_inter = false;
+        bool saw_render_copy_out = false;
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::CreateTexture2) {
+                const auto ct = pod<GpuCreateTexture2Payload>(pk);
+                CHECK(ct.format == static_cast<uint8_t>(F::Rgba16Float));
+                saw_hdr_inter = true;
+            } else if (pk.opcode == GpuOpcode::BeginRenderPass) {
+                const auto rp = pod<GpuBeginRenderPassPayload>(pk);
+                if (rp.color_count == 1 && rp.color[0].texture_id == kTex &&
+                    rp.color[0].view.format == static_cast<uint8_t>(F::Rg11b10Ufloat)) {
+                    saw_render_copy_out = true;
+                }
+            }
+        }
+        CHECK(saw_hdr_inter);
+        CHECK(saw_render_copy_out);
+    }
+
+    // Part 3: CPU texture upload wideners for B5G5R5A1_UNORM, B4G4R4A4_UNORM,
+    // Xbox HDR R10G10B10_7E3_A2_FLOAT (116), and R10G10B10_6E4_A2_FLOAT (117).
+    CHECK(bridge::is_hdr_color_format(D::R10G10B10_7E3_A2_FLOAT));
+    CHECK(bridge::is_hdr_color_format(D::R10G10B10_6E4_A2_FLOAT));
+    {
+        playgta6::os::VirtualMemoryArena mem;
+        com::reset_com_bridge();
+        com::set_guest_memory(&mem);
+        {
+            std::vector<uint8_t> stream;
+            dg::DeviceOptions opts{};
+            opts.sink = [&stream](const uint8_t* data, size_t size) {
+                stream.insert(stream.end(), data, data + size);
+            };
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+            CHECK(static_cast<bool>(device));
+            const uint64_t base_va =
+                mem.virtual_alloc(0, 64u << 10, playgta6::os::kMemReserve | playgta6::os::kMemCommit,
+                                  playgta6::os::PageProtect::ReadWrite);
+            CHECK(base_va != 0);
+
+            auto extract_write_bytes = [](const gpu::CommandEncoder& enc, uint32_t tex_id,
+                                          std::vector<uint8_t>* out) -> bool {
+                for (const Packet& pk : decode(enc)) {
+                    if (pk.opcode == GpuOpcode::WriteTexture) {
+                        const auto wt = pod<GpuWriteTexturePayload>(pk);
+                        if (wt.texture_id == tex_id && pk.payload.size() >= sizeof(wt) + wt.data_len) {
+                            out->assign(pk.payload.begin() + sizeof(wt),
+                                        pk.payload.begin() + sizeof(wt) + wt.data_len);
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            };
+
+            // 3A: B5G5R5A1_UNORM (2x1) -> Rgba8Unorm
+            {
+                const uint16_t px[2] = {0xFC00u, 0x03E0u};  // (R=31,G=0,B=0,A=1), (R=0,G=31,B=0,A=0)
+                const uint64_t va = base_va + 0x0000;
+                CHECK(com::write_guest(va, px, sizeof(px)));
+                dg::GuestResourceDesc d{};
+                d.Dimension = dg::ResourceDimension::Texture2D;
+                d.Width = 2;
+                d.Height = 1;
+                d.DepthOrArraySize = 1;
+                d.MipLevels = 1;
+                d.Format = static_cast<uint32_t>(D::B5G5R5A1_UNORM);
+                d.SampleCount = 1;
+                dg::Resource::Placement pl{};
+                pl.address = va;
+                auto res = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                            dg::device_ref(device.get()), d, pl, 0u);
+                CHECK(res && res->initialize());
+                gpu::CommandEncoder enc;
+                CHECK(device->sync_bound_texture_memory(res->id(), enc));
+                std::vector<uint8_t> bytes;
+                CHECK(extract_write_bytes(enc, res->id(), &bytes));
+                CHECK(bytes.size() >= 8u);
+                CHECK(bytes[0] == 255 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 255);
+                CHECK(bytes[4] == 0 && bytes[5] == 255 && bytes[6] == 0 && bytes[7] == 0);
+            }
+
+            // 3B: B4G4R4A4_UNORM (2x1) -> Rgba8Unorm
+            {
+                const uint16_t px[2] = {0xF841u, 0x0F00u};  // (A=F,R=8,G=4,B=1), (A=0,R=F,G=0,B=0)
+                const uint64_t va = base_va + 0x1000;
+                CHECK(com::write_guest(va, px, sizeof(px)));
+                dg::GuestResourceDesc d{};
+                d.Dimension = dg::ResourceDimension::Texture2D;
+                d.Width = 2;
+                d.Height = 1;
+                d.DepthOrArraySize = 1;
+                d.MipLevels = 1;
+                d.Format = static_cast<uint32_t>(D::B4G4R4A4_UNORM);
+                d.SampleCount = 1;
+                dg::Resource::Placement pl{};
+                pl.address = va;
+                auto res = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                            dg::device_ref(device.get()), d, pl, 0u);
+                CHECK(res && res->initialize());
+                gpu::CommandEncoder enc;
+                CHECK(device->sync_bound_texture_memory(res->id(), enc));
+                std::vector<uint8_t> bytes;
+                CHECK(extract_write_bytes(enc, res->id(), &bytes));
+                CHECK(bytes.size() >= 8u);
+                CHECK(bytes[0] == 0x88 && bytes[1] == 0x44 && bytes[2] == 0x11 && bytes[3] == 0xFF);
+                CHECK(bytes[4] == 0xFF && bytes[5] == 0x00 && bytes[6] == 0x00 && bytes[7] == 0x00);
+            }
+
+            // 3C: Xbox HDR R10G10B10_7E3_A2_FLOAT (116) -> Rgba16Float
+            {
+                const auto pack10 = [](uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+                    return (r & 0x3FFu) | ((g & 0x3FFu) << 10) | ((b & 0x3FFu) << 20) | ((a & 0x3u) << 30);
+                };
+                // Pixel 0: R=1.0 (e=3,m=0), G=31.875 (e=7,m=127), B=2^-9 (e=0,m=1), A=1.0 (3)
+                // Pixel 1: R=0.0 (e=0,m=0), G=0.125 (e=0,m=64),   B=0.25 (e=1,m=0), A=1/3 (1)
+                const uint32_t px[2] = {
+                    pack10((3u << 7) | 0u, (7u << 7) | 127u, (0u << 7) | 1u, 3u),
+                    pack10(0u, (0u << 7) | 64u, (1u << 7) | 0u, 1u),
+                };
+                const uint64_t va = base_va + 0x2000;
+                CHECK(com::write_guest(va, px, sizeof(px)));
+                dg::GuestResourceDesc d{};
+                d.Dimension = dg::ResourceDimension::Texture2D;
+                d.Width = 2;
+                d.Height = 1;
+                d.DepthOrArraySize = 1;
+                d.MipLevels = 1;
+                d.Format = static_cast<uint32_t>(D::R10G10B10_7E3_A2_FLOAT);
+                d.SampleCount = 1;
+                dg::Resource::Placement pl{};
+                pl.address = va;
+                auto res = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                            dg::device_ref(device.get()), d, pl, 0u);
+                CHECK(res && res->initialize());
+                gpu::CommandEncoder enc;
+                CHECK(device->sync_bound_texture_memory(res->id(), enc));
+                std::vector<uint8_t> bytes;
+                CHECK(extract_write_bytes(enc, res->id(), &bytes));
+                CHECK(bytes.size() >= 16u);
+                uint16_t h[8] = {};
+                std::memcpy(h, bytes.data(), sizeof(h));
+                CHECK(h[0] == 0x3C00u && h[1] == 0x4FF8u && h[2] == 0x1800u && h[3] == 0x3C00u);
+                CHECK(h[4] == 0x0000u && h[5] == 0x3000u && h[6] == 0x3400u && h[7] == 0x3555u);
+            }
+
+            // 3D: Xbox HDR R10G10B10_6E4_A2_FLOAT (117) -> Rgba16Float
+            {
+                const auto pack10 = [](uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
+                    return (r & 0x3FFu) | ((g & 0x3FFu) << 10) | ((b & 0x3FFu) << 20) | ((a & 0x3u) << 30);
+                };
+                // Pixel 0: R=1.0 (e=7,m=0), G=508.0 (e=15,m=63), B=2^-12 (e=0,m=1), A=2/3 (2)
+                // Pixel 1: R=0.0 (e=0,m=0), G=254.0 (e=14,m=63), B=2^-6  (e=1,m=0), A=0.0 (0)
+                const uint32_t px[2] = {
+                    pack10((7u << 6) | 0u, (15u << 6) | 63u, (0u << 6) | 1u, 2u),
+                    pack10(0u, (14u << 6) | 63u, (1u << 6) | 0u, 0u),
+                };
+                const uint64_t va = base_va + 0x3000;
+                CHECK(com::write_guest(va, px, sizeof(px)));
+                dg::GuestResourceDesc d{};
+                d.Dimension = dg::ResourceDimension::Texture2D;
+                d.Width = 2;
+                d.Height = 1;
+                d.DepthOrArraySize = 1;
+                d.MipLevels = 1;
+                d.Format = static_cast<uint32_t>(D::R10G10B10_6E4_A2_FLOAT);
+                d.SampleCount = 1;
+                dg::Resource::Placement pl{};
+                pl.address = va;
+                auto res = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                            dg::device_ref(device.get()), d, pl, 0u);
+                CHECK(res && res->initialize());
+                gpu::CommandEncoder enc;
+                CHECK(device->sync_bound_texture_memory(res->id(), enc));
+                std::vector<uint8_t> bytes;
+                CHECK(extract_write_bytes(enc, res->id(), &bytes));
+                CHECK(bytes.size() >= 16u);
+                uint16_t h[8] = {};
+                std::memcpy(h, bytes.data(), sizeof(h));
+                CHECK(h[0] == 0x3C00u && h[1] == 0x5FF0u && h[2] == 0x0C00u && h[3] == 0x3955u);
+                CHECK(h[4] == 0x0000u && h[5] == 0x5BF0u && h[6] == 0x2400u && h[7] == 0x0000u);
+            }
+        }
+        com::reset_com_bridge();
+        com::set_guest_memory(nullptr);
+    }
+}
+
 int main() {
     test_ui_a8_blend_fidelity();
     test_g81_depth_bias_and_shadow_map_parity();
@@ -7473,6 +8031,7 @@ int main() {
     test_device_object_deferral_out_of_order_and_reset_lists();
     test_msaa_resolve_pins_resources_across_unexecuted_frame_advance();
     test_view_format_color_fidelity_and_bc_subresource_extents();
+    test_srgb_uav_hdr_storage_and_cpu_wideners();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
