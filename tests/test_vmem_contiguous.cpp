@@ -1158,6 +1158,20 @@ void test_first_fit_prefix() {
         CHECK(holes.release(kDefaultArenaBase + gran));
         CHECK(holes.reserve(0, gran) == kDefaultArenaBase + gran);
     }
+    {
+        VirtualMemoryArena placeholders(kDefaultArenaBase, 16 * gran);
+        const auto ph = kMemReserve | kMemReservePlaceholder;
+        const auto base = placeholders.virtual_alloc(0, 2 * gran, ph, PageProtect::NoAccess);
+        CHECK(base == kDefaultArenaBase);
+        CHECK(placeholders.virtual_alloc(0, 2 * gran, ph, PageProtect::NoAccess) == base + 2 * gran);
+        // Coalesce over the lazy cursor; the predecessor now contains it.
+        CHECK(placeholders.virtual_free(base, 4 * gran, kMemRelease | kMemCoalescePlaceholders));
+        CHECK(placeholders.reserve(0, gran) == base + 4 * gran);
+        CHECK(placeholders.virtual_free(base, gran, kMemRelease | kMemPreservePlaceholder));
+        CHECK(placeholders.virtual_free(base + gran, gran, kMemRelease | kMemPreservePlaceholder));
+        CHECK(placeholders.virtual_free(base + gran, 0, kMemRelease));
+        CHECK(placeholders.reserve(0, gran) == base + gran);
+    }
     constexpr size_t slots = 128;
     VirtualMemoryArena arena(kDefaultArenaBase, slots * gran);
     std::vector<size_t> occupied(slots, 0);
