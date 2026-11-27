@@ -120,6 +120,8 @@ INPUT_PERIOD_S = 1.0
 INPUT_HOLD_S = 0.1
 DEFAULT_FRAME_INTERVAL_S = 1.0
 DEFAULT_CAPTURE_INTERVAL_SEC = 2.0
+DEFAULT_VIEWPORT_WIDTH = 1280
+DEFAULT_VIEWPORT_HEIGHT = 720
 CANVAS_MIN_X = 410
 DEFAULT_POLL_INTERVAL_S = 0.5
 SERVER_READY_TIMEOUT_S = 15.0
@@ -263,6 +265,48 @@ _RENDERER_MEMORY_INT_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "jsHeapTotalBytes",
         re.compile(r"\b(?:jsHeapTotalBytes|js_heap_total_bytes|totalJSHeapSize|total_js_heap_size)\s*[=:]\s*(\d+)\b"),
     ),
+)
+GPU_HANG_RECOVERY_INT_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("coalescedPresents", ("coalescedPresents", "coalesced_presents")),
+    ("oversizedWgslFallbacks", ("oversizedWgslFallbacks", "oversized_wgsl_fallbacks")),
+    ("deviceLostCount", ("deviceLostCount", "device_lost_count")),
+    ("deviceRecoveredCount", ("deviceRecoveredCount", "device_recovered_count")),
+)
+_COALESCED_PRESENT_SUBMISSIONS_ALIASES: tuple[str, ...] = (
+    "coalescedPresentSubmissions",
+    "coalesced_present_submissions",
+)
+GPU_HANG_RECOVERY_BOOL_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("swapchainProbeInFlight", ("swapchainProbeInFlight", "swapchain_probe_in_flight")),
+    ("rangedPackActive", ("rangedPackActive", "ranged_pack_active")),
+)
+GPU_HANG_RECOVERY_KEYS: tuple[str, ...] = (
+    "coalescedPresents",
+    "oversizedWgslFallbacks",
+    "deviceLostCount",
+    "deviceRecoveredCount",
+    "swapchainProbeInFlight",
+    "rangedPackActive",
+)
+_GPU_HANG_RECOVERY_INT_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (
+        canonical,
+        re.compile(r"\b(?:" + "|".join(re.escape(alias) for alias in aliases) + r")\s*[=:]\s*(\d+)\b"),
+    )
+    for canonical, aliases in GPU_HANG_RECOVERY_INT_KEYS
+)
+_COALESCED_SUBMISSIONS_KV_RE = re.compile(
+    r"\b(?:coalescedPresentSubmissions|coalesced_present_submissions)\s*[=:]\s*(\d+)\b"
+)
+_GPU_HANG_RECOVERY_BOOL_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (
+        canonical,
+        re.compile(
+            r"\b(?:" + "|".join(re.escape(alias) for alias in aliases) + r")\s*[=:]\s*(true|false)\b",
+            re.IGNORECASE,
+        ),
+    )
+    for canonical, aliases in GPU_HANG_RECOVERY_BOOL_KEYS
 )
 MAX_GPU_ADAPTER_LEN = 96
 _WGPU_ADAPTER_LOG_RE = re.compile(r"\[wgpu_worker\]\s+WebGPU adapter:\s*([^\r\n]+)", re.IGNORECASE)
@@ -1620,6 +1664,83 @@ def stage_boot_options_file(
     )
 
 
+@dataclass
+class BootOptionsBackup:
+    """Pre-run snapshot of `<boot_dir>/boot-options.json` for guaranteed `finally` restoration."""
+
+    path: Path
+    existed: bool
+    original_bytes: bytes | None = None
+
+
+def snapshot_boot_options_file(boot_dir: Path) -> BootOptionsBackup:
+    """Capture the current state of `<boot_dir>/boot-options.json` before temporary staging."""
+    dst_file = boot_dir / BOOT_OPTIONS_NAME
+    if dst_file.exists() and not dst_file.is_symlink() and dst_file.is_file():
+        try:
+            return BootOptionsBackup(path=dst_file, existed=True, original_bytes=dst_file.read_bytes())
+        except OSError:
+            return BootOptionsBackup(path=dst_file, existed=False, original_bytes=None)
+    return BootOptionsBackup(path=dst_file, existed=False, original_bytes=None)
+
+
+def restore_boot_options_file(backup: BootOptionsBackup, *, repo_root: Path = REPO_ROOT) -> None:
+    """Restore pre-existing `boot-options.json` or remove the temporary file if none existed."""
+    try:
+        if backup.existed and backup.original_bytes is not None:
+            needs_restore = True
+            if backup.path.exists() and not backup.path.is_symlink() and backup.path.is_file():
+                try:
+                    if backup.path.read_bytes() == backup.original_bytes:
+                        needs_restore = False
+                except OSError:
+                    needs_restore = True
+            if needs_restore:
+                atomic_write_bytes(backup.original_bytes, backup.path)
+        else:
+            backup.path.unlink(missing_ok=True)
+    except OSError as exc:
+        label = repo_relative_label(backup.path, repo_root) or BOOT_OPTIONS_NAME
+        print(
+            f"[warn] failed to restore {label}: {sanitize_text(str(exc))}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def detect_stale_dump_pipelines_boot_options(boot_dir: Path | None) -> str | None:
+    """Return `dump_pipelines_dir` if a pre-existing `boot-options.json` enables MEMFS dumps."""
+    if boot_dir is None:
+        return None
+    dst_file = boot_dir / BOOT_OPTIONS_NAME
+    if not dst_file.is_file():
+        return None
+    try:
+        parsed = json.loads(dst_file.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(parsed, Mapping):
+        return None
+    val = parsed.get("dump_pipelines_dir")
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return None
+
+
+def format_stale_dump_pipelines_warning(
+    boot_dir: Path,
+    dump_pipelines_dir: str,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> str:
+    """Format a sanitized warning when a stale `boot-options.json` has `dump_pipelines_dir`."""
+    label = repo_relative_label(boot_dir / BOOT_OPTIONS_NAME, repo_root) or BOOT_OPTIONS_NAME
+    return sanitize_text(
+        f"stale {label} sets dump_pipelines_dir={dump_pipelines_dir!r} without --dump-pipelines; "
+        f"this forces MEMFS pipeline dumps on every session — remove or clean up {BOOT_OPTIONS_NAME} if unintended"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Chrome / Chromium / Edge discovery
 # ---------------------------------------------------------------------------
@@ -1733,10 +1854,11 @@ def build_chrome_args(
         "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
         "--autoplay-policy=no-user-gesture-required",
-        "--window-size=1280,720",
+        f"--window-size={DEFAULT_VIEWPORT_WIDTH},{DEFAULT_VIEWPORT_HEIGHT}",
     ]
     if headless:
         cmd.append("--headless=new")
+        cmd.append("--force-device-scale-factor=1")
     cmd.append(initial_url)
     return cmd
 
@@ -2250,6 +2372,93 @@ TELEMETRY_PROBE_JS = r"""(() => {
       rendererMemory = rm;
     }
   } catch {}
+  let gpuHangRecovery = null;
+  try {
+    const app = window.playgta6App;
+    const sessStats = app && app.session && typeof app.session.getStats === 'function' ? app.session.getStats() : null;
+    const gpuPanelSnap =
+      app && app.gpuBootPanel
+        ? (typeof app.gpuBootPanel.getSnapshot === 'function'
+            ? app.gpuBootPanel.getSnapshot()
+            : (typeof app.gpuBootPanel.getStats === 'function' ? app.gpuBootPanel.getStats() : null))
+        : null;
+    const hudSnap =
+      app && app.hud
+        ? (typeof app.hud.getDiagnosticsSnapshot === 'function'
+            ? app.hud.getDiagnosticsSnapshot()
+            : (typeof app.hud.getSnapshot === 'function' ? app.hud.getSnapshot() : null))
+        : null;
+    const sources = [
+      bootState && bootState.gpu,
+      bootState && bootState.gpu && bootState.gpu.frameStats,
+      bootState && bootState.gpu && bootState.gpu.shaderStreaming,
+      bootState && bootState.gpu && bootState.gpu.deviceLifecycle,
+      bootState && bootState.shaderStreaming,
+      bootState && bootState.deviceLifecycle,
+      bootState && bootState.loader,
+      bootState,
+      diagnostics && diagnostics.gpu,
+      diagnostics && diagnostics.gpu && diagnostics.gpu.frameStats,
+      diagnostics && diagnostics.shaderStreaming,
+      diagnostics && diagnostics.deviceLifecycle,
+      diagnostics,
+      sessStats && sessStats.gpu,
+      sessStats && sessStats.renderStateStats,
+      sessStats && sessStats.shaderStreaming,
+      sessStats && sessStats.deviceLifecycle,
+      sessStats && sessStats.loader,
+      sessStats,
+      gpuPanelSnap && gpuPanelSnap.shaderStreamingStats,
+      gpuPanelSnap && gpuPanelSnap.shaderStreaming,
+      gpuPanelSnap && gpuPanelSnap.deviceLifecycle,
+      gpuPanelSnap,
+      hudSnap && hudSnap.gpu,
+      hudSnap && hudSnap.telemetry && hudSnap.telemetry.gpu,
+      hudSnap,
+      window.__playgta6GpuStats,
+    ].filter((s) => s && typeof s === 'object');
+    const pickInt = (keys) => {
+      let best = null;
+      for (const src of sources) {
+        for (const key of keys) {
+          const v = src[key];
+          if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
+            const iv = Math.floor(v);
+            best = best === null ? iv : Math.max(best, iv);
+          }
+        }
+      }
+      return best;
+    };
+    const pickBool = (keys) => {
+      for (const src of sources) {
+        for (const key of keys) {
+          const v = src[key];
+          if (typeof v === 'boolean') return v;
+        }
+      }
+      return null;
+    };
+    const ghr = {};
+    let coalesced = pickInt(['coalescedPresents', 'coalesced_presents']);
+    if (coalesced === null) {
+      coalesced = pickInt(['coalescedPresentSubmissions', 'coalesced_present_submissions']);
+    }
+    if (coalesced !== null) ghr.coalescedPresents = coalesced;
+    const oversized = pickInt(['oversizedWgslFallbacks', 'oversized_wgsl_fallbacks']);
+    if (oversized !== null) ghr.oversizedWgslFallbacks = oversized;
+    const lost = pickInt(['deviceLostCount', 'device_lost_count']);
+    if (lost !== null) ghr.deviceLostCount = lost;
+    const recovered = pickInt(['deviceRecoveredCount', 'device_recovered_count']);
+    if (recovered !== null) ghr.deviceRecoveredCount = recovered;
+    const probeInFlight = pickBool(['swapchainProbeInFlight', 'swapchain_probe_in_flight']);
+    if (probeInFlight !== null) ghr.swapchainProbeInFlight = probeInFlight;
+    const rangedActive = pickBool(['rangedPackActive', 'ranged_pack_active']);
+    if (rangedActive !== null) ghr.rangedPackActive = rangedActive;
+    if (Object.keys(ghr).length > 0) {
+      gpuHangRecovery = ghr;
+    }
+  } catch {}
   const hudLog = [];
   try {
     const logRoot = document.getElementById('hud-log');
@@ -2277,6 +2486,7 @@ TELEMETRY_PROBE_JS = r"""(() => {
     preloaderStats,
     gpuMemory,
     rendererMemory,
+    gpuHangRecovery,
     hud: {
       stage: safeText('hud-boot-stage'),
       status: safeText('hud-status'),
@@ -2385,6 +2595,7 @@ class BrowserSessionResult:
     opfs_telemetry: dict[str, Any] | None = None
     gpu_memory: dict[str, Any] | None = None
     renderer_memory: dict[str, Any] | None = None
+    gpu_hang_recovery: dict[str, Any] | None = None
     present_fps_avg: float | None = None
     fps_steady_avg: float | None = None
     fps_p50_window: float | None = None
@@ -4414,6 +4625,155 @@ def _merge_renderer_memory_snapshots(
     return merged or None
 
 
+def extract_gpu_hang_recovery_from_console_lines(lines: Sequence[str] | None) -> dict[str, Any]:
+    """Scan console/HUD log lines for Wave-4/Wave-5 GPU hang & recovery telemetry."""
+    found: dict[str, Any] = {}
+    if not lines:
+        return found
+    coalesced_submissions: int | None = None
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        for canonical, pattern in _GPU_HANG_RECOVERY_INT_KV_PATTERNS:
+            m = pattern.search(raw_line)
+            if m is not None:
+                found[canonical] = max(int(found.get(canonical, 0)), int(m.group(1)))
+        m_sub = _COALESCED_SUBMISSIONS_KV_RE.search(raw_line)
+        if m_sub is not None:
+            sub_val = int(m_sub.group(1))
+            coalesced_submissions = sub_val if coalesced_submissions is None else max(coalesced_submissions, sub_val)
+        for canonical, pattern in _GPU_HANG_RECOVERY_BOOL_KV_PATTERNS:
+            m_bool = pattern.search(raw_line)
+            if m_bool is not None:
+                found[canonical] = m_bool.group(1).lower() == "true"
+    if "coalescedPresents" not in found and coalesced_submissions is not None:
+        found["coalescedPresents"] = coalesced_submissions
+    return found
+
+
+def _merge_gpu_hang_recovery_snapshots(
+    acc: Mapping[str, Any] | None,
+    sample: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Merge Wave-4/Wave-5 GPU hang & recovery snapshots across polls (max counters, latest bools)."""
+    if not isinstance(sample, Mapping) or not sample:
+        return dict(acc) if isinstance(acc, Mapping) and acc else None
+    merged: dict[str, Any] = dict(acc) if isinstance(acc, Mapping) else {}
+    for canonical, _ in GPU_HANG_RECOVERY_INT_KEYS:
+        val = _sanitize_optional_non_negative_int(sample.get(canonical))
+        if val is not None:
+            prev = _sanitize_optional_non_negative_int(merged.get(canonical))
+            merged[canonical] = max(prev, val) if prev is not None else val
+    for canonical, _ in GPU_HANG_RECOVERY_BOOL_KEYS:
+        raw = sample.get(canonical)
+        if isinstance(raw, bool):
+            merged[canonical] = raw
+    return merged or None
+
+
+def _extract_gpu_hang_recovery_stats(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract Wave-4/Wave-5 GPU hang & recovery telemetry from probe, session, or logs."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    raw_boot = probe_map.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe_map.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
+    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+    diag_gpu = diag.get("gpu") if isinstance(diag.get("gpu"), Mapping) else {}
+    probe_gpu = probe_map.get("gpu") if isinstance(probe_map.get("gpu"), Mapping) else {}
+
+    probe_sources: list[Mapping[str, Any]] = []
+    for candidate in (
+        probe_map.get("gpuHangRecovery"),
+        gpu,
+        gpu.get("frameStats"),
+        gpu.get("shaderStreaming"),
+        gpu.get("deviceLifecycle"),
+        boot_state.get("shaderStreaming"),
+        boot_state.get("deviceLifecycle"),
+        boot_state.get("loader"),
+        boot_state,
+        diag_gpu,
+        diag_gpu.get("frameStats"),
+        diag.get("shaderStreaming"),
+        diag.get("deviceLifecycle"),
+        diag,
+        probe_gpu,
+        probe_map,
+    ):
+        if isinstance(candidate, Mapping):
+            probe_sources.append(candidate)
+
+    all_int_sources: list[Mapping[str, Any]] = list(probe_sources)
+    if isinstance(session.gpu_hang_recovery, Mapping):
+        all_int_sources.append(session.gpu_hang_recovery)
+
+    collected_ints: dict[str, list[int]] = {canonical: [] for canonical, _ in GPU_HANG_RECOVERY_INT_KEYS}
+    coalesced_submissions: list[int] = []
+    for src in all_int_sources:
+        for canonical, aliases in GPU_HANG_RECOVERY_INT_KEYS:
+            for key in aliases:
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    collected_ints[canonical].append(val)
+                    break
+        for key in _COALESCED_PRESENT_SUBMISSIONS_ALIASES:
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                coalesced_submissions.append(val)
+                break
+
+    collected_bools: dict[str, bool] = {}
+    for canonical, aliases in GPU_HANG_RECOVERY_BOOL_KEYS:
+        for src in probe_sources:
+            matched = False
+            for key in aliases:
+                raw_val = src.get(key)
+                if isinstance(raw_val, bool):
+                    collected_bools[canonical] = raw_val
+                    matched = True
+                    break
+            if matched:
+                break
+        if canonical not in collected_bools and isinstance(session.gpu_hang_recovery, Mapping):
+            raw_val = session.gpu_hang_recovery.get(canonical)
+            if isinstance(raw_val, bool):
+                collected_bools[canonical] = raw_val
+
+    log_sources: list[Sequence[str]] = [session.console_lines]
+    hud = probe_map.get("hud")
+    if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+        log_sources.append([str(x) for x in hud["logLines"]])
+    log_bools: dict[str, bool] = {}
+    for lines in log_sources:
+        parsed = extract_gpu_hang_recovery_from_console_lines(lines)
+        for canonical, _ in GPU_HANG_RECOVERY_INT_KEYS:
+            if canonical in parsed and isinstance(parsed[canonical], int):
+                collected_ints[canonical].append(parsed[canonical])
+        for canonical, _ in GPU_HANG_RECOVERY_BOOL_KEYS:
+            if canonical in parsed and isinstance(parsed[canonical], bool):
+                log_bools[canonical] = parsed[canonical]
+
+    out: dict[str, Any] = {}
+    for canonical, _ in GPU_HANG_RECOVERY_INT_KEYS:
+        if collected_ints[canonical]:
+            out[canonical] = max(collected_ints[canonical])
+    if "coalescedPresents" not in out and coalesced_submissions:
+        out["coalescedPresents"] = max(coalesced_submissions)
+    for canonical, _ in GPU_HANG_RECOVERY_BOOL_KEYS:
+        if canonical in collected_bools:
+            out[canonical] = collected_bools[canonical]
+        elif canonical in log_bools:
+            out[canonical] = log_bools[canonical]
+    return out
+
+
 def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
     counts = _extract_gpu_counts(probe)
     present_count = _extract_present_count(probe)
@@ -4785,51 +5145,13 @@ def run_browser_session(
     server_log_path = run_dir / f"{log_prefix}server.log"
     chrome_log_path = run_dir / f"{log_prefix}chrome.log"
     smoke_boot_dir: Path | None = None
-    if smoke:
-        smoke_boot_dir = Path(tempfile.mkdtemp(prefix="playgta6-smoke-boot-"))
-        if boot_options is not None:
-            stage_boot_options_file(
-                boot_options,
-                smoke_boot_dir,
-                repo_root=repo,
-                dry_run=False,
-                check_safety=False,
-            )
-        effective_boot_dir: Path | None = smoke_boot_dir
-        effective_game_dir: Path | None = None
-    else:
-        if boot_options is not None and boot_dir is not None:
-            stage_boot_options_file(
-                boot_options,
-                boot_dir,
-                repo_root=repo,
-                dry_run=False,
-                check_safety=True,
-            )
-        effective_boot_dir = boot_dir
-        effective_game_dir = game_dir
-
-    data_dir = repo / "local-data"
-    web_dir = web_dir if web_dir is not None else repo / "web"
-    server_cmd = build_server_cmd(
-        repo=repo,
-        host=host,
-        port=server_port,
-        web_dir=web_dir,
-        data_dir=data_dir,
-        boot_dir=effective_boot_dir,
-        game_dir=effective_game_dir,
-        shaders_dir=shaders_dir,
-        allow_dump_dir=effective_dump_dir,
-        quiet=bool(quiet_server),
-    )
-    chrome_cmd = build_chrome_args(
-        chrome_path,
-        user_data_dir=profile_dir,
-        cdp_port=cdp_port,
-        headless=headless,
-        initial_url="about:blank",
-    )
+    boot_options_backup: BootOptionsBackup | None = None
+    stale_dump_warning: str | None = None
+    server_proc: Any = None
+    chrome_proc: Any = None
+    cdp: CdpClient | None = None
+    server_log_fh = None
+    chrome_log_fh = None
 
     result = BrowserSessionResult(
         target_url=target_url,
@@ -4847,24 +5169,77 @@ def run_browser_session(
         mp4_fps=clean_mp4_fps,
         mp4_skip_black=effective_mp4_skip_black,
     )
-    server_proc: Any = None
-    chrome_proc: Any = None
-    cdp: CdpClient | None = None
-    server_log_fh = None
-    chrome_log_fh = None
 
     pil_image_mod: Any = None
-    if want_frames:
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        pil_image_mod = _import_pil_image()
-        if pil_image_mod is not None:
-            result.non_black_canvas_frames = 0
-        else:
-            result.non_black_canvas_frames = None
-            result.warnings.append("Pillow (PIL) not installed; skipping non-black canvas extrema check")
-
     start_mono = time.monotonic()
     try:
+        if smoke:
+            smoke_boot_dir = Path(tempfile.mkdtemp(prefix="playgta6-smoke-boot-"))
+            if boot_options is not None:
+                stage_boot_options_file(
+                    boot_options,
+                    smoke_boot_dir,
+                    repo_root=repo,
+                    dry_run=False,
+                    check_safety=False,
+                )
+            effective_boot_dir: Path | None = smoke_boot_dir
+            effective_game_dir: Path | None = None
+        else:
+            if not effective_dump_pipelines and boot_options is None and boot_dir is not None:
+                stale_dump_dir = detect_stale_dump_pipelines_boot_options(boot_dir)
+                if stale_dump_dir is not None:
+                    stale_dump_warning = format_stale_dump_pipelines_warning(
+                        boot_dir,
+                        stale_dump_dir,
+                        repo_root=repo,
+                    )
+                    result.warnings.append(stale_dump_warning)
+                    print(f"[warn] {stale_dump_warning}", file=sys.stderr, flush=True)
+            if boot_options is not None and boot_dir is not None:
+                if effective_dump_pipelines:
+                    boot_options_backup = snapshot_boot_options_file(boot_dir)
+                stage_boot_options_file(
+                    boot_options,
+                    boot_dir,
+                    repo_root=repo,
+                    dry_run=False,
+                    check_safety=True,
+                )
+            effective_boot_dir = boot_dir
+            effective_game_dir = game_dir
+
+        data_dir = repo / "local-data"
+        web_dir = web_dir if web_dir is not None else repo / "web"
+        server_cmd = build_server_cmd(
+            repo=repo,
+            host=host,
+            port=server_port,
+            web_dir=web_dir,
+            data_dir=data_dir,
+            boot_dir=effective_boot_dir,
+            game_dir=effective_game_dir,
+            shaders_dir=shaders_dir,
+            allow_dump_dir=effective_dump_dir,
+            quiet=bool(quiet_server),
+        )
+        chrome_cmd = build_chrome_args(
+            chrome_path,
+            user_data_dir=profile_dir,
+            cdp_port=cdp_port,
+            headless=headless,
+            initial_url="about:blank",
+        )
+
+        if want_frames:
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            pil_image_mod = _import_pil_image()
+            if pil_image_mod is not None:
+                result.non_black_canvas_frames = 0
+            else:
+                result.non_black_canvas_frames = None
+                result.warnings.append("Pillow (PIL) not installed; skipping non-black canvas extrema check")
+
         server_log_fh = server_log_path.open("wb")
         server_proc = popen_fn(
             server_cmd,
@@ -4889,6 +5264,21 @@ def run_browser_session(
             cdp.send("Runtime.enable")
             cdp.send("Log.enable")
             cdp.send("Page.enable")
+            if headless:
+                try:
+                    cdp.send(
+                        "Emulation.setDeviceMetricsOverride",
+                        {
+                            "width": DEFAULT_VIEWPORT_WIDTH,
+                            "height": DEFAULT_VIEWPORT_HEIGHT,
+                            "deviceScaleFactor": 1,
+                            "mobile": False,
+                            "screenWidth": DEFAULT_VIEWPORT_WIDTH,
+                            "screenHeight": DEFAULT_VIEWPORT_HEIGHT,
+                        },
+                    )
+                except (CdpError, TimeoutError, OSError):
+                    pass
             try:
                 cdp.send("Performance.enable")
             except (CdpError, TimeoutError, OSError):
@@ -4912,11 +5302,12 @@ def run_browser_session(
         smoke_triggered = False
         observed_gpu_memory: dict[str, int] | None = None
         observed_renderer_memory: dict[str, Any] | None = None
+        observed_gpu_hang_recovery: dict[str, Any] | None = None
         observed_input_script_state: dict[str, Any] | None = None
         observed_input_script_presses = 0
 
         def observe_probe(probe: Mapping[str, Any]) -> None:
-            nonlocal observed_gpu_memory, observed_renderer_memory
+            nonlocal observed_gpu_memory, observed_renderer_memory, observed_gpu_hang_recovery
             nonlocal observed_input_script_state, observed_input_script_presses
             sample_gpu_mem = _extract_gpu_memory_stats(result, probe)
             if sample_gpu_mem is not None:
@@ -4924,6 +5315,12 @@ def run_browser_session(
             sample_ren_mem = _extract_renderer_memory_stats(result, probe)
             if sample_ren_mem is not None:
                 observed_renderer_memory = _merge_renderer_memory_snapshots(observed_renderer_memory, sample_ren_mem)
+            sample_gpu_hr = _extract_gpu_hang_recovery_stats(result, probe)
+            if sample_gpu_hr:
+                observed_gpu_hang_recovery = _merge_gpu_hang_recovery_snapshots(
+                    observed_gpu_hang_recovery,
+                    sample_gpu_hr,
+                )
             script_state = _extract_input_script_state(probe)
             if script_state is not None:
                 presses = max(
@@ -5172,6 +5569,9 @@ def run_browser_session(
             js_heap_used_mb=result.js_heap_used_mb,
             js_heap_total_mb=result.js_heap_total_mb,
         )
+        if observed_gpu_hang_recovery is not None:
+            result.gpu_hang_recovery = observed_gpu_hang_recovery
+        result.gpu_hang_recovery = _extract_gpu_hang_recovery_stats(result) or None
         if result.js_heap_used_mb is None and isinstance(result.renderer_memory, Mapping):
             result.js_heap_used_mb = _sanitize_non_negative_float(result.renderer_memory.get("jsHeapUsedMb"), digits=1)
         if result.js_heap_total_mb is None and isinstance(result.renderer_memory, Mapping):
@@ -5234,6 +5634,8 @@ def run_browser_session(
             shutil.rmtree(profile_dir, ignore_errors=True)
         if smoke_boot_dir is not None:
             shutil.rmtree(smoke_boot_dir, ignore_errors=True)
+        if boot_options_backup is not None:
+            restore_boot_options_file(boot_options_backup, repo_root=repo)
 
 
 # ---------------------------------------------------------------------------
@@ -5438,6 +5840,7 @@ def build_boot_report(
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
     effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
     effective_swapchain_probe = _extract_swapchain_probe_stats(probe)
+    effective_gpu_hang_recovery = _extract_gpu_hang_recovery_stats(session, probe)
 
     milestones: list[dict[str, Any]] = []
     raw_milestones = tracer.get("milestones")
@@ -5605,6 +6008,9 @@ def build_boot_report(
     for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
         if effective_swapchain_probe[probe_key] is not None:
             summary[probe_key] = effective_swapchain_probe[probe_key]
+    for ghr_key in GPU_HANG_RECOVERY_KEYS:
+        if ghr_key in effective_gpu_hang_recovery:
+            summary[ghr_key] = effective_gpu_hang_recovery[ghr_key]
     if warm_boot is not None:
         summary["warm_boot"] = dict(warm_boot)
 
@@ -5761,6 +6167,7 @@ def build_telemetry_payload(
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
     effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
     effective_swapchain_probe = _extract_swapchain_probe_stats(probe)
+    effective_gpu_hang_recovery = _extract_gpu_hang_recovery_stats(session, probe)
     effective_hide_hud = bool(hide_hud or session.hide_hud)
     effective_hold_until_visible = (
         validate_hold_until_visible(hold_until_visible)
@@ -5839,6 +6246,9 @@ def build_telemetry_payload(
     for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
         if effective_swapchain_probe[probe_key] is not None:
             summary[probe_key] = effective_swapchain_probe[probe_key]
+    for ghr_key in GPU_HANG_RECOVERY_KEYS:
+        if ghr_key in effective_gpu_hang_recovery:
+            summary[ghr_key] = effective_gpu_hang_recovery[ghr_key]
     if warm_boot is not None:
         summary["warm_boot"] = dict(warm_boot)
     telemetry_payload: dict[str, Any] = {
@@ -5922,6 +6332,9 @@ def build_telemetry_payload(
     for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
         if effective_swapchain_probe[probe_key] is not None:
             telemetry_payload[probe_key] = effective_swapchain_probe[probe_key]
+    for ghr_key in GPU_HANG_RECOVERY_KEYS:
+        if ghr_key in effective_gpu_hang_recovery:
+            telemetry_payload[ghr_key] = effective_gpu_hang_recovery[ghr_key]
     return sanitize_value(telemetry_payload)
 
 
@@ -6014,6 +6427,9 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
     suppressed_black_frames = _sanitize_optional_non_negative_int(report.get("suppressedBlackFrames"))
     if suppressed_black_frames is None:
         suppressed_black_frames = _sanitize_optional_non_negative_int(summary.get("suppressedBlackFrames"))
+    swapchain_probe_in_flight = _sanitize_optional_bool(report.get("swapchainProbeInFlight"))
+    if swapchain_probe_in_flight is None:
+        swapchain_probe_in_flight = _sanitize_optional_bool(summary.get("swapchainProbeInFlight"))
     probe_parts: list[str] = []
     if swapchain_probe_count is not None:
         probe_parts.append(f"swapchainProbeCount={swapchain_probe_count}")
@@ -6021,8 +6437,24 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
         probe_parts.append(f"lastSampledMaxLuma={last_sampled_max_luma}")
     if suppressed_black_frames is not None:
         probe_parts.append(f"suppressedBlackFrames={suppressed_black_frames}")
+    if swapchain_probe_in_flight is not None:
+        probe_parts.append(f"swapchainProbeInFlight={'true' if swapchain_probe_in_flight else 'false'}")
     if probe_parts:
         lines.append(f"swapchain_probe: {', '.join(probe_parts)}")
+    ghr_parts: list[str] = []
+    for ghr_int_key in ("coalescedPresents", "oversizedWgslFallbacks", "deviceLostCount", "deviceRecoveredCount"):
+        ghr_val = _sanitize_optional_non_negative_int(report.get(ghr_int_key))
+        if ghr_val is None:
+            ghr_val = _sanitize_optional_non_negative_int(summary.get(ghr_int_key))
+        if ghr_val is not None:
+            ghr_parts.append(f"{ghr_int_key}={ghr_val}")
+    ranged_pack_active = _sanitize_optional_bool(report.get("rangedPackActive"))
+    if ranged_pack_active is None:
+        ranged_pack_active = _sanitize_optional_bool(summary.get("rangedPackActive"))
+    if ranged_pack_active is not None:
+        ghr_parts.append(f"rangedPackActive={'true' if ranged_pack_active else 'false'}")
+    if ghr_parts:
+        lines.append(f"gpu_hang_recovery: {', '.join(ghr_parts)}")
     first_visible_frame_s = _sanitize_non_negative_float(
         report.get("first_visible_frame_s"), digits=3
     )
@@ -6657,6 +7089,17 @@ def _run(
     dump_dir: Path | None = (run_dir / DEFAULT_DUMP_SUBDIR_NAME) if effective_dump_pipelines else None
     if resolved_boot_options is not None and not args.smoke:
         validate_boot_dir_safety(boot_dir, repo)
+    stale_dump_warning: str | None = None
+    if not args.smoke and not effective_dump_pipelines and resolved_boot_options is None:
+        stale_dump_dir = detect_stale_dump_pipelines_boot_options(boot_dir)
+        if stale_dump_dir is not None:
+            stale_dump_warning = format_stale_dump_pipelines_warning(
+                boot_dir,
+                stale_dump_dir,
+                repo_root=repo,
+            )
+            if args.dry_run or args.build_only or session_runner is not run_browser_session:
+                print(f"[warn] {stale_dump_warning}", file=sys.stderr, flush=True)
 
     if args.dry_run:
         preview_port = args.port if args.port > 0 else 0
@@ -6785,45 +7228,49 @@ def _run(
         )
 
     staged_boot_options: dict[str, Any] | None = None
-    if resolved_boot_options is not None and not args.smoke:
-        staged_boot_options = stage_boot_options_file(
-            resolved_boot_options,
-            boot_dir,
-            repo_root=repo,
-            dry_run=False,
-            check_safety=True,
-        )
-
-    if not args.smoke and not (out_dir / "runtime.wasm").is_file():
-        raise RunnerError(
-            f"runtime.wasm not found in {repo_relative_label(out_dir, repo)} after build "
-            "(build Wasm64 runtime or pass --smoke)"
-        )
-
-    if args.build_only:
-        if prebuilt_guard.containing_prebuilt(build_dir) is None:
-            clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
-        print("[build-only] build stages and shader staging complete", file=sys.stderr, flush=True)
-        return 0
-
-    run_dir.mkdir(parents=True, exist_ok=True)
-    if prebuilt_guard.containing_prebuilt(build_dir) is None:
-        clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
-    print(f"[run] {repo_relative_label(run_dir, repo)}", file=sys.stderr, flush=True)
-
+    boot_options_backup: BootOptionsBackup | None = None
     shared_profile_dir: Path | None = None
     warm_session: BrowserSessionResult | None = None
     warm_report: dict[str, Any] | None = None
     warm_boot_summary: dict[str, Any] | None = None
-    session_port = args.port
-    if warm_boot_check:
-        shared_profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-warm-profile-"))
-        if session_port == 0:
-            # Pick one free localhost port upfront so cold and warm passes share the exact
-            # same http://127.0.0.1:<port> origin (required for Chrome OPFS cache reuse).
-            session_port = find_free_port("127.0.0.1")
 
     try:
+        if resolved_boot_options is not None and not args.smoke:
+            if effective_dump_pipelines:
+                boot_options_backup = snapshot_boot_options_file(boot_dir)
+            staged_boot_options = stage_boot_options_file(
+                resolved_boot_options,
+                boot_dir,
+                repo_root=repo,
+                dry_run=False,
+                check_safety=True,
+            )
+
+        if not args.smoke and not (out_dir / "runtime.wasm").is_file():
+            raise RunnerError(
+                f"runtime.wasm not found in {repo_relative_label(out_dir, repo)} after build "
+                "(build Wasm64 runtime or pass --smoke)"
+            )
+
+        if args.build_only:
+            if prebuilt_guard.containing_prebuilt(build_dir) is None:
+                clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
+            print("[build-only] build stages and shader staging complete", file=sys.stderr, flush=True)
+            return 0
+
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if prebuilt_guard.containing_prebuilt(build_dir) is None:
+            clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
+        print(f"[run] {repo_relative_label(run_dir, repo)}", file=sys.stderr, flush=True)
+
+        session_port = args.port
+        if warm_boot_check:
+            shared_profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-warm-profile-"))
+            if session_port == 0:
+                # Pick one free localhost port upfront so cold and warm passes share the exact
+                # same http://127.0.0.1:<port> origin (required for Chrome OPFS cache reuse).
+                session_port = find_free_port("127.0.0.1")
+
         cold_kwargs: dict[str, Any] = {
             "repo": repo,
             "run_dir": run_dir,
@@ -6861,6 +7308,8 @@ def _run(
         if args.web_dir:
             cold_kwargs["web_dir"] = web_dir
         session = session_runner(**cold_kwargs)
+        if stale_dump_warning is not None and stale_dump_warning not in session.warnings:
+            session.warnings.append(stale_dump_warning)
 
         cold_has_report = bool(
             session.ok or session.final_probe or session.presents or session.status in ("ok", "fault")
@@ -6948,6 +7397,8 @@ def _run(
     finally:
         if shared_profile_dir is not None:
             shutil.rmtree(shared_profile_dir, ignore_errors=True)
+        if boot_options_backup is not None:
+            restore_boot_options_file(boot_options_backup, repo_root=repo)
 
     # Always write console.log, telemetry.json, and command.json
     console_lines = list(session.console_lines)
