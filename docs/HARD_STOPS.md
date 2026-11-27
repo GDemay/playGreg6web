@@ -105,7 +105,7 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
 2. What XSystemGetAppSpecificDeviceId should return, if anything.
 3. Which HRESULT slot 71/72 should settle on long term (see section 2).
 4. Any policy for XStore slots 20/21/22/65/68 if the boot reaches them.
-5. S7: decided 2026-11-27, implemented in #PRNUM: Media Foundation object-creating imports (MFCreateAttributes, MFCreateMediaType, MFCreateSourceResolver,
+5. S7: decided 2026-11-27, implemented in #2029: Media Foundation object-creating imports (MFCreateAttributes, MFCreateMediaType, MFCreateSourceResolver,
    MFCreateSourceReaderFromMediaSource) are `ok` failing shims in `runtime/os/shim_audit.h` (section 7.4).
 6. S8: CRT `fopen` / `_wfopen` / `remove` (and the msvcp140 `_fsopen` / `_wfsopen`) are `ok` since #1998; no owner
    decision is left (section 7.5).
@@ -278,7 +278,7 @@ Evidence (static, re-checked against main after #1998):
 
 ### 7.4 S7: Media Foundation imports (MFPlat / MFReadWrite)
 
-**Decided 2026-11-27 (option A), implemented in #PRNUM.** The four imports are `ok` in `shim_audit.h` and fail cleanly (null out pointer, `E_NOTIMPL`, logged once each). The text below is the original analysis.
+**Decided 2026-11-27 (option A), implemented in #2029.** The four imports are `ok` in `shim_audit.h` and fail cleanly (null out pointer, `E_NOTIMPL`, logged once each). The text below is the original analysis.
 
 State on main: MFStartup, MFShutdown and MFGetSystemTime are `ok` (MFStartup returns `S_OK`). MFCreateAttributes,
 MFCreateMediaType, MFCreateSourceResolver and MFReadWrite MFCreateSourceReaderFromMediaSource are `deny` ("host COM:
