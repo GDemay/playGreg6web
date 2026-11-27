@@ -2092,3 +2092,110 @@ test('W284 telemetry tracks peakBatchBytes, zeroAllocDrains, backpressureWaitRat
     assert.equal(rawHeader.getUint32(off, true), 0);
   }
 });
+
+test('Orch18 hardening: drainTo clamp & throw-safety, stopAtWrap zero-copy, oversized maxBytes no-livelock, waitForData/Space, and SPSC wrap guard', () => {
+  const encodePkt = (opcode, flags, payloadBytes) => {
+    const out = new Uint8Array(GPU_PACKET_HEADER_BYTES + payloadBytes.byteLength);
+    const dv = new DataView(out.buffer);
+    dv.setUint16(0, opcode, true);
+    dv.setUint16(2, flags, true);
+    dv.setUint32(4, payloadBytes.byteLength, true);
+    out.set(payloadBytes, GPU_PACKET_HEADER_BYTES);
+    return out;
+  };
+
+  // 1) drainTo() does not advance READ_POS or telemetry when callback throws.
+  const ring = GpuRingBuffer.create(64);
+  const pkt16 = encodePkt(OPCODES.DRAW, 1, new Uint8Array(8).fill(0xab));
+  assert.equal(ring.writeBytes(pkt16), true);
+  assert.throws(() => {
+    ring.drainTo(() => {
+      throw new Error('drainTo-boom');
+    });
+  }, /drainTo-boom/);
+  assert.equal(ring.readPos, 0);
+  assert.equal(ring.totalBytesDrained, 0);
+  assert.equal(ring.drainTo((bytes) => assert.equal(bytes.byteLength, 16)), 16);
+  assert.equal(ring.readPos, 16);
+
+  // 2) drainTo() clamps corrupted avail > capacityBytes safely without OOM.
+  const hdrU32 = new Uint32Array(ring.sab, 0, 16);
+  Atomics.store(hdrU32, HEADER_INDEX.READ_POS, 32);
+  Atomics.store(hdrU32, HEADER_INDEX.WRITE_POS, 32 + 200);
+  let clampedLen = 0;
+  const nClamped = ring.drainTo((bytes) => {
+    clampedLen = bytes.byteLength;
+  });
+  assert.equal(nClamped, 64);
+  assert.equal(clampedLen, 64);
+
+  // 3) availableBytes() and getStats() do not return ~4 GiB or poison peakOccupancyBytes on readPos > writePos wrap.
+  ring.reset();
+  Atomics.store(hdrU32, HEADER_INDEX.WRITE_POS, 16);
+  Atomics.store(hdrU32, HEADER_INDEX.READ_POS, 32);
+  assert.equal(ring.availableBytes(), 0);
+  assert.equal(ring.getStats().availableBytes, 0);
+  assert.equal(ring.highWatermarkBytes, 0);
+
+  // 4) drainBatchZeroAlloc never livelocks when a single valid complete packet exceeds maxBytes.
+  ring.reset();
+  const pkt24 = encodePkt(OPCODES.DRAW, 2, new Uint8Array(16).fill(0xcd));
+  assert.equal(ring.writeBytes(pkt24), true);
+  assert.equal(ring.writeBytes(pkt16), true);
+  const overRes = ring.drainBatchZeroAlloc(
+    (bytesView, off, len, span) => {
+      assert.equal(len, 24);
+      assert.equal(span.packets, 1);
+    },
+    { maxBytes: 12, directView: true }
+  );
+  assert.equal(overRes.packets, 1);
+  assert.equal(overRes.bytes, 24);
+  assert.equal(overRes.remainingBytes, 16);
+  assert.equal(ring.drainBatchZeroAlloc(() => {}).bytes, 16);
+
+  // 5) stopAtWrap: true keeps pre-wrap and post-wrap batches 100% zero-copy.
+  ring.reset();
+  assert.equal(ring.writeBytes(new Uint8Array(40)), true);
+  assert.equal(ring.drainTo(() => {}), 40); // readPos = 40, 24 bytes before wrap
+  assert.equal(ring.writeBytes(pkt16), true); // [40..56)
+  assert.equal(ring.writeBytes(pkt16), true); // [56..64) + [0..8) -> wraps!
+  const preWrap = ring.drainBatchZeroAlloc(
+    (bytesView, off, len, span) => {
+      assert.equal(span.zeroCopy, true);
+      assert.equal(span.wrapped, false);
+      assert.equal(len, 16);
+    },
+    { stopAtWrap: true, directView: true }
+  );
+  assert.equal(preWrap.packets, 1);
+  assert.equal(preWrap.zeroCopy, true);
+  assert.equal(preWrap.remainingBytes, 16);
+  const straddle = ring.drainBatchZeroAlloc(() => {}, { stopAtWrap: true });
+  assert.equal(straddle.packets, 1);
+  assert.equal(straddle.wrapped, true);
+
+  // 6) Impossible corrupt header (> capacity - 8) increments corruptHeaders telemetry.
+  ring.reset();
+  const corruptHdr = new Uint8Array(16);
+  new DataView(corruptHdr.buffer).setUint32(4, 1024, true); // > 64 - 8
+  assert.equal(ring.writeBytes(corruptHdr), true);
+  const corruptRes = ring.drainBatchZeroAlloc(() => {
+    throw new Error('corrupt packet must not invoke handler');
+  });
+  assert.equal(corruptRes.packets, 0);
+  assert.equal(ring.corruptHeaders, 1);
+  assert.equal(ring.getStats().corruptHeaders, 1);
+
+  // 7) Batched writeBytes(..., false) + notifyConsumer() and waitForData / waitForSpace fast paths.
+  ring.reset();
+  const seq0 = ring.notifySeq;
+  assert.equal(ring.writeBytes(pkt16, false), true);
+  assert.equal(ring.notifySeq, seq0);
+  ring.notifyConsumer();
+  assert.equal(ring.notifySeq, seq0 + 1);
+  assert.equal(ring.waitForData(1), 'ok');
+  assert.equal(ring.waitForSpace(16, 1), 'ok');
+  assert.equal(ring.drainBatchZeroAlloc(() => {}).bytes, 16);
+  assert.equal(ring.waitForData(0), 'timed-out');
+});

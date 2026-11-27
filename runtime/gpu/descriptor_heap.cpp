@@ -104,7 +104,10 @@ DescriptorHeap::DescriptorHeap(const DescriptorHeapDesc& desc, uint32_t serial)
     } else {
         views_.resize(n);
     }
-    slot_generations_ = std::make_unique<uint64_t[]>(n);
+    slot_generations_ = std::make_unique<std::atomic<uint64_t>[]>(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        slot_generations_[i].store(0, std::memory_order_relaxed);
+    }
     const uint32_t blocks = (n + kGenerationBlockSize - 1) / kGenerationBlockSize;
     block_generations_ = std::make_unique<std::atomic<uint64_t>[]>(blocks);
     for (uint32_t b = 0; b < blocks; ++b) {
@@ -121,21 +124,30 @@ GpuDescriptorHandle DescriptorHeap::gpu_start() const noexcept {
 }
 
 CpuDescriptorHandle DescriptorHeap::cpu_handle(uint32_t index) const noexcept {
+    const uint64_t byte_offset = static_cast<uint64_t>(index) * increment();
     if (desc_.cpu_address != 0) {
-        return CpuDescriptorHandle{desc_.cpu_address + static_cast<uint64_t>(index) * increment()};
+        if (byte_offset > UINT64_MAX - desc_.cpu_address) {
+            return CpuDescriptorHandle{0};
+        }
+        return CpuDescriptorHandle{desc_.cpu_address + byte_offset};
+    }
+    if (byte_offset > 0xffffffffull) {
+        return CpuDescriptorHandle{0};
     }
     return CpuDescriptorHandle{
-        (static_cast<uint64_t>(kCpuTag | serial_) << 32) |
-        (static_cast<uint64_t>(index) * increment())};
+        (static_cast<uint64_t>(kCpuTag | serial_) << 32) | byte_offset};
 }
 
 GpuDescriptorHandle DescriptorHeap::gpu_handle(uint32_t index) const noexcept {
     if (!shader_visible()) {
         return GpuDescriptorHandle{0};
     }
+    const uint64_t byte_offset = static_cast<uint64_t>(index) * increment();
+    if (byte_offset > 0xffffffffull) {
+        return GpuDescriptorHandle{0};
+    }
     return GpuDescriptorHandle{
-        (static_cast<uint64_t>(kGpuTag | serial_) << 32) |
-        (static_cast<uint64_t>(index) * increment())};
+        (static_cast<uint64_t>(kGpuTag | serial_) << 32) | byte_offset};
 }
 
 const ViewDescriptor* DescriptorHeap::view(uint32_t index) const noexcept {
@@ -147,17 +159,21 @@ const SamplerDescriptor* DescriptorHeap::sampler(uint32_t index) const noexcept 
 }
 
 uint64_t DescriptorHeap::slot_generation(uint32_t index) const noexcept {
-    return index < capacity() ? slot_generations_[index] : 0;
+    return index < capacity() ? slot_generations_[index].load(std::memory_order_acquire) : 0;
 }
 
-void DescriptorHeap::stamp(uint32_t index) noexcept {
-    const uint64_t gen = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
-    slot_generations_[index] = gen;
-    std::atomic<uint64_t>& block = block_generations_[index / kGenerationBlockSize];
+void DescriptorHeap::stamp_block(uint32_t block_index, uint64_t gen) noexcept {
+    std::atomic<uint64_t>& block = block_generations_[block_index];
     uint64_t current = block.load(std::memory_order_relaxed);
     while (current < gen &&
            !block.compare_exchange_weak(current, gen, std::memory_order_release, std::memory_order_relaxed)) {
     }
+}
+
+void DescriptorHeap::stamp(uint32_t index) noexcept {
+    const uint64_t gen = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+    slot_generations_[index].store(gen, std::memory_order_release);
+    stamp_block(index / kGenerationBlockSize, gen);
 }
 
 bool DescriptorHeap::write_view(uint32_t index, const ViewDescriptor& record) noexcept {
@@ -184,6 +200,142 @@ bool DescriptorHeap::write_sampler(uint32_t index, const SamplerDescriptor& reco
     return true;
 }
 
+bool DescriptorHeap::copy_range_from(
+    uint32_t dst_index,
+    const DescriptorHeap& src,
+    uint32_t src_index,
+    uint32_t count) noexcept {
+    if (count == 0) {
+        return false;
+    }
+    const bool backward = (this == &src && dst_index > src_index);
+    const bool samplers = is_sampler_heap(desc_.type);
+    uint64_t gen = 0;
+    uint32_t last_block = 0xffffffffu;
+    auto mark_changed = [&](uint32_t di) noexcept {
+        if (gen == 0) {
+            gen = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        }
+        slot_generations_[di].store(gen, std::memory_order_release);
+        const uint32_t b = di / kGenerationBlockSize;
+        if (b != last_block) {
+            if (last_block != 0xffffffffu) {
+                stamp_block(last_block, gen);
+            }
+            last_block = b;
+        }
+    };
+    if (samplers) {
+        if (backward) {
+            for (uint32_t i = count; i-- > 0;) {
+                const uint32_t di = dst_index + i;
+                const SamplerDescriptor& srec = src.samplers_[src_index + i];
+                if (std::memcmp(&samplers_[di], &srec, sizeof(SamplerDescriptor)) != 0) {
+                    samplers_[di] = srec;
+                    mark_changed(di);
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t di = dst_index + i;
+                const SamplerDescriptor& srec = src.samplers_[src_index + i];
+                if (std::memcmp(&samplers_[di], &srec, sizeof(SamplerDescriptor)) != 0) {
+                    samplers_[di] = srec;
+                    mark_changed(di);
+                }
+            }
+        }
+    } else {
+        if (backward) {
+            for (uint32_t i = count; i-- > 0;) {
+                const uint32_t di = dst_index + i;
+                const ViewDescriptor& vrec = src.views_[src_index + i];
+                if (std::memcmp(&views_[di], &vrec, sizeof(ViewDescriptor)) != 0) {
+                    views_[di] = vrec;
+                    mark_changed(di);
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t di = dst_index + i;
+                const ViewDescriptor& vrec = src.views_[src_index + i];
+                if (std::memcmp(&views_[di], &vrec, sizeof(ViewDescriptor)) != 0) {
+                    views_[di] = vrec;
+                    mark_changed(di);
+                }
+            }
+        }
+    }
+    if (last_block != 0xffffffffu) {
+        stamp_block(last_block, gen);
+        return true;
+    }
+    return false;
+}
+
+bool DescriptorHeap::write_views_batch(uint32_t dst_index, const ViewDescriptor* records, uint32_t count) noexcept {
+    if (count == 0 || records == nullptr) {
+        return false;
+    }
+    uint64_t gen = 0;
+    uint32_t last_block = 0xffffffffu;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t di = dst_index + i;
+        if (std::memcmp(&views_[di], &records[i], sizeof(ViewDescriptor)) != 0) {
+            views_[di] = records[i];
+            if (gen == 0) {
+                gen = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            }
+            slot_generations_[di].store(gen, std::memory_order_release);
+            const uint32_t b = di / kGenerationBlockSize;
+            if (b != last_block) {
+                if (last_block != 0xffffffffu) {
+                    stamp_block(last_block, gen);
+                }
+                last_block = b;
+            }
+        }
+    }
+    if (last_block != 0xffffffffu) {
+        stamp_block(last_block, gen);
+        return true;
+    }
+    return false;
+}
+
+bool DescriptorHeap::write_samplers_batch(
+    uint32_t dst_index,
+    const SamplerDescriptor* records,
+    uint32_t count) noexcept {
+    if (count == 0 || records == nullptr) {
+        return false;
+    }
+    uint64_t gen = 0;
+    uint32_t last_block = 0xffffffffu;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t di = dst_index + i;
+        if (std::memcmp(&samplers_[di], &records[i], sizeof(SamplerDescriptor)) != 0) {
+            samplers_[di] = records[i];
+            if (gen == 0) {
+                gen = generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+            }
+            slot_generations_[di].store(gen, std::memory_order_release);
+            const uint32_t b = di / kGenerationBlockSize;
+            if (b != last_block) {
+                if (last_block != 0xffffffffu) {
+                    stamp_block(last_block, gen);
+                }
+                last_block = b;
+            }
+        }
+    }
+    if (last_block != 0xffffffffu) {
+        stamp_block(last_block, gen);
+        return true;
+    }
+    return false;
+}
+
 bool DescriptorHeap::range_changed_since(uint32_t first, uint32_t count, uint64_t since) const noexcept {
     const uint32_t cap = capacity();
     if (count == 0 || first >= cap) {
@@ -207,7 +359,7 @@ bool DescriptorHeap::range_changed_since(uint32_t first, uint32_t count, uint64_
             return true;
         }
         for (uint32_t i = lo; i < hi; ++i) {
-            if (slot_generations_[i] > since) {
+            if (slot_generations_[i].load(std::memory_order_acquire) > since) {
                 return true;
             }
         }
@@ -357,17 +509,21 @@ void DescriptorHeapRegistry::destroy_heap(DescriptorHeap* heap) {
     }
     const uint32_t slot = it->second;
     owned_.erase(it);
-    if (heap->desc().cpu_address != 0) {
-        const uint64_t addr = heap->desc().cpu_address;
+    {
+        // Hold exclusive lookup lock while clearing the slot and placed entry so concurrent
+        // resolve() callers cannot dereference `heap` after deletion.
         std::unique_lock<std::shared_mutex> placed_lock(placed_mutex_);
-        auto pit = std::lower_bound(
-            placed_.begin(), placed_.end(), addr,
-            [](const PlacedHeapRange& r, uint64_t a) { return r.start < a; });
-        if (pit != placed_.end() && pit->start == addr) {
-            placed_.erase(pit);
+        if (heap->desc().cpu_address != 0) {
+            const uint64_t addr = heap->desc().cpu_address;
+            auto pit = std::lower_bound(
+                placed_.begin(), placed_.end(), addr,
+                [](const PlacedHeapRange& r, uint64_t a) { return r.start < a; });
+            if (pit != placed_.end() && pit->start == addr) {
+                placed_.erase(pit);
+            }
         }
+        slots_[slot].store(nullptr, std::memory_order_release);
     }
-    slots_[slot].store(nullptr, std::memory_order_release);
     slot_generation_[slot] = static_cast<uint16_t>((slot_generation_[slot] + 1) & kSlotGenerationMask);
     free_slots_.push_back(slot);
     live_heaps_.fetch_sub(1, std::memory_order_relaxed);
@@ -380,11 +536,10 @@ uint32_t DescriptorHeapRegistry::heap_count() const noexcept {
     return live_heaps_.load(std::memory_order_relaxed);
 }
 
-Status DescriptorHeapRegistry::resolve(uint64_t ptr, uint32_t tag, ResolvedDescriptor* out) const noexcept {
+Status DescriptorHeapRegistry::resolve_locked(uint64_t ptr, uint32_t tag, ResolvedDescriptor* out) const noexcept {
     const uint32_t hi = static_cast<uint32_t>(ptr >> 32);
     if (tag == kCpuTag && (hi & kTagMask) == 0 && ptr != 0) {
         // A CPU handle of a heap placed at an address.
-        std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
         const size_t n = placed_.size();
         const PlacedHeapRange* found = nullptr;
         if (n <= 8) {
@@ -448,6 +603,11 @@ Status DescriptorHeapRegistry::resolve(uint64_t ptr, uint32_t tag, ResolvedDescr
     return Status::Ok;
 }
 
+Status DescriptorHeapRegistry::resolve(uint64_t ptr, uint32_t tag, ResolvedDescriptor* out) const noexcept {
+    std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
+    return resolve_locked(ptr, tag, out);
+}
+
 Status DescriptorHeapRegistry::resolve_cpu(CpuDescriptorHandle handle, ResolvedDescriptor* out) const noexcept {
     return resolve(handle.ptr, kCpuTag, out);
 }
@@ -456,13 +616,13 @@ Status DescriptorHeapRegistry::resolve_gpu(GpuDescriptorHandle handle, ResolvedD
     return resolve(handle.ptr, kGpuTag, out);
 }
 
-Status DescriptorHeapRegistry::resolve_range(
+Status DescriptorHeapRegistry::resolve_range_locked(
     CpuDescriptorHandle start,
     uint32_t count,
     DescriptorHeapType type,
     ResolvedDescriptor* out) const noexcept {
     ResolvedDescriptor r;
-    const Status s = resolve(start.ptr, kCpuTag, &r);
+    const Status s = resolve_locked(start.ptr, kCpuTag, &r);
     if (s != Status::Ok) {
         return s;
     }
@@ -474,6 +634,15 @@ Status DescriptorHeapRegistry::resolve_range(
     }
     *out = r;
     return Status::Ok;
+}
+
+Status DescriptorHeapRegistry::resolve_range(
+    CpuDescriptorHandle start,
+    uint32_t count,
+    DescriptorHeapType type,
+    ResolvedDescriptor* out) const noexcept {
+    std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
+    return resolve_range_locked(start, count, type, out);
 }
 
 Status DescriptorHeapRegistry::write_view_at(CpuDescriptorHandle dst, const ViewDescriptor& record) noexcept {
@@ -551,7 +720,8 @@ Status DescriptorHeapRegistry::create_constant_buffer_view(
     ViewDescriptor r{};
     r.kind = DescriptorKind::Cbv;
     if (desc != nullptr) {
-        if ((desc->size_in_bytes % cbv_alignment_) != 0 || (desc->buffer_location % cbv_alignment_) != 0) {
+        const uint64_t align_mask = static_cast<uint64_t>(cbv_alignment_) - 1u;
+        if ((desc->size_in_bytes & align_mask) != 0 || (desc->buffer_location & align_mask) != 0) {
             return Status::InvalidArgument;
         }
         r.first_element_or_address = desc->buffer_location;
@@ -616,16 +786,6 @@ Status DescriptorHeapRegistry::create_sampler(const SamplerDesc& desc, CpuDescri
 
 namespace {
 
-void copy_one(DescriptorHeap* dst, uint32_t di, const DescriptorHeap* src, uint32_t si) noexcept {
-    if (is_sampler_heap(dst->type())) {
-        const SamplerDescriptor record = *src->sampler(si);
-        dst->write_sampler(di, record);
-    } else {
-        const ViewDescriptor record = *src->view(si);
-        dst->write_view(di, record);
-    }
-}
-
 struct CopyScratch {
     std::vector<ResolvedDescriptor> dst;
     std::vector<ResolvedDescriptor> src;
@@ -653,26 +813,20 @@ Status DescriptorHeapRegistry::copy_descriptors_simple(
     }
     ResolvedDescriptor dst;
     ResolvedDescriptor src;
-    Status s = resolve_range(dst_start, num_descriptors, type, &dst);
-    if (s != Status::Ok) {
-        return s;
-    }
-    s = resolve_range(src_start, num_descriptors, type, &src);
-    if (s != Status::Ok) {
-        return s;
-    }
-    if (dst.heap == src.heap && dst.index == src.index) {
-        return Status::Ok;
-    }
-    if (dst.heap == src.heap && dst.index > src.index) {
-        // memmove semantics: copy backwards when the destination is ahead.
-        for (uint32_t i = num_descriptors; i-- > 0;) {
-            copy_one(dst.heap, dst.index + i, src.heap, src.index + i);
+    {
+        std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
+        Status s = resolve_range_locked(dst_start, num_descriptors, type, &dst);
+        if (s != Status::Ok) {
+            return s;
         }
-    } else {
-        for (uint32_t i = 0; i < num_descriptors; ++i) {
-            copy_one(dst.heap, dst.index + i, src.heap, src.index + i);
+        s = resolve_range_locked(src_start, num_descriptors, type, &src);
+        if (s != Status::Ok) {
+            return s;
         }
+        if (dst.heap == src.heap && dst.index == src.index) {
+            return Status::Ok;
+        }
+        dst.heap->copy_range_from(dst.index, *src.heap, src.index, num_descriptors);
     }
     return Status::Ok;
 }
@@ -709,87 +863,157 @@ Status DescriptorHeapRegistry::copy_descriptors(
     CopyScratch& scratch = copy_scratch();
     scratch.dst.resize(num_dst_ranges);
     scratch.src.resize(num_src_ranges);
+
+    std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
+    DescriptorHeap* single_dst_heap = nullptr;
+    bool multi_dst_heap = false;
+    uint64_t dst_min = UINT64_MAX;
+    uint64_t dst_max_end = 0;
     for (uint32_t i = 0; i < num_dst_ranges; ++i) {
         const uint32_t n = size_of(dst_range_sizes, i);
         if (n == 0) {
             continue;
         }
-        const Status s = resolve_range(dst_range_starts[i], n, type, &scratch.dst[i]);
+        const Status s = resolve_range_locked(dst_range_starts[i], n, type, &scratch.dst[i]);
         if (s != Status::Ok) {
             return s;
         }
+        if (single_dst_heap == nullptr) {
+            single_dst_heap = scratch.dst[i].heap;
+        } else if (single_dst_heap != scratch.dst[i].heap) {
+            multi_dst_heap = true;
+        }
+        const uint64_t lo = scratch.dst[i].index;
+        const uint64_t hi = lo + n;
+        if (lo < dst_min) dst_min = lo;
+        if (hi > dst_max_end) dst_max_end = hi;
     }
+    DescriptorHeap* single_src_heap = nullptr;
+    bool multi_src_heap = false;
+    uint64_t src_min = UINT64_MAX;
+    uint64_t src_max_end = 0;
     for (uint32_t i = 0; i < num_src_ranges; ++i) {
         const uint32_t n = size_of(src_range_sizes, i);
         if (n == 0) {
             continue;
         }
-        const Status s = resolve_range(src_range_starts[i], n, type, &scratch.src[i]);
+        const Status s = resolve_range_locked(src_range_starts[i], n, type, &scratch.src[i]);
         if (s != Status::Ok) {
             return s;
+        }
+        if (single_src_heap == nullptr) {
+            single_src_heap = scratch.src[i].heap;
+        } else if (single_src_heap != scratch.src[i].heap) {
+            multi_src_heap = true;
+        }
+        const uint64_t lo = scratch.src[i].index;
+        const uint64_t hi = lo + n;
+        if (lo < src_min) src_min = lo;
+        if (hi > src_max_end) src_max_end = hi;
+    }
+
+    // O(1) fast-path: disjoint heaps or disjoint bounding boxes cannot overlap.
+    bool may_overlap = true;
+    if (!multi_dst_heap && !multi_src_heap) {
+        if (single_dst_heap != single_src_heap) {
+            may_overlap = false;
+        } else if (dst_max_end <= src_min || src_max_end <= dst_min) {
+            may_overlap = false;
         }
     }
 
     bool overlap = false;
-    for (uint32_t d = 0; d < num_dst_ranges && !overlap; ++d) {
-        const uint32_t dn = size_of(dst_range_sizes, d);
-        if (dn == 0) {
-            continue;
-        }
-        for (uint32_t s = 0; s < num_src_ranges; ++s) {
-            const uint32_t sn = size_of(src_range_sizes, s);
-            if (sn == 0 || scratch.src[s].heap != scratch.dst[d].heap) {
+    if (may_overlap) {
+        for (uint32_t d = 0; d < num_dst_ranges && !overlap; ++d) {
+            const uint32_t dn = size_of(dst_range_sizes, d);
+            if (dn == 0) {
                 continue;
             }
-            const uint64_t d0 = scratch.dst[d].index;
-            const uint64_t s0 = scratch.src[s].index;
-            if (d0 < s0 + sn && s0 < d0 + dn) {
-                overlap = true;
-                break;
+            for (uint32_t s = 0; s < num_src_ranges; ++s) {
+                const uint32_t sn = size_of(src_range_sizes, s);
+                if (sn == 0 || scratch.src[s].heap != scratch.dst[d].heap) {
+                    continue;
+                }
+                const uint64_t d0 = scratch.dst[d].index;
+                const uint64_t s0 = scratch.src[s].index;
+                if (d0 < s0 + sn && s0 < d0 + dn) {
+                    overlap = true;
+                    break;
+                }
             }
         }
     }
 
     const bool samplers = is_sampler_heap(type);
     if (overlap) {
-        // Stage every source descriptor, then scatter.
-        scratch.views.clear();
-        scratch.samplers.clear();
-        for (uint32_t s = 0; s < num_src_ranges; ++s) {
-            const uint32_t sn = size_of(src_range_sizes, s);
-            for (uint32_t k = 0; k < sn; ++k) {
-                if (samplers) {
-                    scratch.samplers.push_back(*scratch.src[s].heap->sampler(scratch.src[s].index + k));
-                } else {
-                    scratch.views.push_back(*scratch.src[s].heap->view(scratch.src[s].index + k));
-                }
+        // Stage every source descriptor, then scatter in batched range writes.
+        if (samplers) {
+            scratch.samplers.clear();
+            if (scratch.samplers.capacity() < dst_total) {
+                scratch.samplers.reserve(static_cast<size_t>(dst_total));
             }
-        }
-        size_t cursor = 0;
-        for (uint32_t d = 0; d < num_dst_ranges; ++d) {
-            const uint32_t dn = size_of(dst_range_sizes, d);
-            for (uint32_t k = 0; k < dn; ++k, ++cursor) {
-                if (samplers) {
-                    scratch.dst[d].heap->write_sampler(scratch.dst[d].index + k, scratch.samplers[cursor]);
-                } else {
-                    scratch.dst[d].heap->write_view(scratch.dst[d].index + k, scratch.views[cursor]);
+            for (uint32_t s = 0; s < num_src_ranges; ++s) {
+                const uint32_t sn = size_of(src_range_sizes, s);
+                if (sn == 0) {
+                    continue;
                 }
+                const SamplerDescriptor* base = scratch.src[s].heap->sampler(scratch.src[s].index);
+                scratch.samplers.insert(scratch.samplers.end(), base, base + sn);
+            }
+            size_t cursor = 0;
+            for (uint32_t d = 0; d < num_dst_ranges; ++d) {
+                const uint32_t dn = size_of(dst_range_sizes, d);
+                if (dn == 0) {
+                    continue;
+                }
+                scratch.dst[d].heap->write_samplers_batch(
+                    scratch.dst[d].index, scratch.samplers.data() + cursor, dn);
+                cursor += dn;
+            }
+        } else {
+            scratch.views.clear();
+            if (scratch.views.capacity() < dst_total) {
+                scratch.views.reserve(static_cast<size_t>(dst_total));
+            }
+            for (uint32_t s = 0; s < num_src_ranges; ++s) {
+                const uint32_t sn = size_of(src_range_sizes, s);
+                if (sn == 0) {
+                    continue;
+                }
+                const ViewDescriptor* base = scratch.src[s].heap->view(scratch.src[s].index);
+                scratch.views.insert(scratch.views.end(), base, base + sn);
+            }
+            size_t cursor = 0;
+            for (uint32_t d = 0; d < num_dst_ranges; ++d) {
+                const uint32_t dn = size_of(dst_range_sizes, d);
+                if (dn == 0) {
+                    continue;
+                }
+                scratch.dst[d].heap->write_views_batch(
+                    scratch.dst[d].index, scratch.views.data() + cursor, dn);
+                cursor += dn;
             }
         }
         return Status::Ok;
     }
 
+    // Non-overlapping path: copy maximal contiguous runs with batched generation stamping.
     uint32_t s = 0;
     uint32_t s_off = 0;
     for (uint32_t d = 0; d < num_dst_ranges; ++d) {
         const uint32_t dn = size_of(dst_range_sizes, d);
-        for (uint32_t k = 0; k < dn; ++k) {
+        uint32_t d_off = 0;
+        while (d_off < dn) {
             while (s_off >= size_of(src_range_sizes, s)) {
                 ++s;
                 s_off = 0;
             }
-            copy_one(scratch.dst[d].heap, scratch.dst[d].index + k, scratch.src[s].heap, scratch.src[s].index + s_off);
-            ++s_off;
+            const uint32_t s_rem = size_of(src_range_sizes, s) - s_off;
+            const uint32_t chunk = std::min(dn - d_off, s_rem);
+            scratch.dst[d].heap->copy_range_from(
+                scratch.dst[d].index + d_off, *scratch.src[s].heap, scratch.src[s].index + s_off, chunk);
+            d_off += chunk;
+            s_off += chunk;
         }
     }
     return Status::Ok;
@@ -2035,7 +2259,9 @@ BindGroupPlan BindGroupPlan::build(
             }
         }
         if (any) {  // a table only a CB-indexed entry reads its index through binds no slot
-            plan.windows_.push_back(TableWindow{i, lo, hi - lo + 1});
+            const uint32_t span = hi - lo;
+            const uint32_t count = span == 0xffffffffu ? 0xffffffffu : span + 1u;
+            plan.windows_.push_back(TableWindow{i, lo, count});
         }
     }
 
@@ -2196,6 +2422,13 @@ void BindGroupCache::build_entries(
     out->key = scratch_key_;
     out->entries.clear();
     out->null_entries = 0;
+    out->null_write_entries = 0;
+    out->relocations.clear();
+    out->relocation_epoch = 0;
+    out->retire_epoch = 0;
+    out->residency_epoch = 0;
+    out->residency_key = 0;
+    out->view_ids.clear();
     out->built_generation.clear();
     for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
         out->built_generation.push_back(state.argument(bind_point, w.parameter_index).heap->generation());
@@ -2203,6 +2436,7 @@ void BindGroupCache::build_entries(
     out->built_words.clear();
     out->table_bases.clear();
     out->heap_slots.clear();
+    out->built_source = slot_source_;
     out->from_memory = memory_words(state, bind_point, plan, &out->built_words);
     if (out->from_memory) {
         for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
@@ -2212,6 +2446,7 @@ void BindGroupCache::build_entries(
     }
     out->entries.reserve(plan.entries().size());
     const RootSignatureDesc& desc = signature.desc();
+    size_t heap_slot_cursor = 0;
     for (const PlanEntry& p : plan.entries()) {
         BindGroupEntry e;
         e.binding = p.binding;
@@ -2257,18 +2492,30 @@ void BindGroupCache::build_entries(
             e.sampler = p.sampler;
             break;
         case PlanSource::HeapIndexed: {
-            DescriptorHeap* heap = nullptr;
-            uint32_t index = 0;
             CachedBindGroup::HeapSlot slot;
             slot.entry = static_cast<uint32_t>(out->entries.size());
-            bool cb_miss = false;
-            if (heap_slot(state, bind_point, p, slot_source_, &heap, &index, &cb_miss)) {
-                slot.gpu_handle = heap->gpu_handle(index).ptr;
-                slot.generation = heap->generation();
-                table_entry(slot_source_, *heap, index, p.register_class, resolver, resolver_user, &e);
+            if (heap_slot_cursor < scratch_heap_slots_.size()) {
+                const ResolvedHeapSlot& rs = scratch_heap_slots_[heap_slot_cursor++];
+                if (rs.valid) {
+                    slot.gpu_handle = rs.heap->gpu_handle(rs.index).ptr;
+                    slot.generation = rs.heap->generation();
+                    table_entry(slot_source_, *rs.heap, rs.index, p.register_class, resolver, resolver_user, &e);
+                } else {
+                    ++heap_index_misses_;  // index outside the bound heap: bound as null, counted
+                    cb_index_misses_ += rs.cb_miss ? 1u : 0u;
+                }
             } else {
-                ++heap_index_misses_;  // index outside the bound heap: bound as null, counted
-                cb_index_misses_ += cb_miss ? 1u : 0u;
+                DescriptorHeap* heap = nullptr;
+                uint32_t index = 0;
+                bool cb_miss = false;
+                if (heap_slot(state, bind_point, p, slot_source_, &heap, &index, &cb_miss)) {
+                    slot.gpu_handle = heap->gpu_handle(index).ptr;
+                    slot.generation = heap->generation();
+                    table_entry(slot_source_, *heap, index, p.register_class, resolver, resolver_user, &e);
+                } else {
+                    ++heap_index_misses_;
+                    cb_index_misses_ += cb_miss ? 1u : 0u;
+                }
             }
             out->heap_slots.push_back(slot);
             break;
@@ -2398,18 +2645,36 @@ BindGroupLookup BindGroupCache::get_or_build(
             break;
         }
     }
-    // Heap-indexed entries: the bound heap and the byte offset the root constant (or the constant-
-    // buffer dword, read now: G62 CB-indexed heaps) selects.
+    // Heap-indexed entries: the bound heap (with presence bit so serial 0 never collides with
+    // nullptr) and the byte offset the root constant (or constant-buffer dword, read once here)
+    // selects. Resolved slots are stashed in scratch_heap_slots_ to avoid redundant CB memory reads.
+    scratch_heap_slots_.clear();
     if (plan.has_heap_indexed()) {
         for (const PlanEntry& p : plan.entries()) {
             if (p.source != PlanSource::HeapIndexed) {
                 continue;
             }
-            const DescriptorHeap* heap = state.bound_heap(
+            DescriptorHeap* heap = state.bound_heap(
                 p.register_class == DescriptorRangeType::Sampler ? DescriptorHeapType::Sampler : DescriptorHeapType::CbvSrvUav);
             uint64_t byte_offset = 0;
-            scratch_key_.push_back(heap != nullptr ? heap->serial() : 0u);
-            scratch_key_.push_back(heap_byte_offset(state, bind_point, p, slot_source_, &byte_offset) ? byte_offset : ~0ull);
+            bool cb_miss = false;
+            const bool has_offset = heap_byte_offset(state, bind_point, p, slot_source_, &byte_offset, &cb_miss);
+            scratch_key_.push_back(heap != nullptr ? (uint64_t{1} << 32) | heap->serial() : 0ull);
+            scratch_key_.push_back(has_offset ? byte_offset : ~0ull);
+            ResolvedHeapSlot rs{};
+            rs.cb_miss = cb_miss;
+            if (has_offset && heap != nullptr) {
+                const uint32_t inc = heap->increment();
+                if (inc != 0 && (byte_offset & (inc - 1u)) == 0) {
+                    const uint64_t idx = byte_offset >> increment_shift(inc);
+                    if (idx < heap->capacity()) {
+                        rs.heap = heap;
+                        rs.index = static_cast<uint32_t>(idx);
+                        rs.valid = true;
+                    }
+                }
+            }
+            scratch_heap_slots_.push_back(rs);
         }
     }
     const uint64_t h = hash_key(scratch_key_);
@@ -2428,7 +2693,7 @@ BindGroupLookup BindGroupCache::get_or_build(
     if (hit_entry != nullptr) {
         CachedBindGroup& cached = *hit_entry;
         cached.last_used_epoch = epoch_;
-        bool changed = false;
+        bool changed = (cached.built_source != slot_source_);
         const std::vector<BindGroupPlan::TableWindow>& windows = plan.table_windows();
         for (size_t t = 0; t < windows.size() && !changed; ++t) {
             const RootArgument& arg = state.argument(bind_point, windows[t].parameter_index);
@@ -2438,12 +2703,11 @@ BindGroupLookup BindGroupCache::get_or_build(
                     static_cast<uint32_t>(first), windows[t].count, cached.built_generation[t]);
             }
         }
-        for (const CachedBindGroup::HeapSlot& s : cached.heap_slots) {
-            DescriptorHeap* heap = nullptr;
-            uint32_t index = 0;
-            if (!changed && s.gpu_handle != 0 && s.entry < plan.entries().size() &&
-                heap_slot(state, bind_point, plan.entries()[s.entry], slot_source_, &heap, &index)) {
-                changed = heap->range_changed_since(index, 1, s.generation);
+        for (size_t hi = 0; hi < cached.heap_slots.size() && !changed; ++hi) {
+            const CachedBindGroup::HeapSlot& s = cached.heap_slots[hi];
+            if (s.gpu_handle != 0 && hi < scratch_heap_slots_.size() && scratch_heap_slots_[hi].valid) {
+                changed = scratch_heap_slots_[hi].heap->range_changed_since(
+                    scratch_heap_slots_[hi].index, 1, s.generation);
             }
         }
         if (!changed && cached.from_memory) {
@@ -2534,14 +2798,11 @@ bool BindGroupCache::memory_words(const RootArgumentState& state, BindPoint bind
     }
     // Heap-indexed slots the title writes itself, after the windows.
     if (plan.has_heap_indexed()) {
-        for (const PlanEntry& p : plan.entries()) {
-            DescriptorHeap* heap = nullptr;
-            uint32_t index = 0;
-            if (p.source != PlanSource::HeapIndexed || !heap_slot(state, bind_point, p, slot_source_, &heap, &index) ||
-                !slot_source_->reads(*heap)) {
+        for (const ResolvedHeapSlot& rs : scratch_heap_slots_) {
+            if (!rs.valid || !slot_source_->reads(*rs.heap)) {
                 continue;
             }
-            slot_source_->snapshot(*heap, index, 1, &scratch_window_);
+            slot_source_->snapshot(*rs.heap, rs.index, 1, &scratch_window_);
             out->insert(out->end(), scratch_window_.begin(), scratch_window_.end());
             any = true;
         }
@@ -2615,10 +2876,10 @@ bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
             }
         } else if (p.source == PlanSource::HeapIndexed) {
             auto it = std::find_if(heap_slots.begin(), heap_slots.end(), [&](const auto& s) { return s.first == i; });
+            e = BindGroupEntry{};
+            e.binding = p.binding;
+            e.root_parameter_index = p.root_parameter_index;
             if (it != heap_slots.end()) {
-                e = BindGroupEntry{};
-                e.binding = p.binding;
-                e.root_parameter_index = p.root_parameter_index;
                 table_entry(&source, *it->second.heap, it->second.index, p.register_class, resolver, resolver_user, &e);
             }
         }
@@ -2747,11 +3008,38 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
             return 0;  // no cached group references any of the ids
         }
     }
-    auto contains = [](std::span<const uint32_t> ids, uint32_t id) noexcept -> bool {
+    const bool sort_res = resource_ids.size() > 8;
+    if (sort_res) {
+        scratch_evict_res_.assign(resource_ids.begin(), resource_ids.end());
+        std::sort(scratch_evict_res_.begin(), scratch_evict_res_.end());
+    }
+    const bool sort_views = view_ids.size() > 8;
+    if (sort_views) {
+        scratch_evict_views_.assign(view_ids.begin(), view_ids.end());
+        std::sort(scratch_evict_views_.begin(), scratch_evict_views_.end());
+    }
+    auto contains_res = [&](uint32_t id) noexcept -> bool {
         if (id == 0) {
             return false;
         }
-        for (const uint32_t candidate : ids) {
+        if (sort_res) {
+            return std::binary_search(scratch_evict_res_.begin(), scratch_evict_res_.end(), id);
+        }
+        for (const uint32_t candidate : resource_ids) {
+            if (candidate == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto contains_view = [&](uint32_t id) noexcept -> bool {
+        if (id == 0) {
+            return false;
+        }
+        if (sort_views) {
+            return std::binary_search(scratch_evict_views_.begin(), scratch_evict_views_.end(), id);
+        }
+        for (const uint32_t candidate : view_ids) {
             if (candidate == id) {
                 return true;
             }
@@ -2761,21 +3049,21 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
     auto references_any = [&](const CachedBindGroup& g) noexcept -> bool {
         if (!resource_ids.empty()) {
             for (const BindGroupEntry& e : g.entries) {
-                if (contains(resource_ids, e.resource_id) ||
-                    contains(resource_ids, e.view.resource_id) ||
-                    contains(resource_ids, e.view.counter_resource_id)) {
+                if (contains_res(e.resource_id) ||
+                    contains_res(e.view.resource_id) ||
+                    contains_res(e.view.counter_resource_id)) {
                     return true;
                 }
             }
             for (const CachedBindGroup::Relocation& r : g.relocations) {
-                if (contains(resource_ids, r.buffer_id)) {
+                if (contains_res(r.buffer_id)) {
                     return true;
                 }
             }
         }
         if (!view_ids.empty()) {
             for (const uint32_t vid : g.view_ids) {
-                if (contains(view_ids, vid)) {
+                if (contains_view(vid)) {
                     return true;
                 }
             }
@@ -3046,7 +3334,6 @@ void ResourceStateRegistry::execute(const CommandListStateTracker& list, std::ve
         if (all_equal) {
             g.uniform_state = g.states[0];
             g.states.clear();
-            g.states.shrink_to_fit();
         }
     }
 }

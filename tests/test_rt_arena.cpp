@@ -1,10 +1,14 @@
 // Unit tests for the paged RT address arena (gpu/rt_arena.h) and zero-alloc indirect/mesh
 // clamp batch planner (gpu/indirect_clamp_batch.h).
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "gpu/cmd_encoder.h"
@@ -290,6 +294,91 @@ void test_indirect_clamp_batch_zero_alloc_and_mesh() {
     }
 }
 
+void test_arena_hardening_eviction_va_reuse_and_report_sync() {
+    // 1) stage_structure with mark_gpu_owned + out_writes must NOT queue guest-memory uploads that
+    //    would later overwrite staged BVH bytes.
+    Arena st(1, 4);
+    std::vector<StagedWrite> writes;
+    CHECK(st.stage_structure(1, 0x10000ull, 2 * kPageBytes, true, &writes) == Ensure::Uploaded);
+    CHECK(writes.size() == 2);
+    CHECK(st.take_uploads().empty());
+    CHECK(st.take_dir_dirty(nullptr, nullptr));  // null out pointers are safe
+
+    // 2) Idle recycled scratch pages are reclaimed by evict_one() when regular RT pages need space.
+    Arena ev(1, 4);
+    ev.set_scratch_budget_pages(4);
+    ScratchAllocation sc{};
+    CHECK(ev.acquire_scratch(4 * kPageBytes, &sc) == Ensure::Uploaded);
+    ev.release_scratch(sc);
+    CHECK(ev.stats().scratch_recycled_pages == 4);
+    // Same dispatch: allocating regular pages must reclaim idle recycled scratch (no false ArenaFull!).
+    CHECK(ev.ensure_page(0x20) == Ensure::Uploaded);
+    CHECK(ev.is_resident(0x20));
+    CHECK(ev.stats().scratch_evictions >= 1);
+
+    // 3) Repeated scratch acquire/release/evict cycles reuse VA space without exhausting L2 tables,
+    //    and UINT64_MAX byte_size does not overflow page calculation.
+    Arena va_test(1, 8);
+    va_test.set_scratch_budget_pages(4);
+    ScratchAllocation overflow_sc{};
+    CHECK(va_test.acquire_scratch(UINT64_MAX, &overflow_sc) == Ensure::ArenaFull);
+    CHECK(!overflow_sc.valid());
+    for (int iter = 0; iter < 100; ++iter) {
+        ScratchAllocation a1{}, a2{};
+        CHECK(va_test.acquire_scratch(2 * kPageBytes, &a1) != Ensure::TableFull);
+        CHECK(a1.valid());
+        va_test.release_scratch(a1);
+        CHECK(va_test.acquire_scratch(3 * kPageBytes, &a2) != Ensure::TableFull);
+        CHECK(a2.valid());
+        va_test.release_scratch(a2);
+    }
+    // Should only have needed 1 L2 table for scratch (4096 top + 4096 L2 = 8192 words).
+    CHECK(va_test.directory().size() == kTopEntries + kL2Entries);
+
+    // 4) ensure_range(..., pin=true) rolls back prefix pins on partial failure.
+    Arena pin_rb(1, 3);
+    CHECK(pin_rb.ensure_page(0, true) == Ensure::Uploaded);
+    CHECK(pin_rb.ensure_range(0x10 * kPageBytes, 4 * kPageBytes, true) == Ensure::ArenaFull);
+    CHECK(pin_rb.stats().pinned == 1);  // only page 0 remains pinned
+
+    // 5) pack_instance_3x4 accepts small valid scale 1e-4, rejects NaN, and zeroes on bad address.
+    Instance3x4 sm{};
+    sm.transform[0][0] = 1e-4f;
+    sm.transform[1][1] = 1e-4f;
+    sm.transform[2][2] = 1e-4f;
+    sm.blas_address = 0x10000ull;
+    sm.blas_root_node = 13u;
+    uint32_t dw[kInstance3x4Dwords];
+    CHECK(pack_instance_3x4(sm, dw));
+    Instance3x4 bad = sm;
+    bad.blas_address = 0x10008ull;
+    std::memset(dw, 0xCC, sizeof(dw));
+    CHECK(!pack_instance_3x4(bad, dw));
+    CHECK(dw[0] == 0u && dw[15] == 0xFFFFFFFFu);
+
+    // 6) clear_report_provider() waits for any in-flight report_json() on another thread.
+    int dummy_owner = 0;
+    std::atomic<bool> entered{false};
+    std::atomic<bool> finished{false};
+    set_report_provider(&dummy_owner, [&]() -> std::string {
+        entered.store(true, std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        finished.store(true, std::memory_order_release);
+        return "{\"ok\":true}";
+    });
+    std::string got;
+    std::thread reader([&] { got = report_json(); });
+    while (!entered.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    clear_report_provider(&dummy_owner);
+    // Must not return before provider finished executing!
+    CHECK(finished.load(std::memory_order_acquire));
+    reader.join();
+    CHECK(got == "{\"ok\":true}");
+    CHECK(report_json() == "{}");
+}
+
 }  // namespace
 
 int main() {
@@ -385,6 +474,7 @@ int main() {
     test_scratch_recycling_and_staging();
     test_pack_instance_3x4();
     test_indirect_clamp_batch_zero_alloc_and_mesh();
+    test_arena_hardening_eviction_va_reuse_and_report_sync();
 
     if (g_failures == 0) std::printf("test_rt_arena: OK\n");
     return g_failures ? 1 : 0;

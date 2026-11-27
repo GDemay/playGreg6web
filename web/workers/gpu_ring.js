@@ -117,7 +117,7 @@
       }
 
       const byteOffset = options.byteOffset !== undefined ? options.byteOffset : 0;
-      if (!Number.isInteger(byteOffset) || byteOffset < 0 || (byteOffset & 3) !== 0) {
+      if (!Number.isSafeInteger(byteOffset) || byteOffset < 0 || (byteOffset & 3) !== 0) {
         throw new RangeError(`byteOffset must be a non-negative 4-byte aligned integer, got ${byteOffset}`);
       }
       if (byteOffset + GPU_RING_HEADER_BYTES > sab.byteLength) {
@@ -248,6 +248,7 @@
       this._zeroAllocDrains = 0;
       this._totalBytesDrained = 0;
       this._emptyDrains = 0;
+      this._corruptHeaders = 0;
     }
 
     _ensureWrapScratch(requiredBytes) {
@@ -278,11 +279,12 @@
     }
 
     _copyWrappedToScratch(startOffset, byteLength) {
-      const scratch = this._ensureWrapScratch(byteLength);
-      const data = this._data;
       const cap = this._capacityBytes;
+      const clampedLen = byteLength > cap ? cap : byteLength;
+      const scratch = this._ensureWrapScratch(clampedLen);
+      const data = this._data;
       const firstLen = cap - startOffset;
-      const secondLen = byteLength - firstLen;
+      const secondLen = clampedLen - firstLen;
       if (firstLen <= 128) {
         for (let i = 0; i < firstLen; i++) {
           scratch[i] = data[startOffset + i];
@@ -301,11 +303,12 @@
     }
 
     _recordOccupancy(bytes) {
-      if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes <= 0) {
+      if (!(bytes > 0) || bytes === Infinity) {
         return;
       }
-      const clamped = bytes > this._capacityBytes ? this._capacityBytes : Math.floor(bytes);
-      const currentPeak = sanitizeNonNegInt(this._peakOccupancyBytes);
+      const clamped = bytes >= this._capacityBytes ? this._capacityBytes : (bytes | 0);
+      const cur = this._peakOccupancyBytes;
+      const currentPeak = cur >= 0 && cur < Infinity ? cur : 0;
       if (clamped > currentPeak) {
         this._peakOccupancyBytes = clamped;
       }
@@ -382,6 +385,10 @@
       return sanitizeNonNegInt(this._emptyDrains);
     }
 
+    get corruptHeaders() {
+      return sanitizeNonNegInt(this._corruptHeaders);
+    }
+
     get sab() {
       return this._sab;
     }
@@ -426,10 +433,44 @@
       return Atomics.load(this._headerU32, HEADER_INDEX.NOTIFY_SEQ);
     }
 
+    _snapshotPositions() {
+      // Load READ_POS before WRITE_POS so concurrent SPSC progress never produces a
+      // wrapped ~4 GiB difference (w - r) when consumer advances between loads.
+      let readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
+      let writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+      let avail = (writePos - readPos) >>> 0;
+      if (avail > this._capacityBytes) {
+        for (let attempt = 0; attempt < 2 && avail > this._capacityBytes; attempt++) {
+          readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
+          writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+          avail = (writePos - readPos) >>> 0;
+        }
+        if (avail > 0x80000000) {
+          avail = 0;
+        } else if (avail > this._capacityBytes) {
+          avail = this._capacityBytes;
+        }
+      }
+      return { readPos, writePos, avail };
+    }
+
     availableBytes() {
-      const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
-      const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
-      const avail = (writePos - readPos) >>> 0;
+      let readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
+      let writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+      let avail = (writePos - readPos) >>> 0;
+      if (avail > this._capacityBytes) {
+        for (let attempt = 0; attempt < 2 && avail > this._capacityBytes; attempt++) {
+          readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
+          writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+          avail = (writePos - readPos) >>> 0;
+        }
+        if (avail > 0x80000000) {
+          return 0;
+        }
+        if (avail > this._capacityBytes) {
+          avail = this._capacityBytes;
+        }
+      }
       this._recordOccupancy(avail);
       return avail;
     }
@@ -437,6 +478,85 @@
     freeBytes() {
       const used = this.availableBytes();
       return used >= this._capacityBytes ? 0 : this._capacityBytes - used;
+    }
+
+    /**
+     * Publishes a consumer wakeup notification on NOTIFY_SEQ (paired with writeBytes(..., false)).
+     */
+    notifyConsumer() {
+      Atomics.add(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
+      return Atomics.notify(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
+    }
+
+    /**
+     * Race-free consumer wait for queued ring bytes.
+     * Snapshots NOTIFY_SEQ before checking WRITE_POS/READ_POS so producer publishes
+     * between the emptiness check and Atomics.wait never lose a wakeup.
+     * Defaults to a bounded timeout (4 ms) so a non-notifying producer cannot deadlock.
+     *
+     * @param {number} [timeoutMs=4]
+     * @returns {'ok'|'not-equal'|'timed-out'|'unsupported'}
+     */
+    waitForData(timeoutMs = 4) {
+      const seq = Atomics.load(this._headerI32, HEADER_INDEX.NOTIFY_SEQ);
+      const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
+      const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+      const avail = (writePos - readPos) >>> 0;
+      if (avail > 0 && avail <= this._capacityBytes) {
+        return 'ok';
+      }
+      if (typeof Atomics.wait !== 'function') {
+        return 'unsupported';
+      }
+      const boundedTimeout =
+        typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs >= 0
+          ? timeoutMs
+          : 4;
+      try {
+        return Atomics.wait(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, seq, boundedTimeout);
+      } catch (_err) {
+        return 'unsupported';
+      }
+    }
+
+    /**
+     * Race-free producer wait until at least `requiredBytes` are free in the ring.
+     *
+     * @param {number} [requiredBytes=1]
+     * @param {number} [timeoutMs=4]
+     * @returns {'ok'|'not-equal'|'timed-out'|'unsupported'}
+     */
+    waitForSpace(requiredBytes = 1, timeoutMs = 4) {
+      const req = sanitizeNonNegInt(requiredBytes);
+      if (req === 0) {
+        return 'ok';
+      }
+      if (req > this._capacityBytes) {
+        return 'timed-out';
+      }
+      const readPos = Atomics.load(this._headerI32, HEADER_INDEX.READ_POS);
+      const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
+      const used = (writePos - (readPos >>> 0)) >>> 0;
+      const free = used >= this._capacityBytes ? 0 : this._capacityBytes - used;
+      if (free >= req) {
+        return 'ok';
+      }
+      if (typeof Atomics.wait !== 'function') {
+        return 'unsupported';
+      }
+      const boundedTimeout =
+        typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs >= 0
+          ? timeoutMs
+          : 4;
+      try {
+        const res = Atomics.wait(this._headerI32, HEADER_INDEX.READ_POS, readPos, boundedTimeout);
+        if (res === 'ok' || res === 'timed-out') {
+          this.recordBackpressureWait(1);
+        }
+        return res;
+      } catch (_err) {
+        return 'unsupported';
+      }
     }
 
     /**
@@ -462,7 +582,7 @@
      * @param {Uint8Array|ArrayBufferView|ArrayBuffer|SharedArrayBuffer} input
      * @returns {boolean}
      */
-    writeBytes(input) {
+    writeBytes(input, notify = true) {
       const src = toUint8Array(input);
       const len = src.byteLength;
       if (len === 0) {
@@ -476,11 +596,13 @@
       const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
       const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
       const used = (writePos - readPos) >>> 0;
-      this._recordOccupancy(used);
       const free = used >= this._capacityBytes ? 0 : this._capacityBytes - used;
       if (len > free) {
-        this._backpressureWaits = sanitizeNonNegInt(this._backpressureWaits) + 1;
-        this._backpressureStalls = sanitizeNonNegInt(this._backpressureStalls) + 1;
+        this._recordOccupancy(used);
+        const curWaits = this._backpressureWaits;
+        this._backpressureWaits = curWaits >= 0 && curWaits < Infinity ? curWaits + 1 : 1;
+        const curStalls = this._backpressureStalls;
+        this._backpressureStalls = curStalls >= 0 && curStalls < Infinity ? curStalls + 1 : 1;
         Atomics.add(this._headerU32, HEADER_INDEX.DROPPED_PACKETS, 1);
         return false;
       }
@@ -496,9 +618,12 @@
 
       const nextWrite = (writePos + len) >>> 0;
       Atomics.store(this._headerU32, HEADER_INDEX.WRITE_POS, nextWrite);
-      Atomics.add(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
-      Atomics.notify(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
-      this._writesSucceeded = sanitizeNonNegInt(this._writesSucceeded) + 1;
+      if (notify !== false) {
+        Atomics.add(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
+        Atomics.notify(this._headerI32, HEADER_INDEX.NOTIFY_SEQ, 1);
+      }
+      const curWrites = this._writesSucceeded;
+      this._writesSucceeded = curWrites >= 0 && curWrites < Infinity ? curWrites + 1 : 1;
       this._recordOccupancy(used + len);
       return true;
     }
@@ -509,6 +634,7 @@
      * - Zero-copy subarray directly over the SharedArrayBuffer when not wrapping.
      * - Linearized into a reusable scratch Uint8Array on wrap-around so framed
      *   GpuPacketHeader streams are never split or corrupted at the ring boundary.
+     * - If `callback` throws, `READ_POS` is left unchanged so the stream remains unread.
      *
      * @param {(bytes: Uint8Array) => void} callback
      * @returns {number} Number of bytes drained.
@@ -528,42 +654,42 @@
         this._emptyDrains = curEmpty >= 0 && curEmpty < Infinity ? curEmpty + 1 : 1;
         return 0;
       }
-      this._recordOccupancy(avail);
+      const boundedAvail = avail > this._capacityBytes ? this._capacityBytes : avail;
+      this._recordOccupancy(boundedAvail);
 
       const offset = (readPos & this._mask) >>> 0;
       let slice;
-      if (offset + avail <= this._capacityBytes) {
-        slice = this._data.subarray(offset, offset + avail);
+      if (offset + boundedAvail <= this._capacityBytes) {
+        slice = this._data.subarray(offset, offset + boundedAvail);
       } else {
-        const scratch = this._copyWrappedToScratch(offset, avail);
-        slice = scratch.subarray(0, avail);
+        const scratch = this._copyWrappedToScratch(offset, boundedAvail);
+        slice = scratch.subarray(0, boundedAvail);
       }
 
-      const nextRead = (readPos + avail) >>> 0;
-      try {
-        callback(slice);
-      } finally {
-        Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
-        Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
-        const curTotal = this._totalBytesDrained;
-        this._totalBytesDrained =
-          (curTotal >= 0 && curTotal < Infinity ? curTotal : 0) + avail;
-        const curMaxBytes =
-          this._maxDrainBatchBytes >= 0 && this._maxDrainBatchBytes < Infinity
-            ? this._maxDrainBatchBytes
-            : 0;
-        if (avail > curMaxBytes) {
-          this._maxDrainBatchBytes = avail;
-        }
-        const curPeakBatch =
-          this._peakBatchBytes >= 0 && this._peakBatchBytes < Infinity
-            ? this._peakBatchBytes
-            : 0;
-        if (avail > curPeakBatch) {
-          this._peakBatchBytes = avail;
-        }
+      // Only advance READ_POS and telemetry if callback succeeds without throwing.
+      callback(slice);
+
+      const nextRead = (readPos + boundedAvail) >>> 0;
+      Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
+      Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
+      const curTotal = this._totalBytesDrained;
+      this._totalBytesDrained =
+        (curTotal >= 0 && curTotal < Infinity ? curTotal : 0) + boundedAvail;
+      const curMaxBytes =
+        this._maxDrainBatchBytes >= 0 && this._maxDrainBatchBytes < Infinity
+          ? this._maxDrainBatchBytes
+          : 0;
+      if (boundedAvail > curMaxBytes) {
+        this._maxDrainBatchBytes = boundedAvail;
       }
-      return avail;
+      const curPeakBatch =
+        this._peakBatchBytes >= 0 && this._peakBatchBytes < Infinity
+          ? this._peakBatchBytes
+          : 0;
+      if (boundedAvail > curPeakBatch) {
+        this._peakBatchBytes = boundedAvail;
+      }
+      return boundedAvail;
     }
 
     /**
@@ -666,6 +792,10 @@
           }
 
           if (payloadBytes > remaining - GPU_PACKET_HEADER_BYTES) {
+            if (payloadBytes > this._capacityBytes - GPU_PACKET_HEADER_BYTES) {
+              const curCorrupt = this._corruptHeaders;
+              this._corruptHeaders = curCorrupt >= 0 && curCorrupt < Infinity ? curCorrupt + 1 : 1;
+            }
             break;
           }
 
@@ -712,21 +842,32 @@
           const nextRead = (readPos + completedBytes) >>> 0;
           Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
           Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
+          const curTotal = this._totalBytesDrained;
           this._totalBytesDrained =
-            sanitizeNonNegInt(this._totalBytesDrained) + completedBytes;
-          const curMaxBytes = sanitizeNonNegInt(this._maxDrainBatchBytes);
+            (curTotal >= 0 && curTotal < Infinity ? curTotal : 0) + completedBytes;
+          const curMaxBytes =
+            this._maxDrainBatchBytes >= 0 && this._maxDrainBatchBytes < Infinity
+              ? this._maxDrainBatchBytes
+              : 0;
           if (completedBytes > curMaxBytes) {
             this._maxDrainBatchBytes = completedBytes;
           }
-          const curPeakBatch = sanitizeNonNegInt(this._peakBatchBytes);
+          const curPeakBatch =
+            this._peakBatchBytes >= 0 && this._peakBatchBytes < Infinity
+              ? this._peakBatchBytes
+              : 0;
           if (completedBytes > curPeakBatch) {
             this._peakBatchBytes = completedBytes;
           }
         }
         if (completedPackets > 0) {
-          this._batchesDrained = sanitizeNonNegInt(this._batchesDrained) + 1;
-          this._packetsDrained = sanitizeNonNegInt(this._packetsDrained) + completedPackets;
-          const curMaxBatch = sanitizeNonNegInt(this._maxBatchSize);
+          const curBatches = this._batchesDrained;
+          this._batchesDrained = curBatches >= 0 && curBatches < Infinity ? curBatches + 1 : 1;
+          const curPackets = this._packetsDrained;
+          this._packetsDrained =
+            (curPackets >= 0 && curPackets < Infinity ? curPackets : 0) + completedPackets;
+          const curMaxBatch =
+            this._maxBatchSize >= 0 && this._maxBatchSize < Infinity ? this._maxBatchSize : 0;
           if (completedPackets > curMaxBatch) {
             this._maxBatchSize = completedPackets;
           }
@@ -734,7 +875,8 @@
       }
 
       if (completedBytes === 0) {
-        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
+        const curEmpty = this._emptyDrains;
+        this._emptyDrains = curEmpty >= 0 && curEmpty < Infinity ? curEmpty + 1 : 1;
       }
 
       const batchWrapped =
@@ -776,6 +918,7 @@
       let framed = true;
       let reuseResult = false;
       let directView = false;
+      let stopAtWrap = false;
 
       if (options !== undefined && options !== null) {
         if (typeof options === 'number') {
@@ -818,6 +961,9 @@
           }
           if (options.directView !== undefined) {
             directView = Boolean(options.directView);
+          }
+          if (options.stopAtWrap !== undefined) {
+            stopAtWrap = Boolean(options.stopAtWrap);
           }
         } else {
           throw new TypeError(
@@ -876,12 +1022,21 @@
           }
 
           if (payloadBytes > remaining - GPU_PACKET_HEADER_BYTES) {
+            if (payloadBytes > this._capacityBytes - GPU_PACKET_HEADER_BYTES) {
+              const curCorrupt = this._corruptHeaders;
+              this._corruptHeaders = curCorrupt >= 0 && curCorrupt < Infinity ? curCorrupt + 1 : 1;
+            }
             break;
           }
 
           const packetLen = GPU_PACKET_HEADER_BYTES + payloadBytes;
-          if (spanBytes + packetLen > maxBytes) {
-            break;
+          if (packetCount > 0) {
+            if (spanBytes + packetLen > maxBytes) {
+              break;
+            }
+            if (stopAtWrap && startOffset + spanBytes + packetLen > this._capacityBytes) {
+              break;
+            }
           }
 
           spanBytes += packetLen;
@@ -1021,6 +1176,7 @@
       this._zeroAllocDrains = 0;
       this._totalBytesDrained = 0;
       this._emptyDrains = 0;
+      this._corruptHeaders = 0;
     }
 
     resetTelemetry() {
@@ -1036,9 +1192,7 @@
     }
 
     getStats() {
-      const writePos = this.writePos;
-      const readPos = this.readPos;
-      const availableBytes = (writePos - readPos) >>> 0;
+      const { readPos, writePos, avail: availableBytes } = this._snapshotPositions();
       this._recordOccupancy(availableBytes);
       const freeBytes =
         availableBytes >= this._capacityBytes ? 0 : this._capacityBytes - availableBytes;
@@ -1110,6 +1264,7 @@
         zeroAllocDrains,
         totalBytesDrained,
         emptyDrains,
+        corruptHeaders: sanitizeNonNegInt(this._corruptHeaders),
         peakOccupancyBytes,
         peakOccupancyRatio,
         highWatermarkBytes,
