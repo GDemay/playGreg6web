@@ -285,7 +285,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 ---
 
-- [ ] **GPU-PERF2150 — Stage only dirty pages of fragmented CPU-visible buffers** — `IN PROGRESS` (#2150, @GDemay). Scope: fragmented translated-window buffer shadow staging, focused window-mark tests and synthetic actual Device flush benchmark; preserve first-flush, verification, unreadable-page and packet semantics. No active #2148 files or streaming destination changes; real-game FPS unmeasured.
+- [ ] **GPU-PERF2150 — Stage only dirty pages of fragmented CPU-visible buffers** — `READY FOR REVIEW` (#2150, @GDemay). Scope: fragmented translated-window shadow staging, allocation-free scanned-mark eligibility, focused tests and a synthetic actual Device submission-flush benchmark. At most half marked bytes use sparse staging; first/verified/direct/denser flushes preserve bulk ordering. Native 64 MiB sparse control: 38.028603 → 0.115659 ms/flush; [all densities and rejected controls](performance/fragmented-buffer-flush.md). Full Linux validation passes; browser/Wasm, affected game frequency and FPS unmeasured. No streaming destination changes.
 
 - [x] **GPU performance — Linear-time Dawn blob-cache eviction selection** — `DONE` (#2050, @GDemay) *(no game files required; scoped to `runtime/gpu/native_exec/blob_cache.h`, its tests and synthetic benchmark)*
   - Preserve disk format, checksum validation and least-recently-used eviction while avoiding a full-index sort on each capped-cache store.
