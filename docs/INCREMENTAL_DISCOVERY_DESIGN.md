@@ -108,6 +108,20 @@ targets 6-9 s -> 1.5 s, vtable seeds 5-9 s -> 2.7-3.2 s, relocations 5-7 s -> 2.
 functions 12-16 s -> 5.7-7.8 s, and the untimed reclaim/drop time between rounds (reclaims
 and the restart drop, 10-14 s) -> about 3 s. Decoding (11-13 s, serial) is now the largest phase.
 
+Phase 0e (measured, same output): decoding is mostly bookkeeping, not instruction decoding.
+Re-decoding every final block of a fresh round (3.9M blocks, 23.2M instructions) with iced alone
+takes 0.6-0.75 s, so a parallel decoder could save at most ~1.5 s of the two fresh rounds. Cycle
+counters around the parts of `run()` (scratch build) put the rest in the predecessor index
+updates (13 %), the block-map inserts (12 %), the `leaders`/`worklist` inserts (11 %), the rest
+of `classify` (14 %), copying the instruction buffer out (9 %) and the worklist pop / `locate`
+(10 %). Changes: a `run()` that starts on an empty block map (the first run of a fresh round)
+does not update the predecessor index edge by edge but builds it once at the end
+(`PredIndex::build`: edges collected in parallel, grouped by a stable sort, bulk-built);
+`leaders` and `worklist` are `VaSet`s, a hierarchical bitmap over the executable sections (one
+bit per byte, `BTreeSet` for other VAs); the cross-function tail-call check looks up the branch
+target first. Paired runs (`refine::discover_refined_timed`, cold, 4 rounds): decode 11.1-11.4 s
+-> 8.6-9.3 s, total 29.9-31.3 s -> 27.5-29.2 s; the encoded result has the same SHA-256 as `main`.
+
 ## What a discovery rule can reach (measured)
 
 Same executable, refined discovery (435,719 functions, 4,001,806 blocks, 23,481,703

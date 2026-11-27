@@ -62,7 +62,9 @@ use crate::reach;
 use crate::reloc::{RelocKind, Relocation, RelocationMap, instruction_relocations};
 
 mod pred_index;
+mod va_set;
 use pred_index::PredIndex;
+use va_set::VaSet;
 mod timing;
 pub use timing::{DiscoveryTimings, Phase, PhaseTime};
 
@@ -617,10 +619,13 @@ struct Discovery<'i, 'a> {
     /// Incoming intra-function edges of every block in [`Self::blocks`], maintained on every edge
     /// change (always equal to [`PredIndex::from_blocks`]).
     preds: PredIndex,
+    /// Set while [`Self::run`] decodes into an empty block map: [`Self::preds`] is then not
+    /// updated edge by edge but built once from the block map when the run ends.
+    preds_deferred: bool,
     /// Every known block start (decoded or still queued).
-    leaders: BTreeSet<u64>,
+    leaders: VaSet,
     /// Pending block starts popped in ascending VA order for input-order independence.
-    worklist: BTreeSet<u64>,
+    worklist: VaSet,
     entries: BTreeSet<u64>,
     /// `jmp reg` sites decoded since the last jump-table round.
     pending_jumps: BTreeSet<u64>,
@@ -666,16 +671,32 @@ struct Discovery<'i, 'a> {
     scratch: Vec<Instruction>,
 }
 
+/// Largest executable span [`Discovery`] keeps its leader sets as bitmaps for (two bits per byte).
+const MAX_BITMAP_SPAN: u64 = 1 << 30;
+
 impl<'i, 'a> Discovery<'i, 'a> {
     fn new(image: &'i CodeImage<'a>, threads: usize) -> Self {
+        // The leader sets' bitmaps cover the executable sections (other VAs go to a `BTreeSet`).
+        let code = image
+            .sections()
+            .iter()
+            .filter(|s| s.executable && !s.is_empty());
+        let lo = code.clone().map(|s| s.va).min().unwrap_or(0);
+        let hi = code.map(|s| s.end()).max().unwrap_or(0);
+        let (lo, hi) = if hi.saturating_sub(lo) <= MAX_BITMAP_SPAN {
+            (lo, hi)
+        } else {
+            (0, 0)
+        };
         Self {
             image,
             threads,
             no_return: image.no_return.iter().copied().collect(),
             blocks: BTreeMap::new(),
             preds: PredIndex::default(),
-            leaders: BTreeSet::new(),
-            worklist: BTreeSet::new(),
+            preds_deferred: false,
+            leaders: VaSet::with_range(lo, hi),
+            worklist: VaSet::with_range(lo, hi),
             entries: BTreeSet::new(),
             pending_jumps: BTreeSet::new(),
             failed_jumps: BTreeMap::new(),
@@ -832,6 +853,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
     }
 
     fn run(&mut self) {
+        // A fresh round decodes millions of blocks into an empty map: index their edges in one
+        // pass at the end instead of one by one (nothing reads the index during the run).
+        self.preds_deferred = self.blocks.is_empty();
         while let Some(va) = self.worklist.pop_first() {
             if self.blocks.contains_key(&va) {
                 continue;
@@ -847,6 +871,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
                 Decoded::No => self.decode_block(va, false),
             }
+        }
+        if std::mem::take(&mut self.preds_deferred) {
+            self.preds = PredIndex::build(self.threads, &self.blocks);
         }
     }
 
@@ -905,13 +932,19 @@ impl<'i, 'a> Discovery<'i, 'a> {
         };
         head.end = at;
         head.terminator = Terminator::Fallthrough;
-        self.preds.remove(start, &tail.successors);
-        self.preds.add(start, &head.successors);
+        if !self.preds_deferred {
+            self.preds.remove(start, &tail.successors);
+            self.preds.add(start, &head.successors);
+        }
         self.insert_block(at, tail);
     }
 
     /// Store a decoded block (replacing any block at `start`) and index its edges.
     fn insert_block(&mut self, start: u64, block: BasicBlock) {
+        if self.preds_deferred {
+            self.blocks.insert(start, block);
+            return;
+        }
         if let Some(old) = self.blocks.remove(&start) {
             self.preds.remove(start, &old.successors);
         }
@@ -924,6 +957,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
         let Some(block) = self.blocks.get_mut(&start) else {
             return;
         };
+        debug_assert!(!self.preds_deferred);
         self.preds.remove(start, &block.successors);
         self.preds.add(start, &successors);
         block.successors = successors;
@@ -942,7 +976,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     /// First known leader at or after `va`, if any.
     fn next_leader_from(&self, va: u64) -> Option<u64> {
-        self.leaders.range(va..).next().copied()
+        self.leaders.first_from(va)
     }
 
     fn decode_block(&mut self, start: u64, overlaps: bool) {
@@ -1179,10 +1213,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
         if table.is_empty() {
             return;
         }
-        if let Some(src_fn) = table.function_at(ip)
-            && let Some(dst_fn) = table.function_at(target)
-            && dst_fn != src_fn
+        // The target lookup first: most branches stay inside their function.
+        if let Some(dst_fn) = table.function_at(target)
             && target == dst_fn
+            && let Some(src_fn) = table.function_at(ip)
+            && dst_fn != src_fn
             && self.image.code_bytes(dst_fn).is_ok()
         {
             self.add_function(dst_fn);
