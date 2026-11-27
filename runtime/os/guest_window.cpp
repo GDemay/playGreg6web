@@ -264,10 +264,10 @@ bool MarkPass::take_dirty(std::vector<uint64_t>* slots) {
 }
 
 bool MarkPass::has_unmarked(uint64_t va, size_t len) const {
-    if (!scanned_ || !translated(va) || len == 0) {
+    if (!scanned_ || !translated(va) || len == 0 || len > kWindowBase + kWindowMaxSize - va) {
         return false;
     }
-    const uint64_t last = slot_of(std::min<uint64_t>(va + (len - 1), kWindowBase + kWindowMaxSize - 1));
+    const uint64_t last = slot_of(va + len - 1);
     for (uint64_t slot = slot_of(va); slot <= last; ++slot) {
         if (scan_marked_[slot] == 0) {
             return true;

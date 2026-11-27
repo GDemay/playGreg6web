@@ -597,6 +597,15 @@ void test_write_marks() {
         CHECK(!pass.has_unmarked(W + 11 * k64K + 5, k64K - 5));
         CHECK(pass.has_unmarked(W + 10 * k64K + 5, 2 * k64K - 5));
         CHECK(!pass.has_unmarked(0, k64K) && !pass.has_unmarked(W, 0));
+        CHECK(!pass.has_unmarked(W + gw::kWindowMaxSize - 1, 2));
+        CHECK(!pass.has_unmarked(W, ~uint64_t{0}));
+        std::vector<uint64_t> queried;
+        CHECK(pass.take(W + 11 * k64K, k64K, &queried) && queried == std::vector<uint64_t>{0});
+        gw::mark_written(W + 10 * k64K, 1);  // a write after the scan belongs to the next pass
+        CHECK(pass.has_unmarked(W + 10 * k64K, 2 * k64K));
+        CHECK(gw::write_marked(W + 10 * k64K));  // the query did not clear that later write
+        std::vector<uint64_t> late;
+        CHECK(gw::take_written(W + 10 * k64K, k64K, &late) && late == std::vector<uint64_t>{0});
         std::vector<const void*> visit;
         index.collect(dirty, &visit);
         CHECK(visit.size() == 3);
