@@ -675,3 +675,454 @@ test('W356: telemetry exposes sanitized cacheHits/cacheMisses/inflightCoalesced/
     await workerSelf.onmessage({ data: { detachMailbox: true, id: 3 } });
   }
 });
+
+// ---------------------------------------------------------------------------
+// 6. Scan-resistant 2-segment SLRU: hot shaders.rpf survives sequential levels.rpf scan
+// ---------------------------------------------------------------------------
+
+test('SLRU protects reused hot shaders.rpf slabs against a 24-slab 64 KiB sequential scan of levels.rpf', async () => {
+  const slabSize = 256 * 1024; // 256 KiB slabs
+  const shadersBytes = makePatternBytes(4 * slabSize, 0x11);
+  const levelsBytes = makePatternBytes(24 * slabSize, 0x22);
+
+  const mock = createControlledRangeFetch(
+    new Map([
+      ['/game/shaders.rpf', shadersBytes],
+      ['/game/levels.rpf', levelsBytes],
+    ]),
+  );
+
+  // Budget fits 8 slabs (6 Protected max + 2 Probation).
+  const cache = new ImmutableHttpfsCache({
+    fetchImpl: mock.fetchImpl,
+    slabSize,
+    slabMaxBytes: 8 * slabSize,
+    prefetchAheadSlabs: 1,
+    opfsDir: null,
+  });
+
+  // Warm 4 hot shaders.rpf slabs and revisit them across slab switches so they promote to Protected.
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (let s = 0; s < 4; s += 1) {
+      const out = await cache.read('/game/shaders.rpf', s * slabSize + 1024, 4096);
+      assert.deepEqual(out, shadersBytes.subarray(s * slabSize + 1024, s * slabSize + 5120));
+    }
+  }
+  const stAfterWarm = cache.getStats();
+  assert.equal(stAfterWarm.slabProtectedEntries, 4);
+  assert.ok(stAfterWarm.slabProtectedPromotions >= 4);
+
+  // Stream sequentially through 24 slabs of levels.rpf in 64 KiB reads (3x total cache capacity!).
+  for (let off = 0; off < levelsBytes.byteLength; off += 64 * 1024) {
+    const out = await cache.read('/game/levels.rpf', off, 64 * 1024);
+    assert.deepEqual(out, levelsBytes.subarray(off, off + 64 * 1024));
+    assert.ok(cache.getStats().slabBytesCached <= 8 * slabSize);
+  }
+  await cache.waitForPrefetches();
+
+  // Every single hot shaders.rpf slab MUST still be resident in RAM (0 network refetches)!
+  const reqsBeforeShaderRecheck = mock.requests.length;
+  for (let s = 0; s < 4; s += 1) {
+    const out = await cache.read('/game/shaders.rpf', s * slabSize + 2048, 4096);
+    assert.deepEqual(out, shadersBytes.subarray(s * slabSize + 2048, s * slabSize + 6144));
+  }
+  assert.equal(
+    mock.requests.length,
+    reqsBeforeShaderRecheck,
+    'Hot Protected shaders.rpf slabs must survive sequential levels.rpf scan with 0 refetches',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 7. 8-lane out-of-order sequential frontier prefetch, tight forward gap & seek cancellation
+// ---------------------------------------------------------------------------
+
+test('8-lane out-of-order sequential reads trigger frontier prefetch, while distant forward jumps do not falsely prefetch and cancel queued prefetches', async () => {
+  const slabSize = 512 * 1024;
+  const seqFile = makePatternBytes(4 * slabSize, 0x55);
+  const randFile = makePatternBytes(12 * slabSize, 0x66);
+
+  const mock = createControlledRangeFetch(
+    new Map([
+      ['/game/seq8.rpf', seqFile],
+      ['/game/rand.rpf', randFile],
+    ]),
+  );
+
+  const cache = new ImmutableHttpfsCache({
+    fetchImpl: mock.fetchImpl,
+    slabSize,
+    slabMaxBytes: 8 * slabSize,
+    prefetchAheadSlabs: 1,
+    sequentialThresholdReads: 3,
+    opfsDir: null,
+  });
+
+  // 8-lane out-of-order sequential arrivals inside slab 0 (lanes arrive 64K, 0, 192K, 128K, 256K).
+  const oooOffsets = [64 * 1024, 0, 192 * 1024, 128 * 1024, 256 * 1024];
+  for (const off of oooOffsets) {
+    const out = await cache.read('/game/seq8.rpf', off, 64 * 1024);
+    assert.deepEqual(out, seqFile.subarray(off, off + 64 * 1024));
+  }
+  await cache.waitForPrefetches();
+  assert.ok(
+    cache.getStats().slabPrefetchesCompleted >= 1,
+    'Out-of-order 8-lane sequential reads must still trigger +1 frontier slab prefetch',
+  );
+
+  // Random forward jumps spaced 400 KiB apart (> 256 KiB maxForwardGap) must NOT falsely prefetch!
+  const prefBeforeRand = cache.getStats().slabPrefetchesScheduled;
+  for (let i = 0; i < 6; i += 1) {
+    const off = i * 400 * 1024;
+    await cache.read('/game/rand.rpf', off, 4096);
+  }
+  await cache.waitForPrefetches();
+  assert.equal(
+    cache.getStats().slabPrefetchesScheduled,
+    prefBeforeRand,
+    'Random forward jumps > 256 KiB apart must not falsely schedule sequential prefetch',
+  );
+
+  // Distant random seek cancels still-queued prefetch waiters for that URL.
+  const gate = createDeferred();
+  const started = createDeferred();
+  const seekFile = makePatternBytes(8 * slabSize, 0x77);
+  const gatedMock = createControlledRangeFetch(new Map([['/game/seek.rpf', seekFile]]), {
+    async onRangeStart(req) {
+      if (req.rangeHeader === `bytes=${slabSize}-${2 * slabSize - 1}`) {
+        started.resolve();
+        await gate.promise;
+      }
+    },
+  });
+
+  const seekCache = new ImmutableHttpfsCache({
+    fetchImpl: gatedMock.fetchImpl,
+    slabSize,
+    slabMaxBytes: 8 * slabSize,
+    prefetchAheadSlabs: 2,
+    maxConcurrentSlabFetches: 1,
+    sequentialThresholdReads: 2,
+    opfsDir: null,
+  });
+
+  // Warm slab 0 + slab 7 so the later distant seek into slab 7 hits RAM and cancels queued prefetch slab 2.
+  await seekCache.read('/game/seek.rpf', 7 * slabSize, 4096);
+  await seekCache.read('/game/seek.rpf', 0, 64 * 1024);
+  // Second sequential read in slab 0 triggers prefetch of slab 1 (in-flight) + slab 2 (queued).
+  await seekCache.read('/game/seek.rpf', 64 * 1024, 64 * 1024);
+  await started.promise;
+
+  // Distant random seek back to cached slab 7 cancels queued prefetch for slab 2!
+  await seekCache.read('/game/seek.rpf', 7 * slabSize + 4096, 4096);
+  gate.resolve();
+  await seekCache.waitForPrefetches();
+
+  assert.ok(
+    seekCache.getStats().slabPrefetchCancelled >= 1,
+    'Distant random seek should cancel still-queued prefetch waiters for that URL',
+  );
+  assert.equal(
+    gatedMock.requests.some((r) => r.rangeHeader === `bytes=${2 * slabSize}-${3 * slabSize - 1}`),
+    false,
+    'Cancelled queued prefetch slab 2 must never be fetched over HTTP',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 8. Bounded memory invariants: OPFS L2 pending write bytes, whole-file total cap & memory-pressure reclaim
+// ---------------------------------------------------------------------------
+
+test('Enforces maxPendingOpfsL2WriteBytes, wholeFileTotalMaxBytes aggregate cap, and memory-pressure reclaim preserving Protected slabs', async () => {
+  const slabSize = 256 * 1024;
+  const rpfBytes = makePatternBytes(8 * slabSize, 0x33);
+  const pgimA = makePatternBytes(128 * 1024, 0x41);
+  const pgimB = makePatternBytes(128 * 1024, 0x42);
+
+  const mock = createControlledRangeFetch(
+    new Map([
+      ['/game/shaders.rpf', rpfBytes],
+      ['/boot/a.pgim', pgimA],
+      ['/boot/b.pgim', pgimB],
+    ]),
+  );
+
+  // Slow OPFS mock to keep write queue populated while testing byte cap.
+  const writeGate = createDeferred();
+  let writesStarted = 0;
+  const slowOpfsL2 = {
+    async readRange() {
+      return null;
+    },
+    async writeRange() {
+      writesStarted += 1;
+      await writeGate.promise;
+      return { stored: true };
+    },
+  };
+
+  const controller = new IoWorkerController({
+    fetchImpl: mock.fetchImpl,
+    slabSize,
+    slabMaxBytes: 8 * slabSize,
+    prefetchAheadSlabs: 0,
+    opfsL2: slowOpfsL2,
+    maxOpfsL2WriteConcurrency: 1,
+    maxPendingOpfsL2WriteBytes: 2 * slabSize, // Queue cap: at most 2 slabs (512 KiB)
+    wholeFileMaxBytes: 128 * 1024,
+    wholeFileTotalMaxBytes: 160 * 1024, // Fits 1 x 128 KiB pgim, second must fall back cleanly!
+  });
+
+  await controller.init({ dataBase: '/data/', bootBase: '/boot/', gameBase: '/game/' });
+
+  // Whole-file aggregate cap: a.pgim buffers whole-file, b.pgim exceeds remaining total cap and falls back.
+  const hA = await controller.openHandle('boot/a.pgim');
+  const hB = await controller.openHandle('boot/b.pgim');
+  assert.equal(controller.getHandleInfo(hA).wholeFileBuffered, true);
+  assert.equal(controller.getHandleInfo(hB).wholeFileBuffered, false);
+  assert.deepEqual(await controller.readHandle(hB, 0, 4096), pgimB.subarray(0, 4096));
+  assert.ok(controller.getStats().wholeFileCache.activeBytes <= 160 * 1024);
+  controller.closeHandle(hA);
+  controller.closeHandle(hB);
+
+  // Trigger 6 cold slab reads -> 1 active OPFS write + queue capped at <= 2 * slabSize bytes!
+  for (let s = 0; s < 6; s += 1) {
+    await controller.immutableCache.read('/game/shaders.rpf', s * slabSize, 4096);
+  }
+  const stQueue = controller.immutableCache.getStats();
+  assert.ok(stQueue.opfsL2QueuedBytes <= 2 * slabSize, `Expected queued bytes <= ${2 * slabSize}, got ${stQueue.opfsL2QueuedBytes}`);
+  assert.ok(stQueue.opfsL2WriteDrops >= 1, 'Expected byte-cap backpressure drops on OPFS L2 write queue');
+
+  // Promote slabs 0 and 1 to Protected before triggering memory-pressure reclaim.
+  await controller.immutableCache.read('/game/shaders.rpf', 0, 4096);
+  await controller.immutableCache.read('/game/shaders.rpf', slabSize, 4096);
+  assert.ok(controller.immutableCache.getStats().slabProtectedEntries >= 2);
+
+  // Send memory-pressure worker message trimming to 2 slabs (512 KiB) while preserving slabSize and Protected slabs.
+  const posted = [];
+  controller.postMessage = (m) => posted.push(m);
+  await controller.handleMessage({
+    id: 99,
+    type: 'memory-pressure',
+    targetSlabBytes: 2 * slabSize,
+    dropQueuedOpfsWrites: true,
+  });
+  const reply = posted.find((m) => m.id === 99);
+  assert.ok(reply && reply.ok === true && reply.bytesFreed >= 4 * slabSize);
+  const stAfterReclaim = controller.immutableCache.getStats();
+  assert.equal(stAfterReclaim.slabSize, slabSize, 'reclaimMemory must preserve slabSize');
+  assert.ok(stAfterReclaim.slabBytesCached <= 2 * slabSize);
+  assert.equal(stAfterReclaim.slabProtectedEntries, 2, 'Protected slabs must be retained while Probation slabs are reclaimed first');
+  assert.equal(stAfterReclaim.opfsL2QueuedBytes, 0);
+
+  writeGate.resolve();
+  await controller.flushOpfsL2Writes();
+  assert.ok(writesStarted >= 1);
+});
+
+// ---------------------------------------------------------------------------
+// 9. OPFS L2 warm reload: HEAD-without-ETag probe, SyncAccessHandle-first read, proactive budget & read-priority gating
+// ---------------------------------------------------------------------------
+
+test('OPFS L2 preserves warm slabs when HEAD omits ETag, prefers SyncAccessHandle on read, enforces opfsL2MaxBytes proactively, and gates writes behind demand fetches', async () => {
+  const slabSize = 256 * 1024;
+  const rpfBytes = makePatternBytes(4 * slabSize, 0x88);
+  const realEtag = '"etag-warm-v1"';
+
+  let syncReadCount = 0;
+  let getFileReadCount = 0;
+  const files = new Map();
+  const mockOpfsDir = {
+    files,
+    async *keys() {
+      for (const k of files.keys()) yield k;
+    },
+    async removeEntry(name) {
+      files.delete(name);
+    },
+    async getFileHandle(name, opts = {}) {
+      if (!files.has(name)) {
+        if (!opts.create) {
+          const err = new Error(`NotFoundError: ${name}`);
+          err.name = 'NotFoundError';
+          throw err;
+        }
+        files.set(name, new Uint8Array(0));
+      }
+      return {
+        async getFile() {
+          getFileReadCount += 1;
+          const data = files.get(name);
+          return {
+            size: data.byteLength,
+            async arrayBuffer() {
+              return data.slice().buffer;
+            },
+          };
+        },
+        async createSyncAccessHandle() {
+          let buf = (files.get(name) || new Uint8Array(0)).slice();
+          return {
+            getSize() {
+              return buf.byteLength;
+            },
+            truncate(n) {
+              buf = buf.slice(0, n);
+            },
+            write(view, { at = 0 } = {}) {
+              const end = at + view.byteLength;
+              if (end > buf.byteLength) {
+                const grown = new Uint8Array(end);
+                grown.set(buf, 0);
+                buf = grown;
+              }
+              buf.set(view, at);
+              return view.byteLength;
+            },
+            read(view, { at = 0 } = {}) {
+              syncReadCount += 1;
+              const n = Math.min(view.byteLength, Math.max(0, buf.byteLength - at));
+              view.set(buf.subarray(at, at + n), 0);
+              return n;
+            },
+            flush() {
+              files.set(name, buf.slice());
+            },
+            close() {},
+          };
+        },
+      };
+    },
+  };
+
+  // Custom fetch: HEAD returns Content-Length ONLY (omits ETag); Range GET returns ETag.
+  let rangeGets = 0;
+  let zeroByteProbes = 0;
+  const customFetch = async (url, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    if (method === 'HEAD') {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Map([['Content-Length', String(rpfBytes.byteLength)]]),
+        async arrayBuffer() {
+          return new ArrayBuffer(0);
+        },
+      };
+    }
+    const rangeHeader = init.headers && (init.headers.Range || init.headers.range);
+    if (rangeHeader === 'bytes=0-0') {
+      zeroByteProbes += 1;
+      return {
+        ok: true,
+        status: 206,
+        headers: new Map([
+          ['ETag', realEtag],
+          ['Content-Range', `bytes 0-0/${rpfBytes.byteLength}`],
+        ]),
+        async arrayBuffer() {
+          return rpfBytes.slice(0, 1).buffer;
+        },
+      };
+    }
+    rangeGets += 1;
+    const m = /^bytes=(\d+)-(\d+)$/.exec(rangeHeader || '');
+    const s = m ? Number(m[1]) : 0;
+    const e = m ? Math.min(Number(m[2]), rpfBytes.byteLength - 1) : rpfBytes.byteLength - 1;
+    const slice = rpfBytes.slice(s, e + 1);
+    return {
+      ok: true,
+      status: 206,
+      headers: new Map([
+        ['ETag', realEtag],
+        ['Content-Range', `bytes ${s}-${e}/${rpfBytes.byteLength}`],
+      ]),
+      async arrayBuffer() {
+        return slice.buffer;
+      },
+    };
+  };
+
+  // Cold session: write 3 slabs with opfsL2MaxBytes = 2 * slabSize -> proactive eviction keeps disk <= 2 slabs!
+  const cold = new ImmutableHttpfsCache({
+    fetchImpl: customFetch,
+    slabSize,
+    slabMaxBytes: 4 * slabSize,
+    prefetchAheadSlabs: 0,
+    opfsDir: mockOpfsDir,
+    opfsL2MaxBytes: 2 * slabSize,
+  });
+
+  await cold.read('/game/shaders.rpf', 0, 4096);
+  await cold.flushOpfsL2Writes();
+  await cold.read('/game/shaders.rpf', slabSize, 4096);
+  await cold.flushOpfsL2Writes();
+  await cold.read('/game/shaders.rpf', 2 * slabSize, 4096);
+  await cold.flushOpfsL2Writes();
+
+  assert.ok(files.size <= 2, `Expected proactive opfsL2MaxBytes eviction to keep <= 2 OPFS files, got ${files.size}`);
+  assert.ok(cold.getStats().opfsL2ProactiveEvictions >= 1);
+
+  // Warm session: HEAD omits ETag -> probes bytes=0-0 -> recovers real ETag -> hits warm OPFS via SyncAccessHandle (0 full slab GETs!).
+  const rangeGetsBeforeWarm = rangeGets;
+  const warm = new ImmutableHttpfsCache({
+    fetchImpl: customFetch,
+    slabSize,
+    slabMaxBytes: 4 * slabSize,
+    prefetchAheadSlabs: 0,
+    opfsDir: mockOpfsDir,
+    opfsL2MaxBytes: 2 * slabSize,
+  });
+
+  const warmData = await warm.read('/game/shaders.rpf', 2 * slabSize, 4096);
+  assert.deepEqual(warmData, rpfBytes.subarray(2 * slabSize, 2 * slabSize + 4096));
+  assert.equal(zeroByteProbes, 1, 'Expected single bytes=0-0 ETag probe when HEAD omitted ETag');
+  assert.equal(rangeGets, rangeGetsBeforeWarm, 'Warm OPFS slab must NOT be invalidated or refetched over HTTP');
+  assert.equal(warm.getStats().opfsL2Hits, 1);
+  assert.equal(warm.getStats().opfsL2Invalidations, 0);
+  assert.ok(syncReadCount >= 1, 'Expected createSyncAccessHandle fast path to be preferred on OPFS read');
+  assert.equal(getFileReadCount, 0, 'getFile() should not be called when createSyncAccessHandle succeeds');
+
+  // Read-priority gating: background OPFS L2 write waits while a demand slab fetch is active, then pumps automatically once demand finishes.
+  const demandGate = createDeferred();
+  const demandStarted = createDeferred();
+  let opfsWriteCount = 0;
+  const gatingStore = {
+    async readRange() {
+      return null;
+    },
+    async writeRange() {
+      opfsWriteCount += 1;
+      return { stored: true };
+    },
+  };
+  const gatingMock = createControlledRangeFetch(new Map([['/game/shaders.rpf', rpfBytes]]), {
+    async onRangeStart(req) {
+      if (req.rangeHeader === `bytes=${slabSize}-${2 * slabSize - 1}`) {
+        demandStarted.resolve();
+        await demandGate.promise;
+      }
+    },
+  });
+  const gatedCache = new ImmutableHttpfsCache({
+    fetchImpl: gatingMock.fetchImpl,
+    slabSize,
+    slabMaxBytes: 4 * slabSize,
+    prefetchAheadSlabs: 0,
+    opfsL2: gatingStore,
+  });
+  // Start a long-running demand fetch on slab 1, then finish slab 0 while slab 1 is still active.
+  const pSlab1 = gatedCache.read('/game/shaders.rpf', slabSize, 4096);
+  await demandStarted.promise;
+  await gatedCache.read('/game/shaders.rpf', 0, 4096);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(
+    opfsWriteCount,
+    0,
+    'Background OPFS L2 write-through must defer while another demand slab fetch is active',
+  );
+  demandGate.resolve();
+  await pSlab1;
+  await gatedCache.flushOpfsL2Writes();
+  assert.equal(opfsWriteCount, 2, 'Deferred OPFS L2 writes must pump automatically once demand fetches finish');
+});
