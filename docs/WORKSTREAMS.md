@@ -183,6 +183,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [x] **Performance #2090 — Selected non-tail XG mip snapshots** — `READY FOR REVIEW` (@GDemay; no game files required).
   - Public XG CopyFromSubresource slot 9 snapshots validated small non-tail 2D mip spans: synthetic 4K RGBA call median 77.506 -> 1.401 ms, exact output/padding parity; unchanged mip0/large/tail/translated controls within 0.56%. Full-chain readability validation and fallback lanes retained. Browser/game FPS and call frequency unmeasured. GitHub assignment permission unavailable; ownership claimed on #2090.
 
+- [ ] **Performance #2151 — XMA IMDCT immutable twiddles** — `IN PROGRESS` (@GDemay; no game assets required).
+  - Measure the public WMA Pro decoder before caching fixed-size transform trigonometry; require exact PCM/state parity and matched warmed/cold measurements. Real active-XMA voice count, browser and FPS effects remain unmeasured.
+
 ## Track 3: GPU Command Bridge (`runtime/gpu/` + `web/workers/wgpu_worker.js`, C++20 + JS)
 **Goal:** Translate `d3d12_xs` command lists to binary packets executed on WebGPU.
 
