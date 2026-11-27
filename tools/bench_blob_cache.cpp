@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -50,9 +51,11 @@ int main(int argc, char** argv) {
         // Prepare keys before timing so reported time includes only the production store calls.
         std::vector<std::string> keys;
         for (size_t i = 0; i < stores; ++i) keys.push_back(key(entries + i));
+        const auto cpu_begin = std::clock();
         const auto begin = std::chrono::steady_clock::now();
         for (const auto& k : keys) cache.store(k.data(), k.size(), value.data(), value.size());
         const auto end = std::chrono::steady_clock::now();
+        const double cpu_ms = 1000.0 * (std::clock() - cpu_begin) / CLOCKS_PER_SEC;
         const auto result = cache.stats();
         if (result.stores != entries + stores || result.store_rejected ||
             result.evictions != (capped ? stores : 0) ||
@@ -68,8 +71,8 @@ int main(int argc, char** argv) {
             } else if (n != value.size() || actual != value) throw std::runtime_error("wrong surviving blob");
         }
         const double ms = std::chrono::duration<double, std::milli>(end - begin).count();
-        std::printf("{\"entries\":%zu,\"stores\":%zu,\"value_bytes\":%zu,\"capped\":%s,\"elapsed_ms\":%.6f,\"us_per_store\":%.6f,\"correct\":true}\n",
-                    entries, stores, value_bytes, capped ? "true" : "false", ms, ms * 1000 / stores);
+        std::printf("{\"entries\":%zu,\"stores\":%zu,\"value_bytes\":%zu,\"capped\":%s,\"elapsed_ms\":%.6f,\"us_per_store\":%.6f,\"cpu_ms\":%.6f,\"correct\":true}\n",
+                    entries, stores, value_bytes, capped ? "true" : "false", ms, ms * 1000 / stores, cpu_ms);
         fs::remove_all(dir);
         return 0;
     } catch (const std::exception& e) {
