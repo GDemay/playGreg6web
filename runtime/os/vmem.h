@@ -467,6 +467,9 @@ private:
     static bool is_valid_protect(PageProtect protect);
 
     uint64_t default_base_ = kDefaultArenaBase;  // == space_base_
+    // Every allocation granule in [default_base_, occupied_prefix_end_) is reserved.
+    // Protected by mutex_; release rewinds it, placeholder splits keep occupancy unchanged.
+    uint64_t occupied_prefix_end_ = kDefaultArenaBase;
     uint64_t space_base_ = kDefaultArenaBase;
     uint64_t space_size_ = 0;
     uint64_t guest_base_ = 0;     // host = guest_base_ + va

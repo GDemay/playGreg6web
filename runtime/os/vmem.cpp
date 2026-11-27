@@ -262,6 +262,7 @@ VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
         default_base_ = kDefaultArenaBase;
     }
     space_base_ = default_base_;
+    occupied_prefix_end_ = default_base_;
 
     uint64_t size = 0;
     if (space_size == 0 || !align_up_checked(space_size, kAllocationGranularity, size) ||
@@ -475,8 +476,9 @@ bool VirtualMemoryArena::range_overlaps_locked(uint64_t start, uint64_t end) con
 
 uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) const {
     const uint64_t space_end = shared_zone_size_ != 0 ? shared_zone_base_ : space_base_ + space_size_;
-    uint64_t candidate = default_base_;
-    for (const auto& [base, res] : reservations_) {
+    uint64_t candidate = occupied_prefix_end_;
+    for (auto it = reservations_.lower_bound(candidate); it != reservations_.end(); ++it) {
+        const auto& res = it->second;
         const uint64_t res_end = res.base + res.granularity_size;
         if (res_end <= candidate) {
             continue;
@@ -559,6 +561,15 @@ uint64_t VirtualMemoryArena::reserve_locked(uint64_t hint_addr,
     res.page_count = page_count;
 
     reservations_.emplace(base, std::move(res));
+    // Only advance across occupied granules, never across a hole that a smaller future
+    // reservation could use. Hinted reservations can join the prefix too.
+    if (base == occupied_prefix_end_) {
+        auto it = reservations_.find(base);
+        while (it != reservations_.end() && it->second.base == occupied_prefix_end_) {
+            occupied_prefix_end_ += it->second.granularity_size;
+            ++it;
+        }
+    }
     reserved_bytes_ += res_size;
     return base;
 }
@@ -849,6 +860,7 @@ bool VirtualMemoryArena::release_locked(uint64_t base_addr) {
     deferred_noaccess_bytes_ -= res_deferred_noaccess;
     committed_bytes_ -= res_committed;
     invalidate_lookup_cache_locked();
+    occupied_prefix_end_ = std::min(occupied_prefix_end_, base_addr);
     reservations_.erase(it);
     return true;
 }

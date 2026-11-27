@@ -1147,6 +1147,55 @@ void test_lazy_commit_concurrent_stress() {
     CHECK(arena.committed_bytes() == 0 && arena.host_committed_bytes() == 0 && arena.lazy_deferred_bytes() == 0);
 }
 
+// Differential first-fit model: variable sizes, exact hints, holes and exhaustion.
+void test_first_fit_prefix() {
+    constexpr uint64_t gran = kAllocationGranularity;
+    {
+        VirtualMemoryArena holes(kDefaultArenaBase, 16 * gran);
+        CHECK(holes.reserve(kDefaultArenaBase + gran, gran) == kDefaultArenaBase + gran);
+        CHECK(holes.reserve(0, 2 * gran) == kDefaultArenaBase + 2 * gran);
+        CHECK(holes.reserve(0, gran) == kDefaultArenaBase);
+        CHECK(holes.release(kDefaultArenaBase + gran));
+        CHECK(holes.reserve(0, gran) == kDefaultArenaBase + gran);
+    }
+    constexpr size_t slots = 128;
+    VirtualMemoryArena arena(kDefaultArenaBase, slots * gran);
+    std::vector<size_t> occupied(slots, 0);
+    struct Live { size_t start; size_t count; uint64_t va; };
+    std::vector<Live> live;
+    uint32_t seed = 0x195eac31;
+    auto next = [&] { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; };
+    for (size_t step = 0; step < 6000; ++step) {
+        if (!live.empty() && next() % 3 == 0) {
+            const size_t i = next() % live.size();
+            const auto r = live[i];
+            CHECK(arena.release(r.va));
+            for (size_t k = r.start; k < r.start + r.count; ++k) occupied[k] = 0;
+            live.erase(live.begin() + i);
+            continue;
+        }
+        const size_t count = 1 + next() % 8;
+        const bool hinted = next() % 4 == 0;
+        const size_t hint = next() % slots;
+        size_t expected = slots;
+        for (size_t i = hinted ? hint : 0; i + count <= slots; ++i) {
+            bool free = true;
+            for (size_t k = i; k < i + count; ++k) free &= occupied[k] == 0;
+            if (free) { expected = i; break; }
+            if (hinted) break;
+        }
+        const uint64_t va = arena.reserve(hinted ? kDefaultArenaBase + hint * gran : 0,
+                                          count * gran - kPageSize);
+        CHECK(va == (expected == slots ? 0 : kDefaultArenaBase + expected * gran));
+        if (va != 0 && expected != slots) {
+            for (size_t k = expected; k < expected + count; ++k) occupied[k] = 1;
+            live.push_back({expected, count, va});
+        }
+    }
+    for (const auto& r : live) CHECK(arena.release(r.va));
+    CHECK(arena.reserve(0, slots * gran) == kDefaultArenaBase);
+}
+
 int main() {
     std::printf("test_vmem_contiguous\n");
     test_translation_and_contiguity();
@@ -1157,6 +1206,7 @@ int main() {
     test_placeholders();
     test_exhaustion();
     test_many_reservations();
+    test_first_fit_prefix();
     test_concurrent_reservations();
     test_process_arena();
     test_written_pages();
