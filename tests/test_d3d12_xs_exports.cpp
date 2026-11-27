@@ -8237,6 +8237,30 @@ void test_g84_xbox_3d_methods_hardening() {
         fx.vcall(list, XSlot::ExecuteIndirect, {I(sig), I(1), I(buf), I(2), I(0), I(0)});
         CHECK(counter(dev, xb::Counter::IndirectSkipped) == 1);
 
+        // Signatures that change views / root addresses per command are skipped and exported as work
+        // counters (boot-report.json takes every Work name).
+        CHECK(std::string(dg::work_name(dg::Work::IndirectVertexIndexArgsSkipped)) == "indirect_vertex_index_args_skipped");
+        CHECK(std::string(dg::work_name(dg::Work::IndirectRootViewArgsSkipped)) == "indirect_root_view_args_skipped");
+        const uint32_t view_args[8] = {dg::CommandSignature::kIndirectArgVertexBufferView, 0, 0, 0,
+                                       dg::CommandSignature::kIndirectArgDraw, 0, 0, 0};
+        const uint32_t root_args[8] = {dg::CommandSignature::kIndirectArgCbv, 0, 0, 0,
+                                       dg::CommandSignature::kIndirectArgDraw, 0, 0, 0};
+        dg::GuestCommandSignatureDesc view_desc{32, 2, put_bytes(view_args, sizeof(view_args)), 0};
+        dg::GuestCommandSignatureDesc root_desc{32, 2, put_bytes(root_args, sizeof(root_args)), 0};
+        const uint64_t view_sig = fx.create(scene.device, Slot::CreateCommandSignature, {I(put(view_desc)), I(0)},
+                                            dg::IID_ID3D12CommandSignature, &result);
+        const uint64_t root_sig = fx.create(scene.device, Slot::CreateCommandSignature, {I(put(root_desc)), I(0)},
+                                            dg::IID_ID3D12CommandSignature, &result);
+        CHECK(view_sig != 0 && root_sig != 0);
+        const uint64_t vi0 = dg::work_total(dg::Work::IndirectVertexIndexArgsSkipped);
+        const uint64_t rv0 = dg::work_total(dg::Work::IndirectRootViewArgsSkipped);
+        fx.vcall(list, XSlot::ExecuteIndirect, {I(view_sig), I(1), I(buf), I(0), I(0), I(0)});
+        fx.vcall(list, XSlot::ExecuteIndirect, {I(root_sig), I(1), I(buf), I(0), I(0), I(0)});
+        CHECK(dg::work_total(dg::Work::IndirectVertexIndexArgsSkipped) == vi0 + 1);
+        CHECK(dg::work_total(dg::Work::IndirectRootViewArgsSkipped) == rv0 + 1);
+        CHECK(counter(dev, xb::Counter::IndirectVertexIndexArgsSkipped) == 1);
+        CHECK(counter(dev, xb::Counter::IndirectRootViewArgsSkipped) == 1);
+
         CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
         scene.execute({list});
         CHECK(load32(cpu_win + 0x10) == 0xCAFEBABEu);
@@ -8259,7 +8283,7 @@ void test_g84_xbox_3d_methods_hardening() {
 
         xb::clear_command_list_xbox_state();
         CHECK(!xb::lookup_command_list_depth_bounds(list, &db));
-        scene.release_all({list, sig, buf, rt0, rt1});
+        scene.release_all({list, sig, view_sig, root_sig, buf, rt0, rt1});
     }
 }
 
