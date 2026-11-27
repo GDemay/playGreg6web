@@ -368,14 +368,14 @@ void test_denied_and_unlisted_exports_fail_cleanly() {
     // Denied by the shim audit: NULL, ERROR_PROC_NOT_FOUND and the audit's reason.
     com::clear_diagnostics();
     win32::SetLastError(0);
-    CHECK(fx.proc("api-ms-win-crt-filesystem-l1-1-0.dll", "remove") == 0);
+    CHECK(fx.proc("VCRUNTIME140.dll", "_purecall") == 0);
     CHECK(pg6_win32_get_last_error() == win32::ERROR_PROC_NOT_FOUND);
     CHECK(diag_contains("host-only export"));
-    CHECK(diag_contains("denied: pg6_crt_remove"));
-    CHECK(diag_contains("deletes host files"));
-    const uint64_t remove_proc = win32::resolve_import("api-ms-win-crt-filesystem-l1-1-0.dll", "remove");
-    CHECK(remove_proc != 0);
-    const char* reason = unavailable_reason_for_proc(remove_proc);
+    CHECK(diag_contains("denied: pg6_crt_purecall"));
+    CHECK(diag_contains("pure-virtual call site"));
+    const uint64_t denied_proc = win32::resolve_import("VCRUNTIME140.dll", "_purecall");
+    CHECK(denied_proc != 0);
+    const char* reason = unavailable_reason_for_proc(denied_proc);
     CHECK(reason != nullptr && std::strncmp(reason, "denied: ", 8) == 0);
     CHECK(unavailable_reason_for_proc(0x1234) == nullptr);
 

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdarg>
@@ -9,10 +10,14 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "os/guest_heap.h"
+#include "os/httpfs_mailbox.h"
 #include "os/ucrt_bridge.h"
+#include "os/ucrt_ext.h"
+#include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 
 namespace {
@@ -513,8 +518,16 @@ void test_stdio() {
     const auto wsfmt = u16_lit("%d %d");
     CHECK(call_vswscanf(win.data(), 5, wsfmt.data(), &wx, &wy) == 2 && wx == 77 && wy == 88);
 
-    // File round-trip with fopen/_wfopen/_wstat64/_fseeki64/fgetpos/fsetpos/remove.
-    const char* tmp_name = "pg6_ucrt_test_tmp.bin";
+    // File round-trip with sandboxed fopen/_wfopen/_wstat64/_fseeki64/fgetpos/fsetpos/remove.
+    clear_userdata_overlay();
+    pg6_crt_reset_runtime_state();
+
+    // Writing outside /userdata (e.g. relative at read-only game root) must be rejected.
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_fopen("pg6_ucrt_test_tmp.bin", "wb") == nullptr);
+    CHECK(*pg6_crt_errno() == PG6_CRT_EACCES);
+
+    const char* tmp_name = "/userdata/pg6_ucrt_test_tmp.bin";
     FILE* f = pg6_crt_fopen(tmp_name, "wb");
     CHECK(f != nullptr);
     if (f != nullptr) {
@@ -541,9 +554,178 @@ void test_stdio() {
         CHECK(std::strcmp(part, "GTA6") == 0);
         CHECK(pg6_crt_fsetpos(rf, &pos) == 0);
         CHECK(pg6_crt_fgetc(rf) == 'G');
+        CHECK(pg6_crt_ungetc('G', rf) == 'G');
+        CHECK(pg6_crt_ftell(rf) == 4);
+        CHECK(pg6_crt_fgetc(rf) == 'G');
         CHECK(pg6_crt_fclose(rf) == 0);
     }
     CHECK(pg6_crt_remove(tmp_name) == 0);
+    CHECK(pg6_crt_wstat64(wtmp.data(), &st) == -1 && *pg6_crt_errno() == PG6_CRT_ENOENT);
+}
+
+void test_sandboxed_stdio_and_fs() {
+    clear_userdata_overlay();
+    pg6_crt_reset_runtime_state();
+
+    // 1. Virtual CWD starts at G:\ and _wgetcwd(nullptr, 0) allocates from the guest heap.
+    uint16_t* dyn_cwd = pg6_crt_wgetcwd(nullptr, 0);
+    CHECK(dyn_cwd != nullptr);
+    if (dyn_cwd != nullptr) {
+        CHECK(default_guest_heap_owns_host(dyn_cwd));
+        CHECK(pg6_crt_wcscmp(dyn_cwd, u16_lit("G:\\").data()) == 0);
+        pg6_crt_free(dyn_cwd);
+    }
+    uint16_t tiny_buf[2] = {};
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wgetcwd(tiny_buf, 2) == nullptr && *pg6_crt_errno() == PG6_CRT_ERANGE);
+
+    // 2. /userdata directory creation, _wchdir, relative _fsopen/_wfsopen, append, _wrename, _wremove, _wrmdir.
+    CHECK(userdata_create_directory("/userdata/saves") == ERROR_SUCCESS);
+    CHECK(pg6_crt_wchdir(u16_lit("G:\\userdata\\saves").data()) == 0);
+    uint16_t cwd_buf[64] = {};
+    CHECK(pg6_crt_wgetcwd(cwd_buf, 64) == cwd_buf);
+    CHECK(pg6_crt_wcscmp(cwd_buf, u16_lit("G:\\userdata\\saves").data()) == 0);
+
+    FILE* sf = pg6_crt_fsopen("slot0.txt", "wb", 0x40);
+    CHECK(sf != nullptr);
+    if (sf != nullptr) {
+        CHECK(pg6_crt_fputs("Vice", sf) == 0);
+        CHECK(pg6_crt_fputwc('!', sf) == '!');
+        CHECK(pg6_crt_fflush(sf) == 0);
+        CHECK(pg6_crt_fclose(sf) == 0);
+    }
+    CHECK(userdata_file_exists("/userdata/saves/slot0.txt"));
+
+    // Exclusive create "wbx" fails with EEXIST on existing file.
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_fopen("slot0.txt", "wbx") == nullptr && *pg6_crt_errno() == PG6_CRT_EEXIST);
+
+    // Append mode via _wfsopen.
+    FILE* af = pg6_crt_wfsopen(u16_lit("slot0.txt").data(), u16_lit("a+b").data(), 0x40);
+    CHECK(af != nullptr);
+    if (af != nullptr) {
+        CHECK(pg6_crt_fwrite("City", 1, 4, af) == 4u);
+        pg6_crt_rewind(af);
+        char text[16] = {};
+        CHECK(pg6_crt_fread(text, 1, 9, af) == 9u);
+        CHECK(std::strcmp(text, "Vice!City") == 0);
+        CHECK(pg6_crt_fclose(af) == 0);
+    }
+
+    // _wrename within /userdata.
+    CHECK(pg6_crt_wrename(u16_lit("slot0.txt").data(), u16_lit("slot1.txt").data()) == 0);
+    CHECK(!userdata_file_exists("/userdata/saves/slot0.txt"));
+    CHECK(userdata_file_exists("/userdata/saves/slot1.txt"));
+
+    // Non-empty directory cannot be removed; after _wremove it can.
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wrmdir(u16_lit("/userdata/saves").data()) == -1);
+    CHECK(*pg6_crt_errno() == PG6_CRT_ENOTEMPTY);
+
+    CHECK(pg6_crt_wremove(u16_lit("slot1.txt").data()) == 0);
+    CHECK(pg6_crt_wchdir(u16_lit("..").data()) == 0);
+    CHECK(pg6_crt_wgetcwd(cwd_buf, 64) == cwd_buf);
+    CHECK(pg6_crt_wcscmp(cwd_buf, u16_lit("G:\\userdata").data()) == 0);
+    CHECK(pg6_crt_wrmdir(u16_lit("saves").data()) == 0);
+    CHECK(pg6_crt_wchdir(u16_lit("G:\\").data()) == 0);
+
+    // 3. Host filesystem escapes are rejected cleanly and never touch the host OS.
+    const char* escape_paths[] = {
+        "../../pg6_must_never_exist.bin",
+        "/userdata/../../pg6_must_never_exist.bin",
+        "G:\\userdata\\..\\..\\pg6_must_never_exist.bin",
+        "\\\\server\\share\\file.bin",
+        "\\\\?\\UNC\\server\\share\\file.bin",
+        "C:\\pg6_must_never_exist.bin",
+        "/etc/pg6_must_never_exist.bin",
+    };
+    for (const char* bad : escape_paths) {
+        pg6_crt_set_errno(0);
+        CHECK(pg6_crt_fopen(bad, "wb") == nullptr);
+        CHECK(*pg6_crt_errno() == PG6_CRT_EACCES);
+        pg6_crt_set_errno(0);
+        CHECK(pg6_crt_remove(bad) == -1);
+        CHECK(*pg6_crt_errno() == PG6_CRT_EACCES);
+    }
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_fopen("C:\\Windows\\System32\\cmd.exe", "rb") == nullptr);
+    CHECK(*pg6_crt_errno() == PG6_CRT_ENOENT);
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wchdir(u16_lit("..").data()) == -1 && *pg6_crt_errno() == PG6_CRT_EACCES);
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wchdir(u16_lit("C:\\Windows").data()) == -1 && *pg6_crt_errno() == PG6_CRT_ENOENT);
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wrmdir(u16_lit("/userdata").data()) == -1 && *pg6_crt_errno() == PG6_CRT_EACCES);
+
+    // Rename crossing out of /userdata into game root is rejected.
+    FILE* tmpf = pg6_crt_fopen("/userdata/stay.bin", "wb");
+    CHECK(tmpf != nullptr);
+    if (tmpf != nullptr) {
+        CHECK(pg6_crt_fclose(tmpf) == 0);
+    }
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wrename(u16_lit("/userdata/stay.bin").data(),
+                          u16_lit("G:\\escaped.bin").data()) == -1);
+    CHECK(*pg6_crt_errno() == PG6_CRT_EACCES);
+    CHECK(pg6_crt_remove("/userdata/stay.bin") == 0);
+
+    // 4. Read-only game root via HttpfsMailboxClient: reads succeed, writes/deletes/renames fail.
+    const std::string asset_data = "GTA6_GAME_ASSET_DATA";
+    playgta6::os::HttpfsDirectBackend backend{};
+    backend.open = [&](std::string_view rel_path) -> int32_t {
+        return rel_path == "common/data/config.txt" ? 1 : -1;
+    };
+    backend.read = [&](int32_t handle, uint64_t offset, void* dst, size_t len) -> int64_t {
+        if (handle != 1 || offset >= asset_data.size()) {
+            return 0;
+        }
+        const size_t avail = std::min<size_t>(len, asset_data.size() - static_cast<size_t>(offset));
+        std::memcpy(dst, asset_data.data() + offset, avail);
+        return static_cast<int64_t>(avail);
+    };
+    backend.close = [](int32_t) -> bool { return true; };
+
+    playgta6::os::HttpfsMailboxClient client(std::move(backend));
+    set_httpfs_client(&client);
+
+    Pg6CrtStat64 gst{};
+    CHECK(pg6_crt_wstat64(u16_lit("G:\\common\\data\\config.txt").data(), &gst) == 0);
+    CHECK(gst.st_size == static_cast<int64_t>(asset_data.size()));
+
+    FILE* gf = pg6_crt_fopen("G:\\common\\data\\config.txt", "rb");
+    CHECK(gf != nullptr);
+    if (gf != nullptr) {
+        char buf[32] = {};
+        CHECK(pg6_crt_fread(buf, 1, asset_data.size(), gf) == asset_data.size());
+        CHECK(std::strcmp(buf, asset_data.c_str()) == 0);
+        // Writing to a read-only stream fails with EBADF.
+        pg6_crt_set_errno(0);
+        CHECK(pg6_crt_fwrite("X", 1, 1, gf) == 0 && *pg6_crt_errno() == PG6_CRT_EBADF);
+        CHECK(pg6_crt_fclose(gf) == 0);
+    }
+
+    // Write/update/remove/rename/rmdir on read-only game root are all rejected with EACCES.
+    for (const char* wmode : {"wb", "r+b", "w+b", "ab", "a+b"}) {
+        pg6_crt_set_errno(0);
+        CHECK(pg6_crt_fopen("G:\\common\\data\\config.txt", wmode) == nullptr);
+        CHECK(*pg6_crt_errno() == PG6_CRT_EACCES);
+    }
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_remove("G:\\common\\data\\config.txt") == -1 && *pg6_crt_errno() == PG6_CRT_EACCES);
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wremove(u16_lit("G:\\common\\data\\config.txt").data()) == -1 &&
+          *pg6_crt_errno() == PG6_CRT_EACCES);
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wrename(u16_lit("G:\\common\\data\\config.txt").data(),
+                          u16_lit("/userdata/stolen.txt").data()) == -1 &&
+          *pg6_crt_errno() == PG6_CRT_EACCES);
+    pg6_crt_set_errno(0);
+    CHECK(pg6_crt_wrmdir(u16_lit("G:\\common\\data").data()) == -1 &&
+          *pg6_crt_errno() == PG6_CRT_EACCES);
+
+    set_httpfs_client(nullptr);
+    clear_userdata_overlay();
+    pg6_crt_reset_runtime_state();
 }
 
 // ---------------------------------------------------------------------------
@@ -611,6 +793,7 @@ int main() {
     test_math();
     test_strings_and_memory();
     test_stdio();
+    test_sandboxed_stdio_and_fs();
     test_time_and_utility();
 
     if (g_failures != 0) {

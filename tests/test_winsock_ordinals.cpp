@@ -3,8 +3,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <thread>
 
+#include "abi/playgta6_abi.h"
+#include "os/guest_heap.h"
+#include "os/host_marshallers.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 #include "os/winsock_ordinals.h"
@@ -160,13 +164,60 @@ void test_inet_addr() {
 }
 
 void test_inet_ntoa() {
-    CHECK(std::strcmp(pg6_ws2_inet_ntoa(Pg6InAddr{0x0100007Fu}), "127.0.0.1") == 0);
-    CHECK(std::strcmp(pg6_ws2_inet_ntoa(Pg6InAddr{0x04030201u}), "1.2.3.4") == 0);
+    playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    char* p_loopback = pg6_ws2_inet_ntoa(Pg6InAddr{0x0100007Fu});
+    CHECK(p_loopback != nullptr && std::strcmp(p_loopback, "127.0.0.1") == 0);
+    // Direct shim must return a guest-accessible buffer (never a raw host TLS pointer).
+    const uint64_t loopback_va = heap.to_guest(p_loopback);
+    CHECK(loopback_va != 0 && heap.owns(loopback_va));
+
+    char* p_second = pg6_ws2_inet_ntoa(Pg6InAddr{0x04030201u});
+    CHECK(p_second == p_loopback && std::strcmp(p_second, "1.2.3.4") == 0);
     CHECK(std::strcmp(pg6_ws2_inet_ntoa(Pg6InAddr{0u}), "0.0.0.0") == 0);
     CHECK(std::strcmp(pg6_ws2_inet_ntoa(Pg6InAddr{ws::kInetAddrNone}), "255.255.255.255") == 0);
 
     const uint32_t parsed = pg6_ws2_inet_addr("192.168.10.20");
     CHECK(std::strcmp(pg6_ws2_inet_ntoa(Pg6InAddr{parsed}), "192.168.10.20") == 0);
+
+    // WS2_32!#11 guest thunk (pg6_gthunk_inet_ntoa): Win64 by-value in_addr in ECX, returns guest VA.
+    playgta6::GuestState state{};
+    const uint64_t stack = heap.alloc(64);
+    state.gpr[playgta6::GuestReg::Rsp] = stack;
+    state.gpr[playgta6::GuestReg::Rcx] = 0xCAFEBABE00000000ull | parsed;
+    pg6_gthunk_inet_ntoa(&state);
+    CHECK(state.gpr[playgta6::GuestReg::Rsp] == stack + 8);
+    const uint64_t gva = state.gpr[playgta6::GuestReg::Rax];
+    CHECK(gva != 0);
+    if (gva != 0) {
+        const auto* host_str = reinterpret_cast<const char*>(heap.to_host(gva));
+        CHECK(host_str != nullptr && std::strcmp(host_str, "192.168.10.20") == 0);
+    }
+
+    // Per-thread isolation for both pg6_ws2_inet_ntoa and pg6_gthunk_inet_ntoa.
+    uint64_t worker_shim_va = 0;
+    uint64_t worker_gthunk_va = 0;
+    std::string worker_shim_text;
+    std::string worker_gthunk_text;
+    std::thread worker([&] {
+        char* wp = pg6_ws2_inet_ntoa(Pg6InAddr{0x08080808u});
+        if (wp != nullptr) {
+            worker_shim_va = heap.to_guest(wp);
+            worker_shim_text = wp;
+        }
+        playgta6::GuestState ws_state{};
+        const uint64_t wstack = heap.alloc(64);
+        ws_state.gpr[playgta6::GuestReg::Rsp] = wstack;
+        ws_state.gpr[playgta6::GuestReg::Rcx] = 0x01010101u;
+        pg6_gthunk_inet_ntoa(&ws_state);
+        worker_gthunk_va = ws_state.gpr[playgta6::GuestReg::Rax];
+        if (worker_gthunk_va != 0) {
+            worker_gthunk_text = reinterpret_cast<const char*>(heap.to_host(worker_gthunk_va));
+        }
+    });
+    worker.join();
+    CHECK(worker_shim_va != 0 && worker_shim_va != loopback_va && worker_shim_text == "8.8.8.8");
+    CHECK(worker_gthunk_va != 0 && worker_gthunk_va != gva && worker_gthunk_text == "1.1.1.1");
+    CHECK(std::strcmp(p_loopback, "192.168.10.20") == 0);
 }
 
 void test_gethostname() {

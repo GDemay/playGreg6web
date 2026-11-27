@@ -20,13 +20,14 @@
 #include <ctime>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
-#include <sys/stat.h>
-
 #include "os/guest_heap.h"
+#include "os/win32_kernel.h"
 #include "os/win32_loader.h"
 
 namespace {
@@ -589,6 +590,148 @@ void from_std_tm(const std::tm& src, Pg6CrtTm& dst) {
 }
 
 // ---------------------------------------------------------------------------
+// Sandboxed virtual CWD & virtual FILE* stream table (O13 / P4 / P8)
+// ---------------------------------------------------------------------------
+// Every path-taking UCRT stdio/filesystem call routes through this virtual layer into
+// playgta6::os::win32's /userdata overlay (writable) and HTTPFS game root (read-only).
+// Host std::fopen / std::remove / _stat64 are never invoked on guest paths.
+
+struct VirtualFile {
+    std::recursive_mutex mutex;
+    playgta6::os::win32::Handle handle = playgta6::os::win32::INVALID_HANDLE_VALUE;
+    bool readable = false;
+    bool writable = false;
+    bool append = false;
+    bool eof = false;
+    bool error = false;
+    bool has_pushback = false;
+    uint8_t pushback = 0;
+};
+
+std::mutex g_virtual_files_mutex;
+std::unordered_set<VirtualFile*> g_virtual_files;
+
+std::mutex g_stream_buf_mutex;
+std::vector<std::pair<FILE*, uint64_t>> g_stream_buf_records;
+
+std::mutex g_virtual_cwd_mutex;
+std::vector<std::string> g_virtual_cwd_segments;
+
+VirtualFile* lookup_virtual_file(FILE* stream) {
+    if (stream == nullptr || stream == stdin || stream == stdout || stream == stderr) {
+        return nullptr;
+    }
+    auto* candidate = reinterpret_cast<VirtualFile*>(stream);
+    std::lock_guard<std::mutex> lock(g_virtual_files_mutex);
+    return g_virtual_files.find(candidate) != g_virtual_files.end() ? candidate : nullptr;
+}
+
+void release_stream_buffer_record(FILE* stream) {
+    std::lock_guard<std::mutex> lock(g_stream_buf_mutex);
+    for (auto it = g_stream_buf_records.begin(); it != g_stream_buf_records.end();) {
+        if (it->first == stream) {
+            playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+            if (heap.owns(it->second)) {
+                heap.free(it->second);
+            }
+            it = g_stream_buf_records.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool equals_ascii_ci(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (ascii_to_lower_u8(static_cast<uint8_t>(a[i])) !=
+            ascii_to_lower_u8(static_cast<uint8_t>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline bool is_path_sep(char c) {
+    return c == '/' || c == '\\';
+}
+
+struct ParsedFopenMode {
+    bool readable = false;
+    bool writable = false;
+    bool append = false;
+    uint32_t disposition = playgta6::os::win32::OPEN_EXISTING;
+};
+
+bool parse_fopen_mode(const char* mode, ParsedFopenMode* out) {
+    if (mode == nullptr || mode[0] == '\0' || out == nullptr) {
+        return false;
+    }
+    const char base = mode[0];
+    if (base != 'r' && base != 'w' && base != 'a') {
+        return false;
+    }
+    bool has_plus = false;
+    bool has_x = false;
+    for (const char* p = mode + 1; *p != '\0'; ++p) {
+        const char c = *p;
+        if (c == '+') {
+            has_plus = true;
+        } else if (c == 'x') {
+            if (base != 'w') {
+                return false;
+            }
+            has_x = true;
+        } else if (c == 'b' || c == 't' || c == 'c' || c == 'n' || c == 'S' || c == 'R' ||
+                   c == 'T' || c == 'D') {
+            continue;
+        } else if (c == ',') {
+            // Optional MSVC encoding suffix: ", ccs=UTF-8" / ", ccs=UNICODE" / ", ccs=UTF-16LE".
+            ++p;
+            while (*p == ' ' || *p == '\t') {
+                ++p;
+            }
+            if (std::strncmp(p, "ccs=", 4) != 0) {
+                return false;
+            }
+            break;
+        } else if (c == ' ' || c == '\t') {
+            continue;
+        } else {
+            return false;
+        }
+    }
+
+    namespace w32 = playgta6::os::win32;
+    *out = ParsedFopenMode{};
+    if (base == 'r') {
+        out->readable = true;
+        out->writable = has_plus;
+        out->disposition = w32::OPEN_EXISTING;
+    } else if (base == 'w') {
+        out->writable = true;
+        out->readable = has_plus;
+        out->disposition = has_x ? w32::CREATE_NEW : w32::CREATE_ALWAYS;
+    } else {
+        out->writable = true;
+        out->append = true;
+        out->readable = has_plus;
+        out->disposition = w32::OPEN_ALWAYS;
+    }
+    return true;
+}
+
+int64_t filetime_ticks_to_unix_sec(uint64_t ticks) {
+    constexpr uint64_t kUnixEpochTicks = 116444736000000000ULL;
+    if (ticks <= kUnixEpochTicks) {
+        return 0;
+    }
+    return static_cast<int64_t>((ticks - kUnixEpochTicks) / 10000000ULL);
+}
+
+// ---------------------------------------------------------------------------
 // Module names matching docs/imports_required.md verbatim
 // ---------------------------------------------------------------------------
 
@@ -808,6 +951,375 @@ void from_std_tm(const std::tm& src, Pg6CrtTm& dst) {
 
 }  // namespace
 
+namespace playgta6::os::ucrt_detail {
+
+int32_t errno_from_win32(uint32_t win32_err) {
+    namespace w32 = playgta6::os::win32;
+    constexpr uint32_t kErrorDirNotEmpty = 145u;
+    constexpr uint32_t kErrorFilenameExcedRange = 206u;
+    constexpr uint32_t kErrorDirectory = 267u;
+    switch (win32_err) {
+        case w32::ERROR_SUCCESS:
+            return 0;
+        case w32::ERROR_FILE_NOT_FOUND:
+        case w32::ERROR_PATH_NOT_FOUND:
+            return PG6_CRT_ENOENT;
+        case w32::ERROR_ACCESS_DENIED:
+        case w32::ERROR_WRITE_PROTECT:
+            return PG6_CRT_EACCES;
+        case w32::ERROR_INVALID_HANDLE:
+            return PG6_CRT_EBADF;
+        case w32::ERROR_NOT_ENOUGH_MEMORY:
+            return PG6_CRT_ENOMEM;
+        case w32::ERROR_FILE_EXISTS:
+        case w32::ERROR_ALREADY_EXISTS:
+            return PG6_CRT_EEXIST;
+        case w32::ERROR_INVALID_PARAMETER:
+        case w32::ERROR_NEGATIVE_SEEK:
+            return PG6_CRT_EINVAL;
+        case kErrorDirNotEmpty:
+            return PG6_CRT_ENOTEMPTY;
+        case kErrorFilenameExcedRange:
+            return PG6_CRT_ENAMETOOLONG;
+        case kErrorDirectory:
+            return PG6_CRT_ENOTDIR;
+        default:
+            return PG6_CRT_EACCES;
+    }
+}
+
+std::string utf16_to_utf8(const uint16_t* src, size_t max_units) {
+    return utf16_to_utf8_u16(src, max_units);
+}
+
+std::vector<uint16_t> utf8_to_utf16(std::string_view s) {
+    return utf8_to_utf16_vec(s);
+}
+
+int32_t resolve_sandbox_path(std::string_view raw_path, SandboxPath* out) {
+    if (out == nullptr) {
+        return PG6_CRT_EINVAL;
+    }
+    *out = SandboxPath{};
+    if (raw_path.empty()) {
+        return PG6_CRT_ENOENT;
+    }
+
+    size_t pos = 0;
+    bool rooted = false;
+
+    // Strip Win32 extended/device prefix (`\\?\` or `\\.\`), rejecting UNC paths (`\\server\share`).
+    if (raw_path.size() >= 2 && is_path_sep(raw_path[0]) && is_path_sep(raw_path[1])) {
+        if (raw_path.size() >= 4 && (raw_path[2] == '?' || raw_path[2] == '.') &&
+            is_path_sep(raw_path[3])) {
+            pos = 4;
+            rooted = true;
+            // Reject `\\?\UNC\...` network shares too.
+            if (raw_path.size() >= pos + 4 && equals_ascii_ci(raw_path.substr(pos, 3), "unc") &&
+                is_path_sep(raw_path[pos + 3])) {
+                return PG6_CRT_EACCES;
+            }
+        } else {
+            return PG6_CRT_EACCES;
+        }
+    }
+
+    // Drive-letter prefix (`G:\...`, `C:\...`, `D:/...`).
+    if (pos + 2 <= raw_path.size() &&
+        ((raw_path[pos] >= 'A' && raw_path[pos] <= 'Z') ||
+         (raw_path[pos] >= 'a' && raw_path[pos] <= 'z')) &&
+        raw_path[pos + 1] == ':') {
+        const char drive = static_cast<char>(ascii_to_lower_u8(static_cast<uint8_t>(raw_path[pos])));
+        pos += 2;
+        if (pos < raw_path.size() && is_path_sep(raw_path[pos])) {
+            rooted = true;
+            while (pos < raw_path.size() && is_path_sep(raw_path[pos])) {
+                ++pos;
+            }
+        } else if (drive != 'g') {
+            rooted = true;
+        }
+    } else if (pos < raw_path.size() && is_path_sep(raw_path[pos])) {
+        rooted = true;
+        while (pos < raw_path.size() && is_path_sep(raw_path[pos])) {
+            ++pos;
+        }
+    }
+
+    std::vector<std::string> segs;
+    if (!rooted) {
+        std::lock_guard<std::mutex> lock(g_virtual_cwd_mutex);
+        segs = g_virtual_cwd_segments;
+    }
+
+    while (pos < raw_path.size()) {
+        while (pos < raw_path.size() && is_path_sep(raw_path[pos])) {
+            ++pos;
+        }
+        if (pos >= raw_path.size()) {
+            break;
+        }
+        const size_t start = pos;
+        while (pos < raw_path.size() && !is_path_sep(raw_path[pos])) {
+            ++pos;
+        }
+        const std::string_view seg = raw_path.substr(start, pos - start);
+        if (seg.empty() || seg == ".") {
+            continue;
+        }
+        if (seg == "..") {
+            if (segs.empty()) {
+                // Reject traversal attempts above the sandbox root.
+                return PG6_CRT_EACCES;
+            }
+            segs.pop_back();
+            continue;
+        }
+        if (seg.find(':') != std::string_view::npos) {
+            return PG6_CRT_EINVAL;
+        }
+        segs.emplace_back(seg);
+    }
+
+    if (segs.empty()) {
+        out->is_root = true;
+        return 0;
+    }
+
+    if (equals_ascii_ci(segs[0], "userdata")) {
+        out->is_userdata = true;
+        out->key = "/userdata";
+        for (size_t i = 1; i < segs.size(); ++i) {
+            out->key.push_back('/');
+            out->key.append(segs[i]);
+        }
+        return 0;
+    }
+
+    out->is_userdata = false;
+    for (size_t i = 0; i < segs.size(); ++i) {
+        if (i != 0) {
+            out->key.push_back('/');
+        }
+        out->key.append(segs[i]);
+    }
+    return 0;
+}
+
+FILE* sandbox_fopen(const char* filename, const char* mode) {
+    if (filename == nullptr || mode == nullptr) {
+        g_crt_errno = PG6_CRT_EINVAL;
+        return nullptr;
+    }
+    ParsedFopenMode parsed{};
+    if (!parse_fopen_mode(mode, &parsed)) {
+        g_crt_errno = PG6_CRT_EINVAL;
+        return nullptr;
+    }
+
+    SandboxPath sp{};
+    const int32_t res_err = resolve_sandbox_path(filename, &sp);
+    if (res_err != 0) {
+        g_crt_errno = res_err;
+        return nullptr;
+    }
+
+    namespace w32 = playgta6::os::win32;
+    if (sp.is_root) {
+        g_crt_errno = PG6_CRT_EACCES;
+        return nullptr;
+    }
+
+    if (sp.is_userdata) {
+        if (sp.key == "/userdata") {
+            g_crt_errno = PG6_CRT_EACCES;
+            return nullptr;
+        }
+        w32::UserdataEntry entry{};
+        if (w32::userdata_stat(sp.key, &entry) == w32::ERROR_SUCCESS && entry.is_directory) {
+            g_crt_errno = PG6_CRT_EACCES;
+            return nullptr;
+        }
+    } else if (parsed.writable) {
+        // Game root is strictly read-only.
+        g_crt_errno = PG6_CRT_EACCES;
+        return nullptr;
+    }
+
+    const uint32_t access = (parsed.readable ? w32::GENERIC_READ : 0u) |
+                            (parsed.writable ? w32::GENERIC_WRITE : 0u);
+    const uint32_t share =
+        w32::FILE_SHARE_READ | (sp.is_userdata ? (w32::FILE_SHARE_WRITE | w32::FILE_SHARE_DELETE) : 0u);
+    const w32::Handle handle = w32::CreateFileA(
+        sp.key.c_str(), access, share, nullptr, parsed.disposition, w32::FILE_ATTRIBUTE_NORMAL);
+    if (handle == w32::INVALID_HANDLE_VALUE) {
+        g_crt_errno = errno_from_win32(w32::GetLastError());
+        return nullptr;
+    }
+
+    auto* vf = new (std::nothrow) VirtualFile();
+    if (vf == nullptr) {
+        w32::CloseHandle(handle);
+        g_crt_errno = PG6_CRT_ENOMEM;
+        return nullptr;
+    }
+    vf->handle = handle;
+    vf->readable = parsed.readable;
+    vf->writable = parsed.writable;
+    vf->append = parsed.append;
+    {
+        std::lock_guard<std::mutex> lock(g_virtual_files_mutex);
+        g_virtual_files.insert(vf);
+    }
+    return reinterpret_cast<FILE*>(vf);
+}
+
+int32_t sandbox_remove(std::string_view raw_path) {
+    SandboxPath sp{};
+    const int32_t res_err = resolve_sandbox_path(raw_path, &sp);
+    if (res_err != 0) {
+        g_crt_errno = res_err;
+        return -1;
+    }
+    if (!sp.is_userdata || sp.key == "/userdata") {
+        g_crt_errno = PG6_CRT_EACCES;
+        return -1;
+    }
+    namespace w32 = playgta6::os::win32;
+    const uint32_t err = w32::userdata_delete_file(sp.key);
+    if (err != w32::ERROR_SUCCESS) {
+        g_crt_errno = errno_from_win32(err);
+        return -1;
+    }
+    return 0;
+}
+
+int32_t sandbox_rename(std::string_view old_path, std::string_view new_path) {
+    SandboxPath from{};
+    SandboxPath to{};
+    int32_t res_err = resolve_sandbox_path(old_path, &from);
+    if (res_err != 0) {
+        g_crt_errno = res_err;
+        return -1;
+    }
+    res_err = resolve_sandbox_path(new_path, &to);
+    if (res_err != 0) {
+        g_crt_errno = res_err;
+        return -1;
+    }
+    if (!from.is_userdata || !to.is_userdata || from.key == "/userdata" || to.key == "/userdata") {
+        g_crt_errno = PG6_CRT_EACCES;
+        return -1;
+    }
+    namespace w32 = playgta6::os::win32;
+    if (from.key == to.key) {
+        w32::UserdataEntry entry{};
+        const uint32_t err = w32::userdata_stat(from.key, &entry);
+        if (err != w32::ERROR_SUCCESS) {
+            g_crt_errno = errno_from_win32(err);
+            return -1;
+        }
+        return 0;
+    }
+    const uint32_t err = w32::userdata_rename(from.key, to.key, /*replace_existing=*/false);
+    if (err != w32::ERROR_SUCCESS) {
+        g_crt_errno = errno_from_win32(err);
+        return -1;
+    }
+    return 0;
+}
+
+int32_t sandbox_rmdir(std::string_view raw_path) {
+    SandboxPath sp{};
+    const int32_t res_err = resolve_sandbox_path(raw_path, &sp);
+    if (res_err != 0) {
+        g_crt_errno = res_err;
+        return -1;
+    }
+    if (!sp.is_userdata || sp.key == "/userdata") {
+        g_crt_errno = PG6_CRT_EACCES;
+        return -1;
+    }
+    namespace w32 = playgta6::os::win32;
+    const uint32_t err = w32::userdata_remove_directory(sp.key);
+    if (err != w32::ERROR_SUCCESS) {
+        g_crt_errno = errno_from_win32(err);
+        return -1;
+    }
+    return 0;
+}
+
+int32_t sandbox_chdir(std::string_view raw_path) {
+    SandboxPath sp{};
+    const int32_t res_err = resolve_sandbox_path(raw_path, &sp);
+    if (res_err != 0) {
+        g_crt_errno = res_err;
+        return -1;
+    }
+    if (sp.is_root) {
+        std::lock_guard<std::mutex> lock(g_virtual_cwd_mutex);
+        g_virtual_cwd_segments.clear();
+        return 0;
+    }
+    if (!sp.is_userdata) {
+        // Non-userdata paths cannot be entered as working directories (no arbitrary host FS access).
+        g_crt_errno = PG6_CRT_ENOENT;
+        return -1;
+    }
+    namespace w32 = playgta6::os::win32;
+    w32::UserdataEntry entry{};
+    const uint32_t err = w32::userdata_stat(sp.key, &entry);
+    if (err != w32::ERROR_SUCCESS) {
+        g_crt_errno = errno_from_win32(err);
+        return -1;
+    }
+    if (!entry.is_directory) {
+        g_crt_errno = PG6_CRT_ENOTDIR;
+        return -1;
+    }
+
+    std::vector<std::string> next_segs;
+    size_t pos = 0;
+    while (pos < sp.key.size()) {
+        while (pos < sp.key.size() && sp.key[pos] == '/') {
+            ++pos;
+        }
+        const size_t start = pos;
+        while (pos < sp.key.size() && sp.key[pos] != '/') {
+            ++pos;
+        }
+        if (pos > start) {
+            next_segs.emplace_back(sp.key.substr(start, pos - start));
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_virtual_cwd_mutex);
+        g_virtual_cwd_segments = std::move(next_segs);
+    }
+    return 0;
+}
+
+std::vector<uint16_t> sandbox_getcwd_utf16() {
+    std::string path = "G:\\";
+    {
+        std::lock_guard<std::mutex> lock(g_virtual_cwd_mutex);
+        for (size_t i = 0; i < g_virtual_cwd_segments.size(); ++i) {
+            if (i != 0) {
+                path.push_back('\\');
+            }
+            path.append(g_virtual_cwd_segments[i]);
+        }
+    }
+    return utf8_to_utf16_vec(path);
+}
+
+void reset_sandbox_state() {
+    std::lock_guard<std::mutex> lock(g_virtual_cwd_mutex);
+    g_virtual_cwd_segments.clear();
+}
+
+}  // namespace playgta6::os::ucrt_detail
+
 // ---------------------------------------------------------------------------
 // 1. api-ms-win-crt-convert-l1-1-0.dll (12 symbols)
 // ---------------------------------------------------------------------------
@@ -1000,6 +1512,10 @@ void pg6_crt_lock_file(FILE* stream) {
     if (stream == nullptr) {
         return;
     }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        vf->mutex.lock();
+        return;
+    }
 #if defined(_MSC_VER)
     _lock_file(stream);
 #else
@@ -1009,6 +1525,10 @@ void pg6_crt_lock_file(FILE* stream) {
 
 void pg6_crt_unlock_file(FILE* stream) {
     if (stream == nullptr) {
+        return;
+    }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        vf->mutex.unlock();
         return;
     }
 #if defined(_MSC_VER)
@@ -1025,29 +1545,58 @@ int32_t pg6_crt_wstat64(const uint16_t* path, Pg6CrtStat64* buffer) {
     }
     std::memset(buffer, 0, sizeof(*buffer));
     const std::string utf8 = utf16_to_utf8_u16(path);
-    errno = 0;
-#if defined(_MSC_VER)
-    struct __stat64 st{};
-    const int rc = _stat64(utf8.c_str(), &st);
-#else
-    struct stat st{};
-    const int rc = stat(utf8.c_str(), &st);
-#endif
-    if (rc != 0) {
-        g_crt_errno = errno != 0 ? pg6_crt_errno_from_host(errno) : PG6_CRT_ENOENT;
+    playgta6::os::ucrt_detail::SandboxPath sp{};
+    const int32_t res_err = playgta6::os::ucrt_detail::resolve_sandbox_path(utf8, &sp);
+    if (res_err != 0) {
+        g_crt_errno = res_err;
         return -1;
     }
-    buffer->st_dev = static_cast<uint32_t>(st.st_dev);
-    buffer->st_ino = static_cast<uint16_t>(st.st_ino);
-    buffer->st_mode = static_cast<uint16_t>(st.st_mode);
-    buffer->st_nlink = static_cast<int16_t>(st.st_nlink);
-    buffer->st_uid = static_cast<int16_t>(st.st_uid);
-    buffer->st_gid = static_cast<int16_t>(st.st_gid);
-    buffer->st_rdev = static_cast<uint32_t>(st.st_rdev);
-    buffer->st_size = static_cast<int64_t>(st.st_size);
-    buffer->atime_sec = static_cast<int64_t>(st.st_atime);
-    buffer->mtime_sec = static_cast<int64_t>(st.st_mtime);
-    buffer->ctime_sec = static_cast<int64_t>(st.st_ctime);
+
+    namespace w32 = playgta6::os::win32;
+    constexpr uint16_t kModeDirRO = 0x416Du;   // _S_IFDIR | 0555
+    constexpr uint16_t kModeDirRW = 0x41FFu;   // _S_IFDIR | 0777
+    constexpr uint16_t kModeFileRO = 0x8124u;  // _S_IFREG | 0444
+    constexpr uint16_t kModeFileRW = 0x81B6u;  // _S_IFREG | 0666
+
+    if (sp.is_root) {
+        buffer->st_mode = kModeDirRO;
+        buffer->st_nlink = 1;
+        return 0;
+    }
+
+    if (sp.is_userdata) {
+        w32::UserdataEntry entry{};
+        const uint32_t err = w32::userdata_stat(sp.key, &entry);
+        if (err != w32::ERROR_SUCCESS) {
+            g_crt_errno = playgta6::os::ucrt_detail::errno_from_win32(err);
+            return -1;
+        }
+        buffer->st_mode = entry.is_directory ? kModeDirRW : kModeFileRW;
+        buffer->st_nlink = 1;
+        buffer->st_size = entry.is_directory ? 0 : static_cast<int64_t>(entry.size);
+        buffer->atime_sec = filetime_ticks_to_unix_sec(entry.accessed);
+        buffer->mtime_sec = filetime_ticks_to_unix_sec(entry.written);
+        buffer->ctime_sec = filetime_ticks_to_unix_sec(entry.created);
+        return 0;
+    }
+
+    const w32::Handle h = w32::CreateFileA(
+        sp.key.c_str(), w32::GENERIC_READ, w32::FILE_SHARE_READ, nullptr, w32::OPEN_EXISTING,
+        w32::FILE_ATTRIBUTE_NORMAL);
+    if (h == w32::INVALID_HANDLE_VALUE) {
+        g_crt_errno = playgta6::os::ucrt_detail::errno_from_win32(w32::GetLastError());
+        return -1;
+    }
+    int64_t sz = 0;
+    const bool ok = w32::GetFileSizeEx(h, &sz);
+    w32::CloseHandle(h);
+    if (!ok) {
+        g_crt_errno = playgta6::os::ucrt_detail::errno_from_win32(w32::GetLastError());
+        return -1;
+    }
+    buffer->st_mode = kModeFileRO;
+    buffer->st_nlink = 1;
+    buffer->st_size = sz;
     return 0;
 }
 
@@ -1056,12 +1605,7 @@ int32_t pg6_crt_remove(const char* path) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
-    errno = 0;
-    const int rc = std::remove(path);
-    if (rc != 0 && errno != 0) {
-        g_crt_errno = pg6_crt_errno_from_host(errno);
-    }
-    return rc;
+    return playgta6::os::ucrt_detail::sandbox_remove(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,6 +2005,19 @@ int32_t pg6_crt_stdio_common_vfprintf(uint64_t options,
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
+    if (lookup_virtual_file(stream) != nullptr) {
+        va_list ap_copy;
+        va_copy(ap_copy, arglist);
+        const int needed = std::vsnprintf(nullptr, 0, format, ap_copy);
+        va_end(ap_copy);
+        if (needed < 0) {
+            return -1;
+        }
+        std::string buf(static_cast<size_t>(needed) + 1, '\0');
+        std::vsnprintf(buf.data(), buf.size(), format, arglist);
+        const size_t written = pg6_crt_fwrite(buf.data(), 1, static_cast<size_t>(needed), stream);
+        return written == static_cast<size_t>(needed) ? needed : -1;
+    }
     return static_cast<int32_t>(std::vfprintf(stream, format, arglist));
 }
 
@@ -1478,7 +2035,7 @@ int32_t pg6_crt_stdio_common_vfwprintf(uint64_t options,
     std::vector<uint16_t> formatted = format_utf16_va(format, arglist);
     formatted.push_back(0);
     const std::string utf8 = utf16_to_utf8_u16(formatted.data());
-    const size_t written = std::fwrite(utf8.data(), 1, utf8.size(), stream);
+    const size_t written = pg6_crt_fwrite(utf8.data(), 1, utf8.size(), stream);
     if (written != utf8.size()) {
         return -1;
     }
@@ -1664,6 +2221,32 @@ int32_t pg6_crt_fseeki64(FILE* stream, int64_t offset, int32_t origin) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        namespace w32 = playgta6::os::win32;
+        uint32_t method = w32::FILE_BEGIN;
+        if (origin == SEEK_SET) {
+            method = w32::FILE_BEGIN;
+        } else if (origin == SEEK_CUR) {
+            method = w32::FILE_CURRENT;
+            if (vf->has_pushback) {
+                offset -= 1;
+            }
+        } else if (origin == SEEK_END) {
+            method = w32::FILE_END;
+        } else {
+            g_crt_errno = PG6_CRT_EINVAL;
+            return -1;
+        }
+        int64_t new_pos = 0;
+        if (!w32::SetFilePointerEx(vf->handle, offset, &new_pos, method)) {
+            g_crt_errno = playgta6::os::ucrt_detail::errno_from_win32(w32::GetLastError());
+            return -1;
+        }
+        vf->has_pushback = false;
+        vf->eof = false;
+        return 0;
+    }
     errno = 0;
 #if defined(_MSC_VER)
     const int rc = _fseeki64(stream, offset, origin);
@@ -1685,17 +2268,15 @@ int32_t pg6_crt_get_stream_buffer_pointers(FILE* stream,
         return PG6_CRT_EINVAL;
     }
     // msvcp140's basic_filebuf keeps these three pointers and dereferences them for every get/put
-    // area access. A host FILE has no MSVC buffer layout, so each stream gets an empty buffer
-    // record {base, ptr, cnt} = {0, 0, 0} in guest memory: the stream buffer never sees buffered
-    // characters and does every transfer through the stdio functions (fgetc/fputc/fwrite). The
-    // out-pointers are guest addresses (stored into guest memory).
-    static std::mutex records_mutex;
-    static std::vector<std::pair<FILE*, uint64_t>> records;
+    // area access. A host/virtual FILE has no MSVC buffer layout, so each stream gets an empty
+    // buffer record {base, ptr, cnt} = {0, 0, 0} in guest memory: the stream buffer never sees
+    // buffered characters and does every transfer through the stdio functions (fgetc/fputc/fwrite).
+    // The out-pointers are guest addresses (stored into guest memory).
     uint64_t record = 0;
     {
-        std::lock_guard<std::mutex> lock(records_mutex);
+        std::lock_guard<std::mutex> lock(g_stream_buf_mutex);
         playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
-        for (const auto& r : records) {
+        for (const auto& r : g_stream_buf_records) {
             if (r.first == stream && heap.owns(r.second)) {
                 record = r.second;
             }
@@ -1706,7 +2287,7 @@ int32_t pg6_crt_get_stream_buffer_pointers(FILE* stream,
                 g_crt_errno = PG6_CRT_ENOMEM;
                 return PG6_CRT_ENOMEM;
             }
-            records.emplace_back(stream, record);
+            g_stream_buf_records.emplace_back(stream, record);
         }
     }
     if (base != nullptr) {
@@ -1741,10 +2322,32 @@ int32_t pg6_crt_fclose(FILE* stream) {
         g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
     }
+    VirtualFile* vf = nullptr;
+    if (stream != stdin && stream != stdout && stream != stderr) {
+        auto* candidate = reinterpret_cast<VirtualFile*>(stream);
+        std::lock_guard<std::mutex> lock(g_virtual_files_mutex);
+        auto it = g_virtual_files.find(candidate);
+        if (it != g_virtual_files.end()) {
+            vf = *it;
+            g_virtual_files.erase(it);
+        }
+    }
+    if (vf != nullptr) {
+        release_stream_buffer_record(stream);
+        playgta6::os::win32::CloseHandle(vf->handle);
+        delete vf;
+        return 0;
+    }
     return std::fclose(stream);
 }
 
 int32_t pg6_crt_fflush(FILE* stream) {
+    if (stream == nullptr) {
+        return std::fflush(nullptr);
+    }
+    if (lookup_virtual_file(stream) != nullptr) {
+        return 0;
+    }
     return std::fflush(stream);
 }
 
@@ -1753,6 +2356,31 @@ int32_t pg6_crt_fgetc(FILE* stream) {
         g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
     }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        if (!vf->readable) {
+            vf->error = true;
+            g_crt_errno = PG6_CRT_EBADF;
+            return EOF;
+        }
+        if (vf->has_pushback) {
+            vf->has_pushback = false;
+            return static_cast<int32_t>(vf->pushback);
+        }
+        uint8_t byte = 0;
+        uint32_t nread = 0;
+        if (!playgta6::os::win32::ReadFile(vf->handle, &byte, 1, &nread)) {
+            vf->error = true;
+            g_crt_errno =
+                playgta6::os::ucrt_detail::errno_from_win32(playgta6::os::win32::GetLastError());
+            return EOF;
+        }
+        if (nread == 0) {
+            vf->eof = true;
+            return EOF;
+        }
+        return static_cast<int32_t>(byte);
+    }
     return std::fgetc(stream);
 }
 
@@ -1760,6 +2388,21 @@ int32_t pg6_crt_fgetpos(FILE* stream, int64_t* pos) {
     if (stream == nullptr || pos == nullptr) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
+    }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        int64_t cur = 0;
+        if (!playgta6::os::win32::SetFilePointerEx(vf->handle, 0, &cur,
+                                                   playgta6::os::win32::FILE_CURRENT)) {
+            g_crt_errno =
+                playgta6::os::ucrt_detail::errno_from_win32(playgta6::os::win32::GetLastError());
+            return -1;
+        }
+        if (vf->has_pushback && cur > 0) {
+            cur -= 1;
+        }
+        *pos = cur;
+        return 0;
     }
     errno = 0;
 #if defined(_MSC_VER)
@@ -1778,22 +2421,35 @@ int32_t pg6_crt_fgetpos(FILE* stream, int64_t* pos) {
 }
 
 FILE* pg6_crt_fopen(const char* filename, const char* mode) {
-    if (filename == nullptr || mode == nullptr) {
-        g_crt_errno = PG6_CRT_EINVAL;
-        return nullptr;
-    }
-    errno = 0;
-    FILE* f = std::fopen(filename, mode);
-    if (f == nullptr && errno != 0) {
-        g_crt_errno = pg6_crt_errno_from_host(errno);
-    }
-    return f;
+    return playgta6::os::ucrt_detail::sandbox_fopen(filename, mode);
 }
 
 int32_t pg6_crt_fputc(int32_t ch, FILE* stream) {
     if (stream == nullptr) {
         g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
+    }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        if (!vf->writable) {
+            vf->error = true;
+            g_crt_errno = PG6_CRT_EBADF;
+            return EOF;
+        }
+        vf->has_pushback = false;
+        if (vf->append) {
+            playgta6::os::win32::SetFilePointerEx(vf->handle, 0, nullptr,
+                                                  playgta6::os::win32::FILE_END);
+        }
+        const uint8_t byte = static_cast<uint8_t>(ch);
+        uint32_t written = 0;
+        if (!playgta6::os::win32::WriteFile(vf->handle, &byte, 1, &written) || written != 1) {
+            vf->error = true;
+            g_crt_errno =
+                playgta6::os::ucrt_detail::errno_from_win32(playgta6::os::win32::GetLastError());
+            return EOF;
+        }
+        return static_cast<int32_t>(byte);
     }
     return std::fputc(ch, stream);
 }
@@ -1803,7 +2459,47 @@ size_t pg6_crt_fread(void* buffer, size_t size, size_t count, FILE* stream) {
         g_crt_errno = PG6_CRT_EINVAL;
         return 0;
     }
-    const playgta6::os::HostWriteScope host_write(buffer, static_cast<uint64_t>(size) * count);  // R40: kernel write
+    if (size == 0 || count == 0) {
+        return 0;
+    }
+    if (count > std::numeric_limits<size_t>::max() / size) {
+        g_crt_errno = PG6_CRT_EINVAL;
+        return 0;
+    }
+    const size_t total = size * count;
+    const playgta6::os::HostWriteScope host_write(buffer, static_cast<uint64_t>(total));  // R40: kernel write
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        if (!vf->readable) {
+            vf->error = true;
+            g_crt_errno = PG6_CRT_EBADF;
+            return 0;
+        }
+        auto* dst = static_cast<uint8_t*>(buffer);
+        size_t done = 0;
+        if (vf->has_pushback && done < total) {
+            dst[done++] = vf->pushback;
+            vf->has_pushback = false;
+        }
+        while (done < total) {
+            const size_t rem = total - done;
+            const uint32_t chunk =
+                static_cast<uint32_t>(std::min<size_t>(rem, 0x40000000u));
+            uint32_t nread = 0;
+            if (!playgta6::os::win32::ReadFile(vf->handle, dst + done, chunk, &nread)) {
+                vf->error = true;
+                g_crt_errno = playgta6::os::ucrt_detail::errno_from_win32(
+                    playgta6::os::win32::GetLastError());
+                break;
+            }
+            done += nread;
+            if (nread == 0) {
+                vf->eof = true;
+                break;
+            }
+        }
+        return done / size;
+    }
     return std::fread(buffer, size, count, stream);
 }
 
@@ -1812,11 +2508,18 @@ int32_t pg6_crt_fseek(FILE* stream, int32_t offset, int32_t origin) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
+    if (lookup_virtual_file(stream) != nullptr) {
+        return pg6_crt_fseeki64(stream, static_cast<int64_t>(offset), origin);
+    }
     return std::fseek(stream, static_cast<long>(offset), origin);
 }
 
 int32_t pg6_crt_fsetpos(FILE* stream, const int64_t* pos) {
     if (stream == nullptr || pos == nullptr) {
+        g_crt_errno = PG6_CRT_EINVAL;
+        return -1;
+    }
+    if (*pos < 0) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
@@ -1828,6 +2531,17 @@ int32_t pg6_crt_ftell(FILE* stream) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
     }
+    if (lookup_virtual_file(stream) != nullptr) {
+        int64_t pos = 0;
+        if (pg6_crt_fgetpos(stream, &pos) != 0) {
+            return -1;
+        }
+        if (pos > INT32_MAX) {
+            g_crt_errno = PG6_CRT_ERANGE;
+            return -1;
+        }
+        return static_cast<int32_t>(pos);
+    }
     return static_cast<int32_t>(std::ftell(stream));
 }
 
@@ -1836,19 +2550,76 @@ size_t pg6_crt_fwrite(const void* buffer, size_t size, size_t count, FILE* strea
         g_crt_errno = PG6_CRT_EINVAL;
         return 0;
     }
+    if (size == 0 || count == 0) {
+        return 0;
+    }
+    if (count > std::numeric_limits<size_t>::max() / size) {
+        g_crt_errno = PG6_CRT_EINVAL;
+        return 0;
+    }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        if (!vf->writable) {
+            vf->error = true;
+            g_crt_errno = PG6_CRT_EBADF;
+            return 0;
+        }
+        vf->has_pushback = false;
+        if (vf->append) {
+            playgta6::os::win32::SetFilePointerEx(vf->handle, 0, nullptr,
+                                                  playgta6::os::win32::FILE_END);
+        }
+        const auto* src = static_cast<const uint8_t*>(buffer);
+        const size_t total = size * count;
+        size_t done = 0;
+        while (done < total) {
+            const size_t rem = total - done;
+            const uint32_t chunk =
+                static_cast<uint32_t>(std::min<size_t>(rem, 0x40000000u));
+            uint32_t written = 0;
+            if (!playgta6::os::win32::WriteFile(vf->handle, src + done, chunk, &written)) {
+                vf->error = true;
+                g_crt_errno = playgta6::os::ucrt_detail::errno_from_win32(
+                    playgta6::os::win32::GetLastError());
+                break;
+            }
+            done += written;
+            if (written == 0) {
+                break;
+            }
+        }
+        return done / size;
+    }
     return std::fwrite(buffer, size, count, stream);
 }
 
 void pg6_crt_rewind(FILE* stream) {
-    if (stream != nullptr) {
-        std::rewind(stream);
+    if (stream == nullptr) {
+        return;
     }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        pg6_crt_fseeki64(stream, 0, SEEK_SET);
+        vf->eof = false;
+        vf->error = false;
+        return;
+    }
+    std::rewind(stream);
 }
 
 int32_t pg6_crt_setvbuf(FILE* stream, char* buffer, int32_t mode, size_t size) {
     if (stream == nullptr) {
         g_crt_errno = PG6_CRT_EINVAL;
         return -1;
+    }
+    if (lookup_virtual_file(stream) != nullptr) {
+        (void)buffer;
+        (void)size;
+        if (mode != _IOFBF && mode != _IOLBF && mode != _IONBF) {
+            g_crt_errno = PG6_CRT_EINVAL;
+            return -1;
+        }
+        return 0;
     }
     // R40: a guest-supplied stdio buffer may sit in XMem memory, and the CRT fills it with kernel
     // reads (ReadFile), which fail on an armed (write-tracked) page. Let the CRT own the buffer.
@@ -1860,6 +2631,16 @@ int32_t pg6_crt_ungetc(int32_t ch, FILE* stream) {
     if (stream == nullptr) {
         g_crt_errno = PG6_CRT_EINVAL;
         return EOF;
+    }
+    if (VirtualFile* vf = lookup_virtual_file(stream)) {
+        std::lock_guard<std::recursive_mutex> lock(vf->mutex);
+        if (ch == EOF) {
+            return EOF;
+        }
+        vf->pushback = static_cast<uint8_t>(ch);
+        vf->has_pushback = true;
+        vf->eof = false;
+        return static_cast<int32_t>(vf->pushback);
     }
     return std::ungetc(ch, stream);
 }
@@ -2628,6 +3409,7 @@ void pg6_crt_reset_runtime_state(void) {
     g_crt_errno = 0;
     g_current_exception = nullptr;
     g_current_exception_context = nullptr;
+    playgta6::os::ucrt_detail::reset_sandbox_state();
 }
 
 int32_t pg6_crt_errno_from_host(int32_t host_errno) {

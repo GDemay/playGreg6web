@@ -26,7 +26,7 @@ const FIXTURE_EXPORTS: &[&str] = &[
     "api-ms-win-crt-string-l1-1-0.dll!strlen",
     "api-ms-win-crt-math-l1-1-0.dll!pow",
     "api-ms-win-crt-math-l1-1-0.dll!sinf",
-    "api-ms-win-crt-filesystem-l1-1-0.dll!remove",
+    "VCRUNTIME140.dll!_purecall",
     "WS2_32.dll!closesocket",
 ];
 

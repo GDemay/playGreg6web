@@ -91,11 +91,22 @@ int32_t pg6_crt_rand_s(uint32_t* value);
 // api-ms-win-crt-runtime
 int32_t pg6_crt_seh_filter_dll(uint32_t exception_num, void* exception_ptrs);
 
-// api-ms-win-crt-stdio (host FILE* handles from __acrt_iob_func)
+// api-ms-win-crt-stdio (host stdin/stdout/stderr and sandboxed virtual FILE* handles)
 int32_t pg6_crt_fputs(const char* str, FILE* stream);
 uint16_t pg6_crt_fputwc(uint16_t ch, FILE* stream);
 uint16_t pg6_crt_fgetwc(FILE* stream);
 uint16_t pg6_crt_ungetwc(uint16_t ch, FILE* stream);
+FILE* pg6_crt_fsopen(const char* filename, const char* mode, int32_t shflag);
+FILE* pg6_crt_wfsopen(const uint16_t* filename, const uint16_t* mode, int32_t shflag);
+
+// api-ms-win-crt-filesystem (sandboxed /userdata overlay and read-only game root)
+int32_t pg6_crt_wrename(const uint16_t* oldname, const uint16_t* newname);
+int32_t pg6_crt_wchdir(const uint16_t* dirname);
+int32_t pg6_crt_wrmdir(const uint16_t* dirname);
+int32_t pg6_crt_wremove(const uint16_t* path);
+
+// api-ms-win-crt-environment (sandboxed virtual working directory)
+uint16_t* pg6_crt_wgetcwd(uint16_t* buffer, int32_t maxlen);
 
 // Imports of the other shipped redistributables (msvcp140_2, concrt140, vcomp140, vccorlib140).
 double pg6_crt_ceil(double x);

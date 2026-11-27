@@ -4,6 +4,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <string>
+#include <string_view>
+#include <vector>
 
 // UCRT (api-ms-win-crt-*) & VCRUNTIME140 / VCRUNTIME140_1 C-ABI Bridge (Track 2, Task O13).
 //
@@ -521,3 +524,28 @@ auto pg6_crt_with_host_errno(F&& call) {
     }
     return result;
 }
+
+// Internal sandboxed stdio / filesystem helpers shared between ucrt_bridge.cpp and ucrt_ext.cpp.
+// Outside extern "C" so they are never treated as exported C-ABI shims.
+namespace playgta6::os::ucrt_detail {
+
+struct SandboxPath {
+    std::string key;          // "/userdata", "/userdata/...", relative game-root path, or "" (root)
+    bool is_userdata = false;
+    bool is_root = false;
+};
+
+int32_t errno_from_win32(uint32_t win32_err);
+int32_t resolve_sandbox_path(std::string_view raw_path, SandboxPath* out);
+std::string utf16_to_utf8(const uint16_t* src, size_t max_units = static_cast<size_t>(-1));
+std::vector<uint16_t> utf8_to_utf16(std::string_view s);
+
+FILE* sandbox_fopen(const char* filename, const char* mode);
+int32_t sandbox_remove(std::string_view raw_path);
+int32_t sandbox_rename(std::string_view old_path, std::string_view new_path);
+int32_t sandbox_rmdir(std::string_view raw_path);
+int32_t sandbox_chdir(std::string_view raw_path);
+std::vector<uint16_t> sandbox_getcwd_utf16();
+void reset_sandbox_state();
+
+}  // namespace playgta6::os::ucrt_detail

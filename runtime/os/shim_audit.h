@@ -55,10 +55,10 @@
     X(pg6_crt_strtoul, ok, "Win64 unsigned long = uint32; identity: endptr") \
     X(pg6_crt_strtoull, ok, "identity: endptr") \
     /* ---- api-ms-win-crt-filesystem ---- */ \
-    X(pg6_crt_lock_file, ok, "FILE* is an opaque host stream handle (from __acrt_iob_func)") \
-    X(pg6_crt_unlock_file, ok, "FILE* is an opaque host stream handle") \
-    X(pg6_crt_wstat64, ok, "fills the 56-byte MSVC _stat64 layout; host path without the win32 path mapping, game paths fail with ENOENT") \
-    X(pg6_crt_remove, deny, "deletes host files by a raw guest path, bypassing the win32 file shims' path mapping") \
+    X(pg6_crt_lock_file, ok, "FILE* is an opaque host or sandboxed virtual stream handle") \
+    X(pg6_crt_unlock_file, ok, "FILE* is an opaque host or sandboxed virtual stream handle") \
+    X(pg6_crt_wstat64, ok, "fills the 56-byte MSVC _stat64 layout; routed through sandboxed /userdata overlay and read-only game root") \
+    X(pg6_crt_remove, ok, "routed through sandboxed /userdata overlay; read-only game root and host escapes rejected with EACCES") \
     /* ---- api-ms-win-crt-heap ---- */ \
     X(pg6_crt_set_new_mode, ok, "") \
     X(pg6_crt_calloc, ok, "guest heap (O24 guest_crt family)") \
@@ -151,12 +151,12 @@
     X(pg6_crt_fseeki64, ok, "") \
     X(pg6_crt_get_stream_buffer_pointers, ok, "per-stream empty {base, ptr, cnt} record in guest memory (guest addresses): basic_filebuf sees no buffered characters and transfers through fgetc/fputc/fwrite") \
     X(pg6_crt_set_fmode, ok, "") \
-    X(pg6_crt_wfopen, deny, "opens host files by a raw guest path (and can create/truncate them), bypassing the win32 file shims' path mapping") \
-    X(pg6_crt_fclose, ok, "host FILE* handle") \
+    X(pg6_crt_wfopen, ok, "routed through sandboxed virtual FILE* over /userdata overlay and read-only game root; never touches host FS") \
+    X(pg6_crt_fclose, ok, "host or sandboxed virtual FILE* handle") \
     X(pg6_crt_fflush, ok, "") \
     X(pg6_crt_fgetc, ok, "") \
     X(pg6_crt_fgetpos, ok, "MSVC fpos_t = int64") \
-    X(pg6_crt_fopen, deny, "opens host files by a raw guest path (and can create/truncate them), bypassing the win32 file shims' path mapping") \
+    X(pg6_crt_fopen, ok, "routed through sandboxed virtual FILE* over /userdata overlay and read-only game root; never touches host FS") \
     X(pg6_crt_fputc, ok, "") \
     X(pg6_crt_fread, ok, "") \
     X(pg6_crt_fseek, ok, "Win64 long offset = int32") \
@@ -264,10 +264,17 @@
     X(pg6_crt_aligned_free, ok, "guest heap (O24)") \
     X(pg6_crt_rand_s, ok, "per-thread PRNG seeded from std::random_device") \
     X(pg6_crt_seh_filter_dll, ok, "EXCEPTION_CONTINUE_SEARCH") \
-    X(pg6_crt_fputs, ok, "host FILE* handle") \
+    X(pg6_crt_fputs, ok, "host or sandboxed virtual FILE* handle") \
     X(pg6_crt_fputwc, ok, "C locale text: units above 0xFF fail with EILSEQ") \
     X(pg6_crt_fgetwc, ok, "C locale text: one byte per unit") \
     X(pg6_crt_ungetwc, ok, "") \
+    X(pg6_crt_fsopen, ok, "routed through sandboxed virtual FILE* over /userdata overlay and read-only game root") \
+    X(pg6_crt_wfsopen, ok, "UTF-16; routed through sandboxed virtual FILE* over /userdata overlay and read-only game root") \
+    X(pg6_crt_wrename, ok, "UTF-16; renames strictly within sandboxed /userdata overlay; rejects game root and host escapes with EACCES") \
+    X(pg6_crt_wchdir, ok, "UTF-16; updates sandboxed virtual CWD within G:\\ and /userdata directories; rejects host escapes") \
+    X(pg6_crt_wrmdir, ok, "UTF-16; removes empty directories strictly within sandboxed /userdata overlay") \
+    X(pg6_crt_wremove, ok, "UTF-16; deletes files strictly within sandboxed /userdata overlay; rejects game root and host escapes with EACCES") \
+    X(pg6_crt_wgetcwd, ok, "UTF-16; returns sandboxed virtual CWD, guest-heap allocated when buffer is null") \
     X(pg6_crt_getdays, ok, "guest heap string, freed by the caller") \
     X(pg6_crt_getmonths, ok, "guest heap string, freed by the caller") \
     X(pg6_crt_gettnames, ok, "opaque zeroed guest heap block, freed by the caller; only passed back to _Strftime") \
@@ -423,7 +430,7 @@
     X(pg6_ws2_getsockopt, ok, "WSAENOTSOCK") \
     X(pg6_ws2_htons, ok, "") \
     X(pg6_ws2_inet_addr, ok, "") \
-    X(pg6_ws2_inet_ntoa, deny, "takes struct in_addr by value (Win64 passes it in a register) and returns a host buffer; gthunk: pg6_gthunk_inet_ntoa (os/host_marshallers.h)") \
+    X(pg6_ws2_inet_ntoa, deny, "takes struct in_addr by value (Win64 passes it in a register); gthunk: pg6_gthunk_inet_ntoa (os/host_marshallers.h)") \
     X(pg6_ws2_listen, ok, "WSAENOTSOCK") \
     X(pg6_ws2_recv, ok, "WSAENETUNREACH") \
     X(pg6_ws2_recvfrom, ok, "WSAENETUNREACH") \
@@ -445,12 +452,5 @@
 // Imports of the shipped guest DLLs (msvcp140 & co.) that knowingly have no shim yet.
 #define PG6_IMPORT_GAPS(X) \
     X("api-ms-win-crt-runtime-l1-1-0.dll", "_endthreadex", "ends the calling guest thread; the runtime has no guest thread exit path yet (ExitThread)") \
-    X("api-ms-win-crt-stdio-l1-1-0.dll", "_fsopen", "host file by a raw guest path, like the denied fopen: needs the win32 file shims' path mapping") \
-    X("api-ms-win-crt-stdio-l1-1-0.dll", "_wfsopen", "host file by a raw guest path, like the denied _wfopen") \
-    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wchdir", "host working directory: needs the win32 file shims' path mapping") \
-    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wremove", "host file by a raw guest path, like the denied remove") \
-    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wrename", "host file by a raw guest path, like the denied remove") \
-    X("api-ms-win-crt-filesystem-l1-1-0.dll", "_wrmdir", "host directory by a raw guest path, like the denied remove") \
-    X("api-ms-win-crt-environment-l1-1-0.dll", "_wgetcwd", "host working directory: needs the win32 file shims' path mapping") \
     X("api-ms-win-crt-heap-l1-1-0.dll", "_aligned_offset_malloc", "no offset-aligned allocation in the guest heap (O24) yet")
 // clang-format on
