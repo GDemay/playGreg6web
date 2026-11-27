@@ -2046,6 +2046,29 @@ fn function_keys_follow_the_cfg_and_the_callee_summaries_only() {
 }
 
 #[test]
+fn function_key_covers_every_callee_summary_field() {
+    const A: u64 = 0x1000;
+    const F: u64 = 0x2000;
+    let rel = (A as i64 - (F as i64 + 5)) as i32;
+    let mut caller = vec![0xE8];
+    caller.extend_from_slice(&rel.to_le_bytes());
+    caller.push(0xC3);
+    let analysis = discover_pieces(&[(A, &[0xC3]), (F, &caller)]);
+    let caller_fn = &analysis.functions[&F];
+    let base = lift::FlagSummaries::compute(analysis.functions.values());
+    let base_key = shard_lift::function_key(caller_fn, &base);
+    for field in 0..6u8 {
+        let mut changed = base.clone();
+        changed.set_field_for_test(A, field, 0x5a5a_5a5a_5a5a_5a5a);
+        assert_ne!(
+            shard_lift::function_key(caller_fn, &changed),
+            base_key,
+            "summary field {field} of the callee must be part of the caller's key"
+        );
+    }
+}
+
+#[test]
 fn shard_keys_cover_the_lifter_context() {
     let analysis = discover_pieces(&[(0x1000, &[0xC3]), (0x2000, &[0xB8, 1, 0, 0, 0, 0xC3])]);
     let functions: Vec<&Function> = analysis.functions.values().collect();

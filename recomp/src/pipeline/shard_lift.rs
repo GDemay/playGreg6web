@@ -56,7 +56,7 @@ use crate::lift::{self, FlagSummaries, MemoryModel, ShardDispatch};
 pub const LIFT_CODEGEN: &str = env!("PLAYGTA6_LIFT_CODEGEN");
 
 /// Format version of the cache keys and entries; bump when the key derivation changes.
-pub const SHARD_CACHE_VERSION: u32 = 1;
+pub const SHARD_CACHE_VERSION: u32 = 2;
 
 /// 128-bit FNV-1a (also usable as a [`fmt::Write`] sink, so `Debug` output is hashed without
 /// being materialised).
@@ -115,6 +115,8 @@ pub fn summary_targets(f: &Function) -> BTreeSet<u64> {
     out
 }
 
+/// Every [`FlagSummaries`] field the lifter reads is hashed (flag and state, touched, written and
+/// live-in); add any new summary field here too.
 /// Cache key of one function's lifted code apart from the lifter version and the shard context
 /// (see the module docs).
 pub fn function_key(f: &Function, summaries: &FlagSummaries) -> u128 {
@@ -123,8 +125,10 @@ pub fn function_key(f: &Function, summaries: &FlagSummaries) -> u128 {
     for t in summary_targets(f) {
         let _ = write!(
             h,
-            "\n{t:x} {:?} {:?} {:?} {:?}",
+            "\n{t:x} {:?} {:?} {:?} {:?} {:?} {:?}",
             summaries.live_in(t),
+            summaries.touched_flags(t),
+            summaries.written_flags(t),
             summaries.touched(t),
             summaries.written(t),
             summaries.live_in_state(t)

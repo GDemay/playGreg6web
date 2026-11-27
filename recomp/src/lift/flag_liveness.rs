@@ -160,6 +160,20 @@ impl FlagSummaries {
         }
     }
 
+    /// Test hook: overwrites one summary field of `entry` (0 live_in, 1 touched_flags,
+    /// 2 written_flags, 3 touched, 4 written, 5 live_in_state) to `value`.
+    #[cfg(test)]
+    pub(crate) fn set_field_for_test(&mut self, entry: u64, field: u8, value: u64) {
+        match field {
+            0 => drop(self.live_in.insert(entry, value as u8)),
+            1 => drop(self.touched_flags.insert(entry, value as u8)),
+            2 => drop(self.written_flags.insert(entry, value as u8)),
+            3 => drop(self.touched.insert(entry, value)),
+            4 => drop(self.written.insert(entry, value)),
+            _ => drop(self.live_in_state.insert(entry, value)),
+        }
+    }
+
     /// Flags the function at `entry` may observe on entry; `None` for a function outside the set.
     pub fn live_in(&self, entry: u64) -> Option<u8> {
         self.live_in.get(&entry).copied()
