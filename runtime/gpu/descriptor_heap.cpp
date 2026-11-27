@@ -890,6 +890,7 @@ Status DescriptorHeapRegistry::copy_descriptors(
     }
     DescriptorHeap* single_src_heap = nullptr;
     bool multi_src_heap = false;
+    bool source_in_destination_heap = false;
     uint64_t src_min = UINT64_MAX;
     uint64_t src_max_end = 0;
     for (uint32_t i = 0; i < num_src_ranges; ++i) {
@@ -901,6 +902,7 @@ Status DescriptorHeapRegistry::copy_descriptors(
         if (s != Status::Ok) {
             return s;
         }
+        source_in_destination_heap |= scratch.src[i].heap == single_dst_heap;
         if (single_src_heap == nullptr) {
             single_src_heap = scratch.src[i].heap;
         } else if (single_src_heap != scratch.src[i].heap) {
@@ -921,6 +923,9 @@ Status DescriptorHeapRegistry::copy_descriptors(
             may_overlap = false;
         }
     }
+
+    // Multiple source heaps can also be disjoint from the sole destination.
+    if (!multi_dst_heap && !source_in_destination_heap) may_overlap = false;
 
     bool overlap = false;
     if (may_overlap) {

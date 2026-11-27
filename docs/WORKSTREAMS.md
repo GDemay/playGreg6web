@@ -272,6 +272,7 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Since #1466: root_descriptor sources joined on descriptor-table SGPRs as table slots (#1471); contained SGPRs and f32/u32 vertex reinterpretation in the reflection join (#1505).
   - Since #1506: default-read vertex inputs joined by reflection (#1513).
 - [ ] **GPU-PERF2067 — Copy contiguous tiled-texture runs** — `READY FOR REVIEW` (#2067, @GDemay). Performance-only scope: `gfx10_detile.cpp`, scalar-oracle tests and a synthetic production detiler benchmark; no texture-streaming or reflection-contract changes. Real-game FPS unmeasured.
+- [ ] **GPU-PERF2152 — Skip impossible cross-heap descriptor overlap scans** — `IN PROGRESS` (#2152, @GDemay). Scope: descriptor heap CPU bookkeeping, snapshot/generation tests and synthetic public-method benchmark. Game batch distributions and FPS unmeasured.
 - [x] **G64 — Upload Every Mip and Array Slice of Console-Layout Textures, Including Linear Multi-Mip Chains (`runtime/gpu`)** — `DONE` (PR #676, closes #665) *(G49 follow-up)*
   - Upload all mips and slices through the dirty-tracked path with GFX10 placement; model linear multi-mip chains from measured footprints.
 - [x] **G65 — One Linear Layout Rule for Allocation Size, XG Layout and Upload (`runtime/gpu`, XG)** — `DONE` (PR #689, closes #678) *(G64 follow-up)*
