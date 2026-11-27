@@ -771,6 +771,14 @@ pub fn emit_module_with_dispatch(
         out.push('\n');
         out.push_str(text);
     }
+    // The variable header/helpers are already emitted. Reserve known definitions
+    // plus room for final attributes/metadata; larger dispatch output can grow normally.
+    let function_bytes = sorted.iter().fold(0usize, |n, f| {
+        n.saturating_add(f.ir.len()).saturating_add(1)
+    });
+    if function_bytes > out.capacity() {
+        out.reserve(function_bytes.saturating_add(1024));
+    }
     for func in &sorted {
         out.push('\n');
         match dispatch {
