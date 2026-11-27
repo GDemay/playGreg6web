@@ -20,8 +20,10 @@ int main(int argc, char** argv) {
     desc.type = d::DescriptorHeapType::CbvSrvUav;
     desc.num_descriptors = count * 6;
     d::DescriptorHeap *heap = nullptr, *other = nullptr, *third = nullptr;
-    if (registry.create_heap(desc, &heap) != d::Status::Ok ||
-        registry.create_heap(desc, &other) != d::Status::Ok ||
+    desc.flags = mode == 1 || mode == 4 ? d::DescriptorHeapFlags::ShaderVisible : d::DescriptorHeapFlags::None;
+    if (registry.create_heap(desc, &heap) != d::Status::Ok) return 1;
+    desc.flags = d::DescriptorHeapFlags::None;
+    if (registry.create_heap(desc, &other) != d::Status::Ok ||
         registry.create_heap(desc, &third) != d::Status::Ok) return 1;
     const auto handle = [](d::DescriptorHeap* h, uint32_t index) {
         return d::CpuDescriptorHandle{h->cpu_start().ptr + uint64_t{index} * h->increment()};
@@ -79,6 +81,7 @@ int main(int argc, char** argv) {
         const auto* bytes = reinterpret_cast<const uint8_t*>(dst.heap->view(dst.index));
         for (size_t b = 0; b < sizeof(d::ViewDescriptor); ++b) hash = (hash ^ bytes[b]) * 0x100000001b3ull;
     }
-    std::printf("{\"ranges\":%u,\"iterations\":%u,\"mode\":%u,\"wall_ms\":%.6f,\"ms_per_call\":%.6f,\"digest\":\"%016llx\",\"correct\":true}\n",
-                count, iterations, mode, elapsed, elapsed / iterations, static_cast<unsigned long long>(hash));
+    std::printf("{\"ranges\":%u,\"iterations\":%u,\"mode\":%u,\"destination_shader_visible\":%s,\"wall_ms\":%.6f,\"ms_per_call\":%.6f,\"digest\":\"%016llx\",\"correct\":true}\n",
+                count, iterations, mode, mode == 1 || mode == 4 ? "true" : "false", elapsed,
+                elapsed / iterations, static_cast<unsigned long long>(hash));
 }
