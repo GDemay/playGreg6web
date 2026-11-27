@@ -1360,6 +1360,11 @@ private:
     };
     std::unordered_map<AddressTextureKey, AddressTextureEntry, AddressTextureKeyHash> address_textures_;
     uint64_t address_texture_tick_ = 0;  // under address_textures_mutex_
+    // Key hashes of address textures dropped by the LRU (under address_textures_mutex_; cleared when
+    // large): a later miss on one of them counts as a re-creation (small_texture_pool stats).
+    std::unordered_set<uint64_t> evicted_address_keys_;
+    static constexpr size_t kMaxEvictedAddressKeys = 1u << 16;
+    void note_address_texture_evicted(const AddressTextureKey& key);  // under address_textures_mutex_
     mutable std::mutex detile_mutex_;
     DetileFn detile_texture_;
     bool using_default_detile_ = false;

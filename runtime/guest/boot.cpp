@@ -3021,7 +3021,9 @@ std::string build_report() {
              ", \"peak_parked_bytes\": " + std::to_string(sp.peak_parked_bytes) +
              ", \"parked_total\": " + std::to_string(sp.parked_total) +
              ", \"evicted\": " + std::to_string(sp.evicted) + ", \"rejected\": " + std::to_string(sp.rejected) +
-             "},\n";
+             ", \"address_misses\": " + std::to_string(sp.address_misses) +
+             ", \"address_evictions\": " + std::to_string(sp.address_evictions) +
+             ", \"address_recreates\": " + std::to_string(sp.address_recreates) + "},\n";
     }
     // Backlog 29: committed memory by kind (os/memory_budget.h).
     {

@@ -233,6 +233,17 @@ void test_disabled_fast_path() {
     CHECK(p.stats().hits == 1 && p.stats().misses == 0);
 }
 
+void test_address_counters() {
+    SmallTexturePool p;
+    p.note_address_miss(false);
+    p.note_address_miss(true);
+    p.note_address_eviction();
+    const SmallTexturePoolStats st = p.stats();
+    CHECK(st.address_misses == 2 && st.address_recreates == 1 && st.address_evictions == 1);
+    // The address counters are separate from the pool's own hit/miss counters.
+    CHECK(st.hits == 0 && st.misses == 0 && st.evicted == 0);
+}
+
 void test_stress_2000_ops_matches_reference() {
     struct RefEntry {
         SmallTextureShape shape;
@@ -360,6 +371,7 @@ int main() {
     test_global_oldest_first_eviction_mixed_shapes();
     test_trim_and_distinct_shapes();
     test_disabled_fast_path();
+    test_address_counters();
     test_stress_2000_ops_matches_reference();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

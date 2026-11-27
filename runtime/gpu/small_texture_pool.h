@@ -70,6 +70,9 @@ struct SmallTexturePoolStats {
     uint64_t evicted = 0;        // parked textures destroyed for room
     uint64_t rejected = 0;       // releases not parked (too big, or pool disabled)
     uint64_t create_ns = 0;      // time the owner spent creating host textures
+    uint64_t address_misses = 0;     // address-texture lookups that needed a texture (hit or create)
+    uint64_t address_evictions = 0;  // address textures dropped by the LRU (count ceiling or VRAM reclaim)
+    uint64_t address_recreates = 0;  // misses on a key the LRU had dropped before (LRU thrash)
     uint32_t parked_count = 0;
     uint64_t parked_bytes = 0;
     uint64_t peak_parked_bytes = 0;
@@ -104,6 +107,10 @@ public:
 
     // The owner reports a real host texture creation.
     void note_create(uint64_t chain_bytes, uint64_t ns) noexcept;
+
+    // The owner's address-texture LRU: a miss (`recreate`: of a key it dropped before), an eviction.
+    void note_address_miss(bool recreate) noexcept;
+    void note_address_eviction() noexcept;
 
     // Number of distinct shapes currently parked in the pool.
     size_t distinct_shapes() const;

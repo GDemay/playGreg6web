@@ -227,6 +227,17 @@ void SmallTexturePool::note_create(uint64_t chain_bytes, uint64_t ns) noexcept {
     stats_.create_ns += ns;
 }
 
+void SmallTexturePool::note_address_miss(bool recreate) noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.address_misses += 1;
+    stats_.address_recreates += recreate ? 1u : 0u;
+}
+
+void SmallTexturePool::note_address_eviction() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.address_evictions += 1;
+}
+
 size_t SmallTexturePool::distinct_shapes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return buckets_.size();
