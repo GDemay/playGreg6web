@@ -2429,61 +2429,57 @@ int64_t pg6_mw_mf_get_system_time(void) {
     return (elapsed_ns / 100) + 1;
 }
 
+// The four object-creating Media Foundation imports fail cleanly (HARD_STOPS 7.4, option A): the out pointer is
+// set to null, E_NOTIMPL comes back and each import logs once. No host COM object reaches the guest and nothing
+// is decoded; the title's media module takes its own failed-request path.
 Pg6HResult pg6_mw_mf_create_attributes(void** out_attributes, uint32_t) {
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        std::fprintf(stderr, "MFPlat: MFCreateAttributes -> E_NOTIMPL (no Media Foundation objects)\n");
+    });
     if (out_attributes == nullptr) {
         return gdk::E_POINTER_HR;
     }
-    void* obj = mw::create_com_stub(2u);
-    if (obj == nullptr) {
-        *out_attributes = nullptr;
-        return gdk::E_OUTOFMEMORY_HR;
-    }
-    *out_attributes = obj;
-    return gdk::S_OK_HR;
+    *out_attributes = nullptr;
+    return gdk::E_NOTIMPL_HR;
 }
 
 Pg6HResult pg6_mw_mf_create_media_type(void** out_media_type) {
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        std::fprintf(stderr, "MFPlat: MFCreateMediaType -> E_NOTIMPL (no Media Foundation objects)\n");
+    });
     if (out_media_type == nullptr) {
         return gdk::E_POINTER_HR;
     }
-    void* obj = mw::create_com_stub(3u);
-    if (obj == nullptr) {
-        *out_media_type = nullptr;
-        return gdk::E_OUTOFMEMORY_HR;
-    }
-    *out_media_type = obj;
-    return gdk::S_OK_HR;
+    *out_media_type = nullptr;
+    return gdk::E_NOTIMPL_HR;
 }
 
 Pg6HResult pg6_mw_mf_create_source_resolver(void** out_source_resolver) {
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        std::fprintf(stderr, "MFPlat: MFCreateSourceResolver -> E_NOTIMPL (no Media Foundation objects)\n");
+    });
     if (out_source_resolver == nullptr) {
         return gdk::E_POINTER_HR;
     }
-    void* obj = mw::create_com_stub(4u);
-    if (obj == nullptr) {
-        *out_source_resolver = nullptr;
-        return gdk::E_OUTOFMEMORY_HR;
-    }
-    *out_source_resolver = obj;
-    return gdk::S_OK_HR;
+    *out_source_resolver = nullptr;
+    return gdk::E_NOTIMPL_HR;
 }
 
-Pg6HResult pg6_mw_mf_create_source_reader_from_media_source(void* media_source,
+Pg6HResult pg6_mw_mf_create_source_reader_from_media_source(void*,
                                                             void*,
                                                             void** out_source_reader) {
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+        std::fprintf(stderr,
+                     "MFReadWrite: MFCreateSourceReaderFromMediaSource -> E_NOTIMPL (no Media Foundation objects)\n");
+    });
     if (out_source_reader == nullptr) {
         return gdk::E_POINTER_HR;
     }
     *out_source_reader = nullptr;
-    if (media_source == nullptr) {
-        return gdk::E_INVALIDARG_HR;
-    }
-    void* obj = mw::create_com_stub(5u);
-    if (obj == nullptr) {
-        return gdk::E_OUTOFMEMORY_HR;
-    }
-    *out_source_reader = obj;
-    return gdk::S_OK_HR;
+    return gdk::E_NOTIMPL_HR;
 }
-
 }  // extern "C"
