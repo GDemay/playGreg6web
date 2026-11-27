@@ -15,6 +15,12 @@ const {
   EMSCRIPTEN_PTHREAD_WORKER_NAME,
   PTHREAD_WGPU_CHANNEL_NAME,
   PTHREAD_HTTPFS_SAB_CHANNEL_NAME,
+  PTHREAD_TX_MSG_FAULT_RECORD,
+  FAULT_RECORD_MESSAGE_TYPE,
+  FAULT_RECORD_PREFIX,
+  FLUSH_PIPELINE_DUMPS_MESSAGE_TYPE,
+  FLUSH_PIPELINE_DUMP_MESSAGE_TYPE,
+  PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE,
   HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
@@ -30,6 +36,12 @@ const {
   BOOT_INIT_FORWARD_KEYS,
   isEmscriptenPthreadWorkerName,
   isEmscriptenPthreadWorker,
+  isFaultRecordLine,
+  parseFaultRecordLine,
+  getLastFaultRecord,
+  resetLastFaultRecord,
+  flushPipelineDump,
+  flushPipelineDumps,
   createPatchedPthreadEnv,
   installPthreadHostImportShim,
   bootstrapEmscriptenPthreadWorker,
@@ -4533,4 +4545,385 @@ test('Orch-13 loader.js gpu-validation-error emits gpuValidationForwarded: true 
   assert.equal(mainErr.type, 'gpu-validation-error');
   assert.equal(mainErr.error.type, 'validation');
   assert.match(mainErr.error.message, /Bind group entry mismatch/);
+});
+
+test('Orch-39 loader.js off-thread em-pthread host_log [fault-record] flushes synchronously to console.error, BroadcastChannel, and txPort even if txPort closes immediately', () => {
+  assert.equal(PTHREAD_TX_MSG_FAULT_RECORD, 'fault-record');
+  assert.equal(FAULT_RECORD_MESSAGE_TYPE, 'fault-record');
+  assert.equal(FAULT_RECORD_PREFIX, '[fault-record]');
+
+  const faultJson =
+    '{"kind":"\\u0075nimplemented_slot","va":"0x140004321","unimplemented_slot":{"interface":"IXStore","slot":71},"registers":{"rax":"0x99"},"call_stack":{"frames":[]}}';
+  const rawGuestLog = `[fault-record] ${faultJson}`;
+
+  assert.equal(isFaultRecordLine(rawGuestLog), true);
+  const parsed = parseFaultRecordLine(rawGuestLog);
+  assert.equal(parsed.kind, 'unimplemented_slot');
+  assert.equal(parsed.va, '0x140004321');
+  assert.equal(parsed.target, '0x140004321');
+  assert.equal(parsed.unimplemented_slot.slot, 71);
+
+  // 1. Open txPort: synchronous console.error + direct BroadcastChannel('game-progress') + structured txPort fault-record message.
+  const bcMessages = [];
+  class MockBC {
+    constructor(name) {
+      this.name = name;
+    }
+    postMessage(msg) {
+      bcMessages.push({ channel: this.name, msg });
+    }
+    close() {}
+  }
+  const txMessages = [];
+  const consoleErrors = [];
+  const scope = {
+    name: 'em-pthread-4',
+    BroadcastChannel: MockBC,
+    console: {
+      error(line) {
+        consoleErrors.push(line);
+      },
+    },
+  };
+  const fakeTxPort = {
+    postMessage(msg) {
+      txMessages.push(msg);
+    },
+    close() {},
+  };
+
+  const booted = bootstrapEmscriptenPthreadWorker({
+    scope,
+    BroadcastChannel: MockBC,
+    txPort: fakeTxPort,
+    importScriptsFn: () => {},
+  });
+
+  const mem = new WebAssembly.Memory({ initial: 1 });
+  booted.hostImports.setMemory(mem);
+  const bytes = new TextEncoder().encode(rawGuestLog);
+  new Uint8Array(mem.buffer, 64, bytes.byteLength).set(bytes);
+  booted.hostImports.env.host_log(64, bytes.byteLength);
+
+  const progressBc1 = bcMessages.filter((m) => m.channel === 'game-progress');
+  assert.equal(consoleErrors.length, 1);
+  assert.ok(consoleErrors[0].includes('[fault-record]'));
+  assert.equal(progressBc1.length, 1);
+  assert.ok(progressBc1[0].msg.label.includes('[fault-record]'));
+  assert.equal(txMessages.length, 1);
+  assert.equal(txMessages[0].type, PTHREAD_TX_MSG_FAULT_RECORD);
+  assert.equal(txMessages[0].faultRecord.kind, 'unimplemented_slot');
+  assert.equal(txMessages[0].broadcastSent, true);
+  assert.equal(txMessages[0].consoleEmitted, true);
+  assert.equal(txMessages[0].workerName, 'em-pthread-4');
+  assert.equal(booted.getLastFaultRecord().va, '0x140004321');
+  assert.equal(scope.__playgta6LastFaultRecord.unimplemented_slot.slot, 71);
+  booted.cleanup();
+
+  // 2. Broken / closing txPort right before std::abort(): console.error AND direct BroadcastChannel STILL succeed!
+  bcMessages.length = 0;
+  consoleErrors.length = 0;
+  const brokenTxPort = {
+    postMessage() {
+      throw new Error('port closed on abort');
+    },
+    close() {},
+  };
+  const scope2 = {
+    name: 'em-pthread-9',
+    BroadcastChannel: MockBC,
+    console: {
+      error(line) {
+        consoleErrors.push(line);
+      },
+    },
+  };
+  const booted2 = bootstrapEmscriptenPthreadWorker({
+    scope: scope2,
+    BroadcastChannel: MockBC,
+    txPort: brokenTxPort,
+    importScriptsFn: () => {},
+  });
+  booted2.hostImports.setMemory(mem);
+  booted2.hostImports.env.host_log(64, bytes.byteLength);
+
+  const progressBc2 = bcMessages.filter((m) => m.channel === 'game-progress');
+  assert.equal(consoleErrors.length, 1);
+  assert.equal(progressBc2.length, 1);
+  assert.ok(progressBc2[0].msg.label.includes('[fault-record]'));
+  assert.equal(booted2.getLastFaultRecord().kind, 'unimplemented_slot');
+  booted2.cleanup();
+});
+
+test('Orch-39 buildRuntimeModuleConfig captures [fault-record] on host_log/printErr/onAbort and immediately flushes MEMFS /pg6_dump on onAbort even if MEMFS disappears after abort', async () => {
+  resetLastFaultRecord();
+  const memfs = createFakeMemfs();
+  const uploaded = [];
+  const mainEvents = [];
+  const observerEvents = [];
+  const consoleErrors = [];
+  const consoleLogs = [];
+  const reports = [];
+  let abortReasonSeen = null;
+
+  // Write 6 files (> maxConcurrentUploads=2) to verify synchronous snapshotting on onAbort.
+  for (let i = 0; i < 5; i += 1) {
+    memfs.writeFile(`/pg6_dump/native/pso_${i}.bin`, new Uint8Array([i + 1, i + 2]));
+  }
+  memfs.writeFile('/pg6_dump/manifest.json', '{"count":5}');
+
+  const pendingResolvers = [];
+  const cfg = buildRuntimeModuleConfig({
+    locationHref: 'http://127.0.0.1:8080/loader.js',
+    dumpPipelines: true,
+    dumpMaxConcurrentUploads: 2,
+    dumpSetIntervalFn: () => 42,
+    dumpClearIntervalFn: () => {},
+    dumpFetchFn: (url, init) =>
+      new Promise((resolve) => {
+        uploaded.push({ url, bytes: new Uint8Array(init.body) });
+        pendingResolvers.push(() => resolve({ ok: true, status: 200 }));
+      }),
+    reportFn: (label) => reports.push(label),
+    postToMain: (msg) => mainEvents.push(msg),
+    onFaultRecord: (rec, meta) => observerEvents.push({ rec, meta }),
+    console: {
+      error: (line) => consoleErrors.push(line),
+      log: (line) => consoleLogs.push(line),
+    },
+    onAbort: (what) => {
+      abortReasonSeen = what;
+    },
+  });
+
+  const mockModule = { FS: memfs.fs };
+  cfg.preRun[0](mockModule);
+
+  // Regular stdout lines still forward to console.log when options.print is omitted.
+  cfg.print('regular stdout line');
+  assert.deepEqual(consoleLogs, ['regular stdout line']);
+
+  // printErr delivers a compact KV [fault-record] with trailing newline.
+  cfg.printErr(
+    '[fault-record] kind=unimplemented_slot va=0x140055555 com_slot=71 hard_stop=true\n',
+  );
+  assert.equal(cfg.getLastFaultRecord().kind, 'unimplemented_slot');
+  assert.equal(cfg.getLastFaultRecord().va, '0x140055555');
+  assert.equal(cfg.getLastFaultRecord().com_slot, 71);
+  assert.equal(consoleErrors.length, 1);
+  assert.equal(observerEvents.length, 1);
+  assert.equal(mainEvents.length, 1);
+  assert.equal(mainEvents[0].type, FAULT_RECORD_MESSAGE_TYPE);
+  assert.equal(reports.some((line) => line.includes('[fault-record]')), true);
+
+  // Write one more late shader right before onAbort(), while the first flush pass is still in flight!
+  memfs.writeFile('/pg6_dump/dxil/late_before_abort.dxbc', new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
+
+  // Trigger onAbort, then IMMEDIATELY wipe MEMFS AND invoke a second stop() (matching coordinator onAbort)
+  // to verify the second stop() never wipes previously snapshotted bytes!
+  cfg.onAbort('Aborted(native code called abort())');
+  assert.equal(abortReasonSeen, 'Aborted(native code called abort())');
+  memfs.files.clear();
+  memfs.dirs.clear();
+  cfg.getPipelineDumpSyncer().stop().catch(() => {});
+
+  // Re-emitted fault-record event on abort with onAbort: true.
+  const abortEvt = mainEvents.find((e) => e.type === FAULT_RECORD_MESSAGE_TYPE && e.onAbort === true);
+  assert.ok(abortEvt, 'expected fault-record re-emission on onAbort');
+  assert.equal(abortEvt.faultRecord.va, '0x140055555');
+
+  // Drain all in-flight and queued snapshotted uploads after MEMFS was cleared!
+  let guard = 0;
+  while (pendingResolvers.length > 0 && guard < 32) {
+    guard += 1;
+    const batch = pendingResolvers.splice(0, pendingResolvers.length);
+    for (const done of batch) {
+      done();
+    }
+    await new Promise((r) => setImmediate(r));
+  }
+
+  const uploadedUrls = uploaded.map((u) => u.url);
+  assert.equal(uploadedUrls.includes('/__pg6_dump/dxil/late_before_abort.dxbc'), true);
+  assert.equal(uploadedUrls.includes('/__pg6_dump/manifest.json'), true);
+  assert.equal(uploadedUrls.length, 7);
+  assert.equal(cfg.getPipelineDumpSyncer().getStats().filesUploaded, 7);
+
+  // Explicit flushPipelineDump() alias works cleanly.
+  assert.equal(typeof cfg.flushPipelineDump, 'function');
+  assert.equal(typeof cfg.flushPipelineDumps, 'function');
+  const postFlushStats = await cfg.flushPipelineDump();
+  assert.equal(postFlushStats.filesUploaded, 7);
+  resetLastFaultRecord();
+});
+
+test('Orch-39 loader.js coordinator VM handles flush-pipeline-dumps message, global __pg6FlushDumps hook, and request-last-fault-record', async () => {
+  const mainMessages = [];
+  const progressMessages = [];
+  const consoleErrors = [];
+  const postedDumpUrls = [];
+  const workersByScript = new Map();
+  const memfs = createFakeMemfs();
+  memfs.writeFile('/pg6_dump/native/boot.bin', new Uint8Array([1, 2, 3, 4]));
+  memfs.writeFile('/pg6_dump/manifest.json', '{"count":1}');
+
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+    }
+    postMessage(msg) {
+      if (this.name === 'game-progress') {
+        progressMessages.push(msg);
+      }
+    }
+    close() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+    terminate() {}
+  }
+
+  const workerSelf = {
+    location: { href: 'http://127.0.0.1:8080/loader.js?dumpPipelines=1' },
+    onmessage: null,
+    postMessage(msg) {
+      mainMessages.push(msg);
+    },
+    createRuntimeModule: async (moduleConfig) => {
+      const mod = { FS: memfs.fs };
+      moduleConfig.preRun[0](mod);
+      // Simulate runtime emitting a [fault-record] over host_log.
+      const mem = new WebAssembly.Memory({ initial: 1 });
+      moduleConfig.hostImports.setMemory(mem);
+      const line = '[fault-record] {"kind":"\\u0074rap","va":"0x140077777","hard_stop":"S1"}';
+      const encoded = new TextEncoder().encode(line);
+      new Uint8Array(mem.buffer, 128, encoded.byteLength).set(encoded);
+      moduleConfig.env.host_log(128, encoded.byteLength);
+      return mod;
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    WebAssembly,
+    indexedDB: null,
+    console: {
+      error: (line) => consoleErrors.push(line),
+      warn: () => {},
+      log: () => {},
+    },
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    setInterval: () => 777,
+    clearInterval: () => {},
+    fetch: async (url, init) => {
+      if (init && init.method === 'HEAD') {
+        return { ok: true, status: 200 };
+      }
+      if (typeof url === 'string' && url.includes('/__pg6_dump/')) {
+        postedDumpUrls.push(url);
+        return { ok: true, status: 200 };
+      }
+      return { ok: false, status: 404 };
+    },
+    importScripts(scriptPath) {
+      if (scriptPath === './dist/runtime.js') {
+        return;
+      }
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  // Global flush hook exposed matching run_browser_boot.py FLUSH_PIPELINE_DUMPS_JS.
+  assert.equal(typeof sandbox.__pg6FlushDumps, 'function');
+  assert.equal(typeof flushPipelineDump, 'function');
+  assert.equal(typeof flushPipelineDumps, 'function');
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dumpPipelines: true,
+    },
+  });
+
+  workersByScript.get('./workers/io_worker.js').onmessage({ data: { ready: true, summary: 'ok' } });
+  workersByScript.get('./workers/wgpu_worker.js').onmessage({ data: { ready: true, adapter: 'mock' } });
+  workersByScript.get('./workers/audio_worker.js').onmessage({ data: { ready: true } });
+
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Verify fault-record was captured synchronously and sent to main thread.
+  const mainFault = mainMessages.find((m) => m && m.type === FAULT_RECORD_MESSAGE_TYPE);
+  assert.ok(mainFault, 'expected structured fault-record sent to main thread');
+  assert.equal(mainFault.faultRecord.kind, 'trap');
+  assert.equal(mainFault.faultRecord.va, '0x140077777');
+  assert.equal(consoleErrors.length, 1);
+
+  // Write a new dump file and trigger explicit flush-pipeline-dumps message from main thread.
+  memfs.writeFile('/pg6_dump/dxil/extra.dxbc', new Uint8Array([9, 8, 7]));
+  workerSelf.onmessage({ data: { type: FLUSH_PIPELINE_DUMPS_MESSAGE_TYPE, id: 'flush-1' } });
+  await new Promise((r) => setTimeout(r, 20));
+
+  const flushedReply = mainMessages.find(
+    (m) => m && m.type === PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE && m.id === 'flush-1',
+  );
+  assert.ok(flushedReply, 'expected pipeline-dumps-flushed reply');
+  assert.equal(flushedReply.ok, true);
+  assert.equal(flushedReply.stats.filesUploaded, 3);
+  assert.equal(postedDumpUrls.includes('/__pg6_dump/dxil/extra.dxbc'), true);
+
+  // Global __pg6FlushDumps hook and request-last-fault-record query both work.
+  const globalStats = await sandbox.__pg6FlushDumps();
+  assert.equal(globalStats.filesUploaded, 3);
+
+  workerSelf.onmessage({ data: { type: 'request-last-fault-record', id: 'fr-1' } });
+  const frReply = mainMessages.find(
+    (m) => m && m.type === FAULT_RECORD_MESSAGE_TYPE && m.id === 'fr-1',
+  );
+  assert.ok(frReply);
+  assert.equal(frReply.faultRecord.va, '0x140077777');
+
+  // request-loader-status includes lastFaultRecord and pipelineDumpStats.
+  workerSelf.onmessage({ data: { type: 'request-loader-status', id: 'st-1' } });
+  const statusReply = mainMessages.find((m) => m && m.type === 'loader-status' && m.id === 'st-1');
+  assert.ok(statusReply);
+  assert.equal(statusReply.lastFaultRecord.kind, 'trap');
+  assert.equal(statusReply.pipelineDumpStats.filesUploaded, 3);
 });

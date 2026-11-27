@@ -9,6 +9,21 @@ const PTHREAD_HTTPFS_SAB_CHANNEL_NAME = 'playgta6-httpfs-sab';
 const PTHREAD_TX_MSG_WGPU_SUBMIT = 'wgpu-submit';
 const PTHREAD_TX_MSG_PROGRESS = 'progress';
 const PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER = 'recycle-cmd-buffer';
+const PTHREAD_TX_MSG_FAULT_RECORD = 'fault-record';
+const FAULT_RECORD_MESSAGE_TYPE = 'fault-record';
+const FAULT_RECORD_PREFIX = '[fault-record]';
+const FAULT_RECORD_LINE_RE = /\[fault-record\][ \t]*([^\r\n]*)/i;
+const FAULT_RECORD_FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const FAULT_RECORD_NUMERIC_KEYS = new Set([
+  'thread',
+  'elapsed_ms',
+  'slot',
+  'com_slot',
+  'unimplemented_com_slot',
+]);
+const FLUSH_PIPELINE_DUMPS_MESSAGE_TYPE = 'flush-pipeline-dumps';
+const FLUSH_PIPELINE_DUMP_MESSAGE_TYPE = 'flush-pipeline-dump';
+const PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE = 'pipeline-dumps-flushed';
 const WGPU_CMD_POOL_MIN_BYTES = 256 * 1024;
 const WGPU_CMD_POOL_MAX_BYTES = 32 * 1024 * 1024;
 const WGPU_CMD_POOL_MAX_BUFFERS = 3;
@@ -223,10 +238,397 @@ let inputSab = null;
 let activeCoordinatorInputBridge = null;
 let activeCoordinatorRuntimeModule = null;
 let activeCoordinatorModuleConfig = null;
+let coordinatorPostToMain = null;
+let lastCoordinatorFaultRecord = null;
+let lastCoordinatorFaultRecordLine = null;
+let lastCoordinatorFaultRecordConsoleLine = null;
 let httpfsMailboxSab = null;
 let httpfsMailboxSabs = [];
 let httpfsClient = null;
 let nextHttpfsBroadcastLane = 0;
+
+function isFaultRecordLine(line) {
+  return typeof line === 'string' && FAULT_RECORD_LINE_RE.test(line);
+}
+
+function normalizeFaultRecordHex(value) {
+  try {
+    if (typeof value === 'bigint') {
+      return value >= 0n ? `0x${value.toString(16)}` : null;
+    }
+    if (typeof value === 'number') {
+      return Number.isSafeInteger(value) && value >= 0 ? `0x${value.toString(16)}` : null;
+    }
+    if (typeof value === 'string') {
+      const m = /^\s*0x([0-9a-f]{1,16})\s*$/i.exec(value);
+      return m ? `0x${BigInt(`0x${m[1]}`).toString(16)}` : null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function parseFaultRecordKvValue(key, rawValue) {
+  if (rawValue === 'null') {
+    return null;
+  }
+  if (rawValue === 'true') {
+    return true;
+  }
+  if (rawValue === 'false') {
+    return false;
+  }
+  if (
+    (rawValue.startsWith('{') && rawValue.endsWith('}')) ||
+    (rawValue.startsWith('[') && rawValue.endsWith(']'))
+  ) {
+    try {
+      return JSON.parse(rawValue);
+    } catch {
+      return rawValue;
+    }
+  }
+  if (FAULT_RECORD_NUMERIC_KEYS.has(key) && /^-?\d+$/.test(rawValue)) {
+    const parsedInt = Number.parseInt(rawValue, 10);
+    if (Number.isSafeInteger(parsedInt)) {
+      return parsedInt;
+    }
+  }
+  return rawValue;
+}
+
+function parseFaultRecordKv(rawPayload) {
+  const out = {};
+  let matchedAny = false;
+  let i = 0;
+  const len = rawPayload.length;
+
+  while (i < len) {
+    while (i < len && /\s/.test(rawPayload[i])) {
+      i += 1;
+    }
+    if (i >= len) {
+      break;
+    }
+    const keyStart = i;
+    while (i < len && /[A-Za-z0-9_.-]/.test(rawPayload[i])) {
+      i += 1;
+    }
+    const key = rawPayload.slice(keyStart, i);
+    if (!key || i >= len || rawPayload[i] !== '=') {
+      while (i < len && !/\s/.test(rawPayload[i])) {
+        i += 1;
+      }
+      continue;
+    }
+    const allowedKey = !FAULT_RECORD_FORBIDDEN_KEYS.has(key);
+    i += 1;
+    if (i >= len) {
+      if (allowedKey) {
+        out[key] = '';
+        matchedAny = true;
+      }
+      break;
+    }
+
+    const ch = rawPayload[i];
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      const quotedStart = i;
+      i += 1;
+      let buf = '';
+      while (i < len && rawPayload[i] !== quote) {
+        if (rawPayload[i] === '\\' && i + 1 < len) {
+          i += 1;
+        }
+        buf += rawPayload[i];
+        i += 1;
+      }
+      const hasClosingQuote = i < len && rawPayload[i] === quote;
+      if (hasClosingQuote) {
+        i += 1;
+      }
+      let decoded = buf;
+      if (quote === '"' && hasClosingQuote) {
+        try {
+          decoded = JSON.parse(rawPayload.slice(quotedStart, i));
+        } catch {
+          decoded = buf;
+        }
+      }
+      if (allowedKey) {
+        out[key] = decoded;
+        matchedAny = true;
+      }
+      continue;
+    }
+
+    if (ch === '{' || ch === '[') {
+      const openCh = ch;
+      const closeCh = ch === '{' ? '}' : ']';
+      let depth = 0;
+      let inStr = false;
+      let escaped = false;
+      const valStart = i;
+      while (i < len) {
+        const c = rawPayload[i];
+        if (inStr) {
+          if (escaped) {
+            escaped = false;
+          } else if (c === '\\') {
+            escaped = true;
+          } else if (c === '"') {
+            inStr = false;
+          }
+        } else if (c === '"') {
+          inStr = true;
+        } else if (c === openCh) {
+          depth += 1;
+        } else if (c === closeCh) {
+          depth -= 1;
+          if (depth === 0) {
+            i += 1;
+            break;
+          }
+        }
+        i += 1;
+      }
+      if (allowedKey) {
+        out[key] = parseFaultRecordKvValue(key, rawPayload.slice(valStart, i));
+        matchedAny = true;
+      }
+      continue;
+    }
+
+    const valStart = i;
+    while (i < len && !/\s/.test(rawPayload[i])) {
+      i += 1;
+    }
+    if (allowedKey) {
+      out[key] = parseFaultRecordKvValue(key, rawPayload.slice(valStart, i));
+      matchedAny = true;
+    }
+  }
+
+  return matchedAny ? out : null;
+}
+
+function cloneFaultRecord(record) {
+  if (!record || typeof record !== 'object' || Array.isArray(record)) {
+    return null;
+  }
+  try {
+    return JSON.parse(JSON.stringify(record));
+  } catch {
+    return Object.assign({}, record);
+  }
+}
+
+function normalizeFaultRecordPayload(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const kind = typeof raw.kind === 'string' ? raw.kind.trim() : '';
+  if (!kind) {
+    return null;
+  }
+  const cloned = cloneFaultRecord(raw);
+  if (!cloned) {
+    return null;
+  }
+  cloned.kind = kind;
+  const normVa = normalizeFaultRecordHex(raw.va);
+  if (normVa !== null) {
+    cloned.va = normVa;
+  }
+  const normRip = normalizeFaultRecordHex(raw.rip);
+  if (normRip !== null) {
+    cloned.rip = normRip;
+  }
+  const normTarget = normalizeFaultRecordHex(raw.target);
+  if (normTarget !== null) {
+    cloned.target = normTarget;
+  } else if (cloned.target === undefined && typeof cloned.va === 'string' && cloned.va.length > 0) {
+    cloned.target = cloned.va;
+  }
+  return cloned;
+}
+
+function parseFaultRecordLine(line) {
+  if (typeof line !== 'string' || line.length === 0) {
+    return null;
+  }
+  const match = FAULT_RECORD_LINE_RE.exec(line);
+  if (!match) {
+    return null;
+  }
+  const payload = match[1].trim();
+  if (!payload) {
+    return null;
+  }
+  let parsed = null;
+  if (payload.startsWith('{')) {
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+  } else {
+    parsed = parseFaultRecordKv(payload);
+  }
+  return normalizeFaultRecordPayload(parsed);
+}
+
+function formatFaultRecordConsoleLine(rawLine, faultRecord) {
+  if (typeof rawLine === 'string' && isFaultRecordLine(rawLine)) {
+    return rawLine;
+  }
+  if (faultRecord && typeof faultRecord === 'object') {
+    try {
+      return `[wasm] ${FAULT_RECORD_PREFIX} ${JSON.stringify(faultRecord)}`;
+    } catch {
+      return `[wasm] ${FAULT_RECORD_PREFIX} {"kind":"unknown"}`;
+    }
+  }
+  return `[wasm] ${FAULT_RECORD_PREFIX}`;
+}
+
+function emitFaultRecordConsoleError(line, consoleObj) {
+  const targetConsole =
+    consoleObj && typeof consoleObj.error === 'function'
+      ? consoleObj
+      : typeof console !== 'undefined' && console && typeof console.error === 'function'
+        ? console
+        : null;
+  if (!targetConsole) {
+    return false;
+  }
+  try {
+    targetConsole.error(line);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getLastFaultRecord() {
+  return lastCoordinatorFaultRecord ? cloneFaultRecord(lastCoordinatorFaultRecord) : null;
+}
+
+function resetLastFaultRecord() {
+  lastCoordinatorFaultRecord = null;
+  lastCoordinatorFaultRecordLine = null;
+  lastCoordinatorFaultRecordConsoleLine = null;
+  if (typeof globalThis !== 'undefined') {
+    try {
+      globalThis.__playgta6LastFaultRecord = null;
+    } catch {
+      // Ignore non-writable globalThis property.
+    }
+  }
+}
+
+function recordCoordinatorFaultRecord(rawRecord, meta = {}) {
+  const normalized =
+    normalizeFaultRecordPayload(rawRecord) ||
+    parseFaultRecordLine(meta.rawLine || meta.label || '');
+  if (!normalized) {
+    return null;
+  }
+  const consoleLine = formatFaultRecordConsoleLine(meta.rawLine || meta.label, normalized);
+  lastCoordinatorFaultRecord = cloneFaultRecord(normalized);
+  lastCoordinatorFaultRecordLine = consoleLine;
+  if (typeof globalThis !== 'undefined') {
+    try {
+      globalThis.__playgta6LastFaultRecord = cloneFaultRecord(normalized);
+    } catch {
+      // Ignore non-writable globalThis property.
+    }
+  }
+
+  const shouldEmitConsole =
+    meta.consoleEmitted !== true &&
+    (meta.forceConsole === true || lastCoordinatorFaultRecordConsoleLine !== consoleLine);
+  if (shouldEmitConsole) {
+    lastCoordinatorFaultRecordConsoleLine = consoleLine;
+    emitFaultRecordConsoleError(consoleLine, meta.console);
+  }
+
+  const postFn =
+    typeof meta.postToMain === 'function'
+      ? meta.postToMain
+      : typeof coordinatorPostToMain === 'function'
+        ? coordinatorPostToMain
+        : null;
+  if (postFn) {
+    try {
+      postFn({
+        type: FAULT_RECORD_MESSAGE_TYPE,
+        faultRecord: cloneFaultRecord(normalized),
+        rawLine: consoleLine,
+        label: typeof meta.label === 'string' && meta.label.length > 0 ? meta.label : consoleLine,
+        source: typeof meta.source === 'string' ? meta.source : 'wasm',
+        workerName: typeof meta.workerName === 'string' ? meta.workerName : null,
+        onAbort: meta.onAbort === true,
+        timestamp: Date.now(),
+      });
+    } catch {
+      // Non-fatal postMessage failure on fault-record forwarding.
+    }
+  }
+
+  if (
+    meta.flushDumps !== false &&
+    activeCoordinatorPipelineDumpSyncer &&
+    activeCoordinatorPipelineDumpSyncer.enabled &&
+    typeof activeCoordinatorPipelineDumpSyncer.flush === 'function'
+  ) {
+    try {
+      const p = activeCoordinatorPipelineDumpSyncer.flush({ snapshotFiles: true });
+      if (p && typeof p.catch === 'function') {
+        p.catch(() => {});
+      }
+    } catch {
+      // Pipeline dump flush must never block fault-record capture.
+    }
+  }
+
+  return cloneFaultRecord(normalized);
+}
+
+function flushActiveCoordinatorPipelineDumps(options = {}) {
+  const flushOpts =
+    options && typeof options === 'object' ? options : { snapshotFiles: true };
+  if (
+    activeCoordinatorPipelineDumpSyncer &&
+    typeof activeCoordinatorPipelineDumpSyncer.flush === 'function'
+  ) {
+    try {
+      return Promise.resolve(activeCoordinatorPipelineDumpSyncer.flush(flushOpts));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+  if (
+    activeCoordinatorModuleConfig &&
+    typeof activeCoordinatorModuleConfig.flushPipelineDumps === 'function'
+  ) {
+    try {
+      return Promise.resolve(activeCoordinatorModuleConfig.flushPipelineDumps(flushOpts));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+  return Promise.resolve({
+    enabled: false,
+    filesUploaded: 0,
+    bytesUploaded: 0,
+    uploadErrors: 0,
+    lastFlushAtMs: null,
+    pendingCount: 0,
+  });
+}
 
 function normalizeHttpfsMailboxLanes(value, fallback = DEFAULT_HTTPFS_MAILBOX_LANES) {
   const defaultLanes =
@@ -2486,8 +2888,63 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     attachTxPort(options.txPort);
   }
 
+  let lastPthreadFaultRecord = null;
+  const pthreadConsoleObj =
+    options.console && typeof options.console.error === 'function'
+      ? options.console
+      : scope && scope.console && typeof scope.console.error === 'function'
+        ? scope.console
+        : typeof console !== 'undefined'
+          ? console
+          : null;
+  const pthreadWorkerName =
+    scope && typeof scope.name === 'string' && scope.name.length > 0
+      ? scope.name
+      : EMSCRIPTEN_PTHREAD_WORKER_NAME;
+
   const pthreadReport = (label) => {
     const payload = { label };
+    if (isFaultRecordLine(label)) {
+      const faultRecord = parseFaultRecordLine(label);
+      if (faultRecord) {
+        lastPthreadFaultRecord = faultRecord;
+        if (scope && typeof scope === 'object') {
+          try {
+            scope.__playgta6LastFaultRecord = cloneFaultRecord(faultRecord);
+          } catch {
+            // Ignore non-writable scope property.
+          }
+        }
+      }
+      // Emit synchronously to console.error BEFORE std::abort() can tear down the pthread worker
+      // so Chrome CDP captures the complete [fault-record] line even if IPC ports close immediately.
+      emitFaultRecordConsoleError(label, pthreadConsoleObj);
+      // Deliver directly over BroadcastChannel('game-progress') so main-thread BootTracer receives
+      // [fault-record] immediately even if coordinator txPort is closed on worker error/abort.
+      const broadcastSent = postBroadcastOnce(
+        BroadcastChannelCtor,
+        PROGRESS_CHANNEL_NAME,
+        payload,
+      );
+      let txSent = false;
+      if (txPort && !txPortClosed) {
+        try {
+          txPort.postMessage({
+            type: PTHREAD_TX_MSG_FAULT_RECORD,
+            faultRecord: faultRecord ? cloneFaultRecord(faultRecord) : null,
+            label,
+            rawLine: label,
+            workerName: pthreadWorkerName,
+            broadcastSent,
+            consoleEmitted: true,
+          });
+          txSent = true;
+        } catch {
+          closeTxPort();
+        }
+      }
+      return broadcastSent || txSent;
+    }
     if (txPort && !txPortClosed) {
       try {
         txPort.postMessage({ type: PTHREAD_TX_MSG_PROGRESS, payload });
@@ -2811,6 +3268,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     getHttpfsSab: () => attachedHttpfsSab,
     attachTxPort,
     hasTxPort: () => Boolean(txPort && !txPortClosed),
+    getLastFaultRecord: () => (lastPthreadFaultRecord ? cloneFaultRecord(lastPthreadFaultRecord) : null),
     getSharedModules: () => pthreadSharedModulesList.slice(),
     getSharedModuleByName: (name) =>
       pthreadSharedModulesByName.get(normalizeSharedModuleName(name)) || null,
@@ -7736,32 +8194,104 @@ function createMemfsPipelineDumpSyncer(options = {}) {
     return found;
   }
 
-  async function runFlushPass() {
-    if (!enabled) {
-      return getStats();
+  function snapshotPendingFiles(fsObj) {
+    if (!fsObj) {
+      return [];
     }
-    const fsObj = resolveFs();
-    if (!fsObj || !fetchFn) {
-      lastFlushAtMs = nowFn();
-      pendingCount = 0;
-      return getStats();
-    }
-
     const allFiles = collectDumpFiles(fsObj);
-    const toUpload = [];
+    const snapshotted = [];
     for (let i = 0; i < allFiles.length; i += 1) {
       const item = allFiles[i];
       const prevSize = uploadedSizes.get(item.relpath);
       if (prevSize !== undefined && item.sizeBytes !== null && prevSize === item.sizeBytes) {
         continue;
       }
-      toUpload.push(item);
+      const copy = {
+        relpath: item.relpath,
+        fullPath: item.fullPath,
+        sizeBytes: item.sizeBytes,
+      };
+      try {
+        const raw = fsObj.readFile(item.fullPath);
+        copy.prefetchedBytes = toUint8ArrayCopy(raw);
+      } catch {
+        copy.prefetchFailed = true;
+      }
+      snapshotted.push(copy);
+    }
+    return snapshotted;
+  }
+
+  async function runFlushPass(passOptions = {}) {
+    if (!enabled) {
+      return getStats();
+    }
+    const preSnapshotted =
+      passOptions && Array.isArray(passOptions.preSnapshottedItems)
+        ? passOptions.preSnapshottedItems
+        : null;
+    const fsObj = resolveFs();
+    if ((!fsObj && (!preSnapshotted || preSnapshotted.length === 0)) || !fetchFn) {
+      lastFlushAtMs = nowFn();
+      pendingCount = 0;
+      return getStats();
+    }
+
+    const toUpload = [];
+    const seenRelpaths = new Set();
+    if (fsObj) {
+      const allFiles = collectDumpFiles(fsObj);
+      for (let i = 0; i < allFiles.length; i += 1) {
+        const item = allFiles[i];
+        const prevSize = uploadedSizes.get(item.relpath);
+        if (prevSize !== undefined && item.sizeBytes !== null && prevSize === item.sizeBytes) {
+          continue;
+        }
+        seenRelpaths.add(item.relpath);
+        toUpload.push(item);
+      }
+    }
+    if (preSnapshotted) {
+      for (let i = 0; i < preSnapshotted.length; i += 1) {
+        const snap = preSnapshotted[i];
+        const snapSize =
+          snap.prefetchedBytes instanceof Uint8Array
+            ? snap.prefetchedBytes.byteLength
+            : snap.sizeBytes;
+        const prevSize = uploadedSizes.get(snap.relpath);
+        if (prevSize !== undefined && snapSize !== null && prevSize === snapSize) {
+          continue;
+        }
+        if (!seenRelpaths.has(snap.relpath)) {
+          seenRelpaths.add(snap.relpath);
+          toUpload.push(snap);
+        }
+      }
+      toUpload.sort(compareDumpCandidates);
     }
 
     if (toUpload.length === 0) {
       pendingCount = 0;
       lastFlushAtMs = nowFn();
       return getStats();
+    }
+
+    const snapshotFiles = Boolean(passOptions && passOptions.snapshotFiles === true);
+    if (snapshotFiles && fsObj) {
+      // Synchronously read all pending MEMFS files before the first await so teardown/onAbort
+      // cannot lose queued files beyond maxConcurrentUploads.
+      for (let i = 0; i < toUpload.length; i += 1) {
+        const item = toUpload[i];
+        if (item.prefetchedBytes instanceof Uint8Array || item.prefetchFailed) {
+          continue;
+        }
+        try {
+          const raw = fsObj.readFile(item.fullPath);
+          item.prefetchedBytes = toUint8ArrayCopy(raw);
+        } catch {
+          item.prefetchFailed = true;
+        }
+      }
     }
 
     let remainingOrInFlight = toUpload.length;
@@ -7771,15 +8301,25 @@ function createMemfsPipelineDumpSyncer(options = {}) {
 
     async function uploadOne(item) {
       let bytes;
-      try {
-        const raw = fsObj.readFile(item.fullPath);
-        bytes = toUint8ArrayCopy(raw);
-      } catch {
+      if (item.prefetchedBytes instanceof Uint8Array) {
+        bytes = item.prefetchedBytes;
+      } else if (item.prefetchFailed) {
         uploadErrors += 1;
         failedInPass += 1;
         remainingOrInFlight = Math.max(0, remainingOrInFlight - 1);
         pendingCount = remainingOrInFlight + failedInPass;
         return;
+      } else {
+        try {
+          const raw = fsObj.readFile(item.fullPath);
+          bytes = toUint8ArrayCopy(raw);
+        } catch {
+          uploadErrors += 1;
+          failedInPass += 1;
+          remainingOrInFlight = Math.max(0, remainingOrInFlight - 1);
+          pendingCount = remainingOrInFlight + failedInPass;
+          return;
+        }
       }
 
       const actualSize = bytes.byteLength;
@@ -7842,8 +8382,8 @@ function createMemfsPipelineDumpSyncer(options = {}) {
     return getStats();
   }
 
-  function startFlushPass() {
-    const p = runFlushPass().finally(() => {
+  function startFlushPass(passOptions) {
+    const p = runFlushPass(passOptions).finally(() => {
       if (activeFlush === p) {
         activeFlush = null;
       }
@@ -7852,17 +8392,64 @@ function createMemfsPipelineDumpSyncer(options = {}) {
     return p;
   }
 
-  function flush() {
+  let queuedSnapshotFiles = false;
+  let queuedPreSnapshottedByRelpath = null;
+
+  function mergePreSnapshottedItems(items) {
+    if (!Array.isArray(items) || items.length === 0) {
+      return;
+    }
+    if (!queuedPreSnapshottedByRelpath) {
+      queuedPreSnapshottedByRelpath = new Map();
+    }
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      if (!item || !item.relpath) {
+        continue;
+      }
+      const existing = queuedPreSnapshottedByRelpath.get(item.relpath);
+      if (
+        !existing ||
+        item.prefetchedBytes instanceof Uint8Array ||
+        !(existing.prefetchedBytes instanceof Uint8Array)
+      ) {
+        queuedPreSnapshottedByRelpath.set(item.relpath, item);
+      }
+    }
+  }
+
+  function flush(flushOptions) {
     if (!enabled) {
       return Promise.resolve(getStats());
     }
+    const wantsSnapshot = Boolean(flushOptions && flushOptions.snapshotFiles === true);
     if (!activeFlush) {
-      return startFlushPass();
+      return startFlushPass(wantsSnapshot ? { snapshotFiles: true } : undefined);
+    }
+    if (wantsSnapshot) {
+      queuedSnapshotFiles = true;
+      const fsObj = resolveFs();
+      if (fsObj) {
+        mergePreSnapshottedItems(snapshotPendingFiles(fsObj));
+      }
     }
     if (!queuedFlush) {
       queuedFlush = activeFlush.then(() => {
+        const nextSnapshot = queuedSnapshotFiles;
+        const nextPreSnapshotted = queuedPreSnapshottedByRelpath
+          ? Array.from(queuedPreSnapshottedByRelpath.values())
+          : null;
+        queuedSnapshotFiles = false;
+        queuedPreSnapshottedByRelpath = null;
         queuedFlush = null;
-        return startFlushPass();
+        return startFlushPass(
+          nextSnapshot || (nextPreSnapshotted && nextPreSnapshotted.length > 0)
+            ? {
+                snapshotFiles: nextSnapshot,
+                preSnapshottedItems: nextPreSnapshotted,
+              }
+            : undefined,
+        );
       });
     }
     return queuedFlush;
@@ -7904,7 +8491,7 @@ function createMemfsPipelineDumpSyncer(options = {}) {
     if (!enabled) {
       return Promise.resolve(getStats());
     }
-    return flush();
+    return flush({ snapshotFiles: true });
   }
 
   return {
@@ -8006,9 +8593,85 @@ function buildRuntimeModuleConfig(options = {}) {
     typeof options.log === 'function' ? options.log : (msg) => activeReportFn(`[wasm] ${msg}`);
   const userOnFirstPresent =
     typeof options.onFirstPresent === 'function' ? options.onFirstPresent : null;
+  const userOnFaultRecord =
+    typeof options.onFaultRecord === 'function' ? options.onFaultRecord : null;
+  const userPrint = typeof options.print === 'function' ? options.print : null;
+  const userPrintErr = typeof options.printErr === 'function' ? options.printErr : null;
+  const configConsoleObj =
+    options.console && typeof options.console.error === 'function'
+      ? options.console
+      : typeof console !== 'undefined'
+        ? console
+        : null;
+  const configPostToMain =
+    typeof options.postToMain === 'function'
+      ? options.postToMain
+      : typeof coordinatorPostToMain === 'function'
+        ? coordinatorPostToMain
+        : null;
   let audioRingController = null;
+  let lastModuleFaultRecord = null;
+  let lastModuleFaultRecordLine = null;
+  let lastModuleFaultRecordConsoleLine = null;
+  let flushPipelineDumpInternal = () => Promise.resolve(null);
+
+  const captureModuleFaultRecord = (rawText, meta = {}) => {
+    if (typeof rawText !== 'string' || !isFaultRecordLine(rawText)) {
+      return null;
+    }
+    const parsed = parseFaultRecordLine(rawText);
+    if (!parsed) {
+      return null;
+    }
+    const formattedLine = rawText.includes('[wasm]') ? rawText : `[wasm] ${rawText}`;
+    lastModuleFaultRecord = cloneFaultRecord(parsed);
+    lastModuleFaultRecordLine = formattedLine;
+
+    const alreadyEmittedConsole = lastModuleFaultRecordConsoleLine === formattedLine;
+    if (!alreadyEmittedConsole) {
+      lastModuleFaultRecordConsoleLine = formattedLine;
+      emitFaultRecordConsoleError(formattedLine, configConsoleObj);
+    }
+
+    if (userOnFaultRecord) {
+      try {
+        userOnFaultRecord(cloneFaultRecord(parsed), {
+          rawLine: formattedLine,
+          source: meta.source || 'wasm',
+          onAbort: meta.onAbort === true,
+        });
+      } catch {
+        // Fault-record observer errors must never interfere with capture.
+      }
+    }
+
+    recordCoordinatorFaultRecord(parsed, {
+      rawLine: formattedLine,
+      label: formattedLine,
+      source: meta.source || 'wasm',
+      onAbort: meta.onAbort === true,
+      console: configConsoleObj,
+      consoleEmitted: true,
+      postToMain: configPostToMain,
+      flushDumps: false,
+    });
+
+    try {
+      const p = flushPipelineDumpInternal({ snapshotFiles: true });
+      if (p && typeof p.catch === 'function') {
+        p.catch(() => {});
+      }
+    } catch {
+      // Dump flush must never disrupt fault-record delivery.
+    }
+
+    return cloneFaultRecord(parsed);
+  };
 
   const logFn = (msg) => {
+    if (typeof msg === 'string' && isFaultRecordLine(msg)) {
+      captureModuleFaultRecord(msg, { source: 'host_log' });
+    }
     if (
       audioRingController &&
       !audioRingController.isAttached() &&
@@ -8168,8 +8831,33 @@ function buildRuntimeModuleConfig(options = {}) {
     if (!pipelineDumpSyncer || !pipelineDumpSyncer.enabled) {
       return Promise.resolve(pipelineDumpSyncer ? pipelineDumpSyncer.getStats() : null);
     }
+    if (boundModule && boundModule.FS && typeof pipelineDumpSyncer.attachModule === 'function') {
+      try {
+        pipelineDumpSyncer.attachModule(boundModule);
+      } catch {
+        // Ignore attach failures during teardown flush.
+      }
+    }
     try {
       return pipelineDumpSyncer.stop();
+    } catch {
+      return Promise.resolve(pipelineDumpSyncer.getStats());
+    }
+  };
+
+  flushPipelineDumpInternal = (flushOpts) => {
+    if (!pipelineDumpSyncer || !pipelineDumpSyncer.enabled) {
+      return Promise.resolve(pipelineDumpSyncer ? pipelineDumpSyncer.getStats() : null);
+    }
+    if (boundModule && boundModule.FS && typeof pipelineDumpSyncer.attachModule === 'function') {
+      try {
+        pipelineDumpSyncer.attachModule(boundModule);
+      } catch {
+        // Ignore attach failures during explicit flush.
+      }
+    }
+    try {
+      return pipelineDumpSyncer.flush(flushOpts);
     } catch {
       return Promise.resolve(pipelineDumpSyncer.getStats());
     }
@@ -8381,6 +9069,10 @@ function buildRuntimeModuleConfig(options = {}) {
   let instantiatedWasmHandler = null;
 
   const destroyRuntimeConfig = () => {
+    const drainPromise = stopPipelineDumpSyncer();
+    if (drainPromise && typeof drainPromise.catch === 'function') {
+      drainPromise.catch(() => {});
+    }
     stopInputBridge();
     audioRingController.destroy();
     if (
@@ -8394,10 +9086,6 @@ function buildRuntimeModuleConfig(options = {}) {
     attachedGuestMemory = null;
     attachedGuestMemoryWorker = null;
     runtimeExportsSummary = null;
-    const drainPromise = stopPipelineDumpSyncer();
-    if (drainPromise && typeof drainPromise.catch === 'function') {
-      drainPromise.catch(() => {});
-    }
   };
 
   const resetRuntimeConfig = () => {
@@ -8410,6 +9098,55 @@ function buildRuntimeModuleConfig(options = {}) {
   const userOnRuntimeInitialized =
     typeof options.onRuntimeInitialized === 'function' ? options.onRuntimeInitialized : null;
   const userOnExit = typeof options.onExit === 'function' ? options.onExit : null;
+  const userOnAbort = typeof options.onAbort === 'function' ? options.onAbort : null;
+
+  const print = function onPlayGta6Print(text) {
+    const isFault = typeof text === 'string' && isFaultRecordLine(text);
+    if (isFault) {
+      const captured = captureModuleFaultRecord(text, { source: 'print' });
+      if (captured && !userPrint) {
+        try {
+          activeReportFn(text.includes('[wasm]') ? text : `[wasm] ${text}`);
+        } catch {
+          // Ignore progress report failures during print capture.
+        }
+      }
+    }
+    if (userPrint) {
+      return userPrint.apply(this, arguments);
+    }
+    if (!isFault && configConsoleObj && typeof configConsoleObj.log === 'function') {
+      try {
+        configConsoleObj.log(text);
+      } catch {
+        // Ignore console.log failures.
+      }
+    }
+    return undefined;
+  };
+
+  const printErr = function onPlayGta6PrintErr(text) {
+    const isFault = typeof text === 'string' && isFaultRecordLine(text);
+    if (isFault) {
+      captureModuleFaultRecord(text, { source: 'printErr' });
+      try {
+        activeReportFn(text.includes('[wasm]') ? text : `[wasm] ${text}`);
+      } catch {
+        // Ignore progress report failures during printErr capture.
+      }
+    }
+    if (userPrintErr) {
+      return userPrintErr.apply(this, arguments);
+    }
+    if (!isFault && configConsoleObj && typeof configConsoleObj.error === 'function') {
+      try {
+        configConsoleObj.error(text);
+      } catch {
+        // Ignore console.error failures.
+      }
+    }
+    return undefined;
+  };
 
   const onRuntimeInitialized = function onPlayGta6RuntimeInitialized() {
     const mod = this && typeof this === 'object' ? this : boundModule;
@@ -8441,6 +9178,11 @@ function buildRuntimeModuleConfig(options = {}) {
   };
 
   const onExit = function onPlayGta6RuntimeExit() {
+    // Snapshot and flush any pending MEMFS /pg6_dump files BEFORE clearing boundModule.
+    const drainPromise = stopPipelineDumpSyncer();
+    if (drainPromise && typeof drainPromise.catch === 'function') {
+      drainPromise.catch(() => {});
+    }
     stopInputBridge();
     resetAudioRingAttachment();
     if (
@@ -8454,14 +9196,61 @@ function buildRuntimeModuleConfig(options = {}) {
     attachedGuestMemory = null;
     attachedGuestMemoryWorker = null;
     runtimeExportsSummary = null;
-    const drainPromise = stopPipelineDumpSyncer();
-    if (drainPromise && typeof drainPromise.catch === 'function') {
-      drainPromise.catch(() => {});
-    }
     if (userOnExit) {
       return userOnExit.apply(this, arguments);
     }
     return undefined;
+  };
+
+  const onAbort = function onPlayGta6RuntimeAbort(what) {
+    // Immediately flush MEMFS /pg6_dump BEFORE teardown clears boundModule.
+    const drainPromise = stopPipelineDumpSyncer();
+    if (drainPromise && typeof drainPromise.catch === 'function') {
+      drainPromise.catch(() => {});
+    }
+    const whatText = what !== undefined && what !== null ? String(what) : '';
+    if (whatText && isFaultRecordLine(whatText)) {
+      captureModuleFaultRecord(whatText, { source: 'onAbort', onAbort: true });
+      try {
+        activeReportFn(whatText.includes('[wasm]') ? whatText : `[wasm] ${whatText}`);
+      } catch {
+        // Ignore progress report failures during onAbort capture.
+      }
+    } else {
+      const latched = lastModuleFaultRecord || lastCoordinatorFaultRecord;
+      if (latched) {
+        const latchedLine =
+          lastModuleFaultRecordLine ||
+          lastCoordinatorFaultRecordLine ||
+          formatFaultRecordConsoleLine(null, latched);
+        recordCoordinatorFaultRecord(latched, {
+          rawLine: latchedLine,
+          label: latchedLine,
+          source: 'onAbort',
+          onAbort: true,
+          console: configConsoleObj,
+          postToMain: configPostToMain,
+          flushDumps: false,
+        });
+      }
+    }
+    stopInputBridge();
+    resetAudioRingAttachment();
+    if (
+      instantiatedWasmHandler &&
+      typeof instantiatedWasmHandler.releasePendingWireBytes === 'function'
+    ) {
+      instantiatedWasmHandler.releasePendingWireBytes();
+    }
+    boundModule = null;
+    instantiatedMemory = null;
+    attachedGuestMemory = null;
+    attachedGuestMemoryWorker = null;
+    runtimeExportsSummary = null;
+    if (userOnAbort) {
+      return userOnAbort.apply(this, arguments);
+    }
+    return drainPromise;
   };
 
   const userdataApiObj = activeHostImports.userdata || {};
@@ -8469,8 +9258,11 @@ function buildRuntimeModuleConfig(options = {}) {
     mainScriptUrlOrBlob: resolvedRuntimeScriptUrl,
     locateFile,
     preRun,
+    print,
+    printErr,
     onRuntimeInitialized,
     onExit,
+    onAbort,
     env: activeHostImports.env,
     hostImports: activeHostImports,
     httpfsMailboxSab:
@@ -8507,8 +9299,11 @@ function buildRuntimeModuleConfig(options = {}) {
     dispose: destroyRuntimeConfig,
     pipelineDumpSyncer,
     getPipelineDumpSyncer: () => pipelineDumpSyncer,
-    flushPipelineDumps: () => pipelineDumpSyncer.flush(),
+    flushPipelineDumps: (flushOpts) => flushPipelineDumpInternal(flushOpts),
+    flushPipelineDump: (flushOpts) => flushPipelineDumpInternal(flushOpts),
     stopPipelineDumpSyncer,
+    getLastFaultRecord: () =>
+      lastModuleFaultRecord ? cloneFaultRecord(lastModuleFaultRecord) : null,
     hostCallbacks: options.hostCallbacks || {
       log: logFn,
       wgpuSubmit,
@@ -9655,11 +10450,46 @@ function handlePthreadTxMessage(data, _workerName, sourcePort) {
   if (data.type === PTHREAD_TX_MSG_WGPU_SUBMIT) {
     return handlePthreadWgpuSubmit(data, { ownedArrayBuffer: true, sourcePort });
   }
+  if (data.type === PTHREAD_TX_MSG_FAULT_RECORD) {
+    const rawLine =
+      typeof data.rawLine === 'string'
+        ? data.rawLine
+        : typeof data.label === 'string'
+          ? data.label
+          : '';
+    recordCoordinatorFaultRecord(data.faultRecord, {
+      rawLine,
+      label: typeof data.label === 'string' ? data.label : rawLine,
+      source: 'pthread',
+      workerName: typeof data.workerName === 'string' ? data.workerName : _workerName,
+      consoleEmitted: data.consoleEmitted === true,
+    });
+    if (data.broadcastSent !== true && rawLine) {
+      postProgress({ label: rawLine });
+    }
+    return true;
+  }
   if (data.type === PTHREAD_TX_MSG_PROGRESS) {
     if (data.payload && typeof data.payload === 'object') {
+      if (typeof data.payload.label === 'string' && isFaultRecordLine(data.payload.label)) {
+        recordCoordinatorFaultRecord(null, {
+          rawLine: data.payload.label,
+          label: data.payload.label,
+          source: 'pthread',
+          workerName: _workerName,
+        });
+      }
       return postProgress(data.payload);
     }
     if (typeof data.label === 'string') {
+      if (isFaultRecordLine(data.label)) {
+        recordCoordinatorFaultRecord(null, {
+          rawLine: data.label,
+          label: data.label,
+          source: 'pthread',
+          workerName: _workerName,
+        });
+      }
       return postProgress({ label: data.label });
     }
     return false;
@@ -9804,6 +10634,12 @@ function getLoaderStatus() {
     sideModuleCapWarnings: wasmMemoryTelemetry.sideModuleCapWarnings,
     peakWireBytesInFlight: wasmMemoryTelemetry.peakWireBytesInFlight,
     sharedModulesDeliveredToPthreads: wasmMemoryTelemetry.sharedModulesDeliveredToPthreads,
+    lastFaultRecord: getLastFaultRecord(),
+    pipelineDumpStats:
+      activeCoordinatorPipelineDumpSyncer &&
+      typeof activeCoordinatorPipelineDumpSyncer.getStats === 'function'
+        ? activeCoordinatorPipelineDumpSyncer.getStats()
+        : null,
     runtimeExports:
       activeCoordinatorModuleConfig &&
       typeof activeCoordinatorModuleConfig.getRuntimeExportsSummary === 'function'
@@ -9896,6 +10732,32 @@ async function tryBootWasmRuntime() {
           pendingPreloadedGuestBuffers = null;
           activeCoordinatorRuntimeModule = null;
           activeCoordinatorModuleConfig = null;
+        },
+        onAbort: (what) => {
+          if (
+            activeCoordinatorPipelineDumpSyncer &&
+            typeof activeCoordinatorPipelineDumpSyncer.stop === 'function'
+          ) {
+            try {
+              const p = activeCoordinatorPipelineDumpSyncer.stop();
+              if (p && typeof p.catch === 'function') {
+                p.catch(() => {});
+              }
+            } catch {
+              // Ignore dump flush errors during abort teardown.
+            }
+          }
+          coordinatorPthreadPool.closeTxPorts();
+          coordinatorSharedWasmModules.clear();
+          coordinatorAudioBridge.clearPending();
+          if (audioWorker) {
+            resetAttachedRuntimeAudioRing(audioWorker);
+          }
+          pendingPreloadedWasmBinary = null;
+          pendingPreloadedGuestBuffers = null;
+          activeCoordinatorRuntimeModule = null;
+          activeCoordinatorModuleConfig = null;
+          postProgress({ error: `runtime abort: ${what}` });
         },
         getAudioWorker: () => audioWorker,
         isAudioWorkerReady: () => audioWorkerReady,
@@ -10046,6 +10908,7 @@ if (typeof self !== 'undefined') {
 
   const postToMain =
     typeof self.postMessage === 'function' ? (payload) => self.postMessage(payload) : null;
+  coordinatorPostToMain = postToMain;
 
   const wgpuPthreadChannel =
     typeof BroadcastChannel === 'function'
@@ -10118,6 +10981,70 @@ if (typeof self !== 'undefined') {
       }
       return;
     }
+    if (
+      msg.type === FLUSH_PIPELINE_DUMPS_MESSAGE_TYPE ||
+      msg.type === FLUSH_PIPELINE_DUMP_MESSAGE_TYPE ||
+      msg.flushPipelineDumps === true ||
+      msg.flushPipelineDump === true
+    ) {
+      Promise.resolve(flushActiveCoordinatorPipelineDumps({ snapshotFiles: true }))
+        .then((stats) => {
+          if (postToMain) {
+            const payload = {
+              type: PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE,
+              ok: true,
+              stats,
+              timestamp: Date.now(),
+            };
+            if (msg.id !== undefined) {
+              payload.id = msg.id;
+            }
+            try {
+              postToMain(payload);
+            } catch {
+              // Non-fatal dump flush reply failure.
+            }
+          }
+        })
+        .catch((err) => {
+          if (postToMain) {
+            const payload = {
+              type: PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE,
+              ok: false,
+              error: String(err),
+              timestamp: Date.now(),
+            };
+            if (msg.id !== undefined) {
+              payload.id = msg.id;
+            }
+            try {
+              postToMain(payload);
+            } catch {
+              // Non-fatal dump flush error reply failure.
+            }
+          }
+        });
+      return;
+    }
+    if (msg.type === 'request-last-fault-record') {
+      if (postToMain) {
+        const payload = {
+          type: FAULT_RECORD_MESSAGE_TYPE,
+          faultRecord: getLastFaultRecord(),
+          rawLine: lastCoordinatorFaultRecordLine,
+          timestamp: Date.now(),
+        };
+        if (msg.id !== undefined) {
+          payload.id = msg.id;
+        }
+        try {
+          postToMain(payload);
+        } catch {
+          // Non-fatal fault-record query reply failure.
+        }
+      }
+      return;
+    }
     if (msg.type === 'request-gpu-telemetry') {
       if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
         const statsReq = { stats: true };
@@ -10169,6 +11096,14 @@ if (typeof self !== 'undefined') {
         return;
       }
       if (msg.type === 'teardown' || msg.type === 'destroy') {
+        if (activeCoordinatorPipelineDumpSyncer) {
+          try {
+            activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
+          } catch {
+            // Ignore pipeline dump syncer teardown errors.
+          }
+          activeCoordinatorPipelineDumpSyncer = null;
+        }
         coordinatorPthreadPool.closeTxPorts();
         coordinatorSharedWasmModules.clear();
         if (activeCoordinatorInputBridge) {
@@ -10190,14 +11125,6 @@ if (typeof self !== 'undefined') {
             // Ignore module config teardown errors.
           }
         }
-        if (activeCoordinatorPipelineDumpSyncer) {
-          try {
-            activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
-          } catch {
-            // Ignore pipeline dump syncer teardown errors.
-          }
-          activeCoordinatorPipelineDumpSyncer = null;
-        }
         activeCoordinatorRuntimeModule = null;
         activeCoordinatorModuleConfig = null;
         teardownCoordinatorAudioWorker({
@@ -10217,6 +11144,7 @@ if (typeof self !== 'undefined') {
       }
       return;
     }
+    resetLastFaultRecord();
     coordinatorPthreadPool.closeTxPorts();
     if (activeCoordinatorInputBridge) {
       try {
@@ -10463,6 +11391,18 @@ const exportedApi = {
   PTHREAD_TX_MSG_WGPU_SUBMIT,
   PTHREAD_TX_MSG_PROGRESS,
   PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER,
+  PTHREAD_TX_MSG_FAULT_RECORD,
+  FAULT_RECORD_MESSAGE_TYPE,
+  FAULT_RECORD_PREFIX,
+  FLUSH_PIPELINE_DUMPS_MESSAGE_TYPE,
+  FLUSH_PIPELINE_DUMP_MESSAGE_TYPE,
+  PIPELINE_DUMPS_FLUSHED_MESSAGE_TYPE,
+  isFaultRecordLine,
+  parseFaultRecordLine,
+  getLastFaultRecord,
+  resetLastFaultRecord,
+  flushPipelineDump: flushActiveCoordinatorPipelineDumps,
+  flushPipelineDumps: flushActiveCoordinatorPipelineDumps,
   WGPU_CMD_POOL_MIN_BYTES,
   WGPU_CMD_POOL_MAX_BYTES,
   WGPU_CMD_POOL_MAX_BUFFERS,
@@ -10564,6 +11504,13 @@ const exportedApi = {
 
 if (typeof globalThis !== 'undefined') {
   globalThis.PlayGta6Loader = exportedApi;
+  if (typeof globalThis.__pg6FlushDumps !== 'function') {
+    try {
+      globalThis.__pg6FlushDumps = flushActiveCoordinatorPipelineDumps;
+    } catch {
+      // Ignore non-writable globalThis property.
+    }
+  }
 }
 
 if (typeof module !== 'undefined' && module.exports) {
