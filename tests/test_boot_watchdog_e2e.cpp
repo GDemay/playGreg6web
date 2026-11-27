@@ -1,7 +1,9 @@
 // Windows only: runs the real playgta6_boot (no game) through its watchdog path. A tiny synthetic
 // image is booted with --test-stall (a test seam: the boot thread hangs once the boot is active),
 // then --watchdog-ms fires: all-thread stacks on stderr, an all-thread minidump, the boot report
-// with fault_record.minidump, exit 10 -- all within a time bound.
+// with fault_record.minidump, exit 10 -- all within a time bound. A second case adds
+// --test-stall-report (the report path hangs too): the exit backstop (#1988) must end the run
+// with exit 10 and write host-fault-report_stuck-<pid>.dmp, which minidump_stack.py parses.
 // Usage: test_boot_watchdog_e2e <playgta6_boot.exe> [minidump_stack.py]
 #ifdef _WIN32
 #include "os/image_loader.h"
@@ -91,6 +93,59 @@ static int fail(const std::string& what, const std::string& detail) {
     return 1;
 }
 
+static int run_backstop_case(const char* exe, const char* script, const std::string& dir, const std::string& pgim) {
+    const std::string report = dir + "report_stuck.json", err_path = dir + "stderr_stuck.txt";
+    constexpr DWORD kWatchdogMs = 3000, kBackstopMs = 2000, kMaxMs = 60000;
+    std::string cmd = std::string("\"") + exe + "\" --pgim \"" + pgim + "\" --report \"" + report +
+                      "\" --watchdog-ms " + std::to_string(kWatchdogMs) + " --quiet --test-stall-report";
+    SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+    HANDLE err = CreateFileA(err_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = err;
+    si.hStdError = err;
+    PROCESS_INFORMATION pi{};
+    const DWORD t0 = GetTickCount();
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+        return fail("backstop: CreateProcess", cmd);
+    CloseHandle(err);
+    const bool exited = WaitForSingleObject(pi.hProcess, kMaxMs) == WAIT_OBJECT_0;
+    const DWORD elapsed = GetTickCount() - t0;
+    DWORD code = 0;
+    GetExitCodeProcess(pi.hProcess, &code);
+    if (!exited) TerminateProcess(pi.hProcess, 99);
+    const DWORD pid = pi.dwProcessId;
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    const std::string child_err = slurp(err_path);
+    if (!exited) return fail("backstop: still running after the bound", child_err);
+    if (code != 10 || elapsed < kWatchdogMs + kBackstopMs)
+        return fail("backstop: exit " + std::to_string(code) + " after " + std::to_string(elapsed) +
+                        " ms, want 10 after >= watchdog + backstop",
+                    child_err);
+    if (!has(child_err, "[harness] exit backstop: terminating"))
+        return fail("backstop: stderr text missing", child_err);
+    const std::string dump = dir + "host-fault-report_stuck-" + std::to_string(pid) + ".dmp";
+    std::ifstream df(dump, std::ios::binary | std::ios::ate);
+    const long long size = df ? static_cast<long long>(df.tellg()) : -1;
+    df.close();
+    if (size <= 1024) return fail("backstop: dump missing or empty", dump + " size " + std::to_string(size));
+    if (script != nullptr) {
+        const std::string out = dump + ".txt";
+        const std::string py =
+            std::string("python -I \"") + script + "\" \"" + dump + "\" --all-threads > \"" + out + "\"";
+        if (std::system(py.c_str()) != 0) return fail("backstop: minidump_stack.py failed", slurp(out));
+        const std::string text = slurp(out);
+        if (!has(text, "thread ") || !has(text, "playgta6_boot.exe+0x"))
+            return fail("backstop: parsed dump lacks stacks", text);
+    }
+    std::printf("boot backstop e2e OK (%lu ms, dump %lld bytes)\n", static_cast<unsigned long>(elapsed), size);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 2) return 2;
     const char* script = argc > 2 ? argv[2] : nullptr;
@@ -160,7 +215,7 @@ int main(int argc, char** argv) {
         if (!has(text, "thread ") || !has(text, "playgta6_boot.exe+0x")) return fail("parsed dump lacks stacks", text);
     }
     std::printf("boot watchdog e2e OK (%lu ms, dump %lld bytes)\n", static_cast<unsigned long>(elapsed), size);
-    return 0;
+    return run_backstop_case(argv[1], script, dir, pgim);
 }
 #else
 int main() { return 0; }
