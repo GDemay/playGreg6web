@@ -42,7 +42,7 @@ def main():
             if len({s[key] for variant in samples.values() for s in variant}) != 1:
                 raise RuntimeError('baseline/patch PCM output differs: ' + key)
         cases.append({'subframe': size, 'channels': channels, 'kind': kind,
-                      'unchangedControl': kind != 'nonzero', 'samples': samples})
+                      'controlWorkload': kind != 'nonzero', 'samples': samples})
     print(json.dumps({
         'benchmark': 'synthetic native public WMA Pro FrameDecoder decode',
         'baselineCommit': args.baseline_commit, 'patchCommit': args.patch_commit,
