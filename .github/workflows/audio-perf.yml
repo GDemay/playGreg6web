@@ -41,10 +41,18 @@ jobs:
             c++ -std=c++20 -O3 -DNDEBUG -I"$tree/runtime" byte/tests/test_xma_decoder.cpp "$tree/runtime/os/xma_decoder.cpp" "$tree/runtime/os/xapu_opus.cpp" -pthread -o "$tree-bin"
             "./$tree-bin"
           done
+          if [ -f byte/tests/test_xma_bitreader.cpp ]; then
+            c++ -std=c++20 -O3 -DNDEBUG -Ibyte/runtime byte/tests/test_xma_bitreader.cpp byte/runtime/os/xapu_opus.cpp -pthread -o bitreader-oracle
+            ./bitreader-oracle
+          fi
       - name: Separate alternating seven-pair measurements
         run: |
           python3 byte/tools/bench_xma_decoder.py ./baseline-bin ./twiddle-bin --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.twiddle_ref }}" --samples 7 > results/twiddle.json
-          python3 byte/tools/bench_xma_decoder.py ./baseline-bin ./byte-bin --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.byte_ref }}" --samples 7 > results/byte.json
+          if [ '${{ inputs.twiddle_ref }}' = '${{ inputs.byte_ref }}' ]; then
+            mv results/twiddle.json results/combined.json
+          else
+            python3 byte/tools/bench_xma_decoder.py ./baseline-bin ./byte-bin --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.byte_ref }}" --samples 7 > results/byte.json
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
