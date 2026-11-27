@@ -228,6 +228,8 @@ public:
     bool flush_indexed = false;
     bool flush_primed = false;
     uint64_t flush_visit_seq = 0;
+    uint64_t flush_last_compare_seq = 0;
+    uint64_t flush_order = 0;  // stable tracking order for deterministic upload packet order
     // O36: the flush indexes a buffer by window slot once its write marks are in use; it is then
     // only flushed when one of its slots is marked.
     bool window_marks_in_use() const { return window_marked_ && cpu_va_ != 0 && shadow_size_ != 0; }

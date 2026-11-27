@@ -1293,6 +1293,10 @@ private:
     uint64_t next_fake_va_ = kFakeGpuVaBase;
     std::mutex tracked_mutex_;
     std::vector<Resource*> tracked_;
+    // The only buffers an indexed flush must visit without a dirty-page report.
+    std::unordered_set<Resource*> buffer_unprimed_;  // under tracked_mutex_
+    uint64_t next_buffer_flush_order_ = 0;
+    os::WriteCursor buffer_skip_cursor_{};  // last indexed take; applied lazily on a skipped buffer's next visit
     os::guest_window::SlotIndex slot_index_;  // O36: window slot -> tracked buffers (under tracked_mutex_)
     // #1963: host pages -> tracked buffers (under tracked_mutex_) and relocated uniform ranges (under
     // relocation_mutex_), for native flushes driven by the OS write tracking (flush_cpu_buffers).

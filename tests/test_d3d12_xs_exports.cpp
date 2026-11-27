@@ -9554,9 +9554,13 @@ void test_native_flush_page_index() {
         } else {
             CHECK(dg::work_total(dg::Work::FlushBuffersSkipped) == skipped_b0);
         }
+        // A long clean interval must lazily advance a skipped buffer's effective write cursor.
+        // A later write to a different page must not re-compare the older page reports.
+        for (int clean = 0; clean < 12; ++clean) CHECK(flush().empty());
         // One page of A: only that page is uploaded, B and the uniform range stay skipped.
         CHECK(com::write_guest(mem + 2 * kPage + 8, two));
         CHECK(only(flush(), id_a, static_cast<uint32_t>(2 * kPage)));
+        for (int clean = 0; clean < 8; ++clean) CHECK(flush().empty());
         // The straddling tail of A (its fourth page).
         CHECK(com::write_guest(mem + 3 * kPage + 96, one));
         CHECK(only(flush(), id_a, static_cast<uint32_t>(3 * kPage)));
@@ -9632,6 +9636,12 @@ void test_native_flush_page_index() {
         }
         CHECK(flush().empty());
         CHECK(dg::work_total(dg::Work::FlushCrosscheckMisses) == misses0);
+        // Switching modes invalidates candidate state and re-primes every buffer.
+        dg::set_flush_mode(dg::FlushMode::Full);
+        CHECK(flush().empty());
+        dg::set_flush_mode(mode);
+        CHECK(flush().empty());
+        CHECK(flush().empty());
         // A buffer released between flushes leaves the index (no stale key is visited), and the
         // uniform range inside it, no longer covered by a take, is compared again.
         fx.vcall(b, Slot::Release);

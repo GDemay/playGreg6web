@@ -951,6 +951,8 @@ uint64_t Device::allocate_gpu_va(uint64_t size) {
 void Device::track_cpu_buffer(Resource* resource) {
     std::lock_guard<std::mutex> lock(tracked_mutex_);
     tracked_.push_back(resource);
+    resource->flush_order = next_buffer_flush_order_++;
+    buffer_unprimed_.insert(resource);
 }
 
 void Device::untrack_cpu_buffer(Resource* resource) {
@@ -959,6 +961,7 @@ void Device::untrack_cpu_buffer(Resource* resource) {
     slot_index_.remove(resource);
     buffer_page_index_.remove(resource);
     crosscheck_buffers_.erase(resource);
+    buffer_unprimed_.erase(resource);
     resource->flush_indexed = false;
     resource->flush_primed = false;
 }
@@ -2395,7 +2398,10 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             std::lock_guard<std::mutex> lock(tracked_mutex_);
             buffer_page_index_.clear();
             crosscheck_buffers_.clear();
+            buffer_unprimed_.clear();
+            buffer_skip_cursor_ = flush_cursor_;
             for (Resource* r : tracked_) {
+                buffer_unprimed_.insert(r);
                 r->flush_indexed = false;
                 r->flush_primed = false;
             }
@@ -2444,15 +2450,22 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             // (Indexed buffers lie inside take_ranges.)
             host_ranges.reserve(take_ranges.size() + (indexed ? 64u : tracked_.size()));
             host_ranges.insert(host_ranges.end(), take_ranges.begin(), take_ranges.end());
-            for (Resource* r : tracked_) {
+            // Primed indexed buffers already lie in take_ranges; walking all of them here
+            // defeats the dirty-page index even when no guest bytes changed.
+            auto add_buffer_range = [&](Resource* r) {
                 if (r->cpu_address() == 0 || r->shadow_bytes() == 0 || (indexed && r->flush_indexed)) {
-                    continue;
+                    return;
                 }
                 if (const auto* live = static_cast<const uint8_t*>(
                         com::guest_to_host(r->cpu_address(), static_cast<size_t>(r->shadow_bytes())))) {
                     host_ranges.emplace_back(reinterpret_cast<uintptr_t>(live),
                                              reinterpret_cast<uintptr_t>(live) + static_cast<uintptr_t>(r->shadow_bytes()));
                 }
+            };
+            if (indexed) {
+                for (Resource* r : buffer_unprimed_) add_buffer_range(r);
+            } else {
+                for (Resource* r : tracked_) add_buffer_range(r);
             }
             const auto add_range = [&](uint64_t cpu, uint64_t size) {
                 if (const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(size)))) {
@@ -2508,21 +2521,34 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                     }
                 }
                 crosscheck_buffers_.clear();
-                uint64_t visited = 0, skipped = 0, untracked = 0;
-                for (Resource* r : tracked_) {
+                std::vector<Resource*> candidates;
+                if (crosscheck) {
+                    candidates = tracked_;
+                } else {
+                    candidates.reserve(visit.size() + buffer_unprimed_.size());
+                    for (const void* key : visit) candidates.push_back(const_cast<Resource*>(static_cast<const Resource*>(key)));
+                    candidates.insert(candidates.end(), buffer_unprimed_.begin(), buffer_unprimed_.end());
+                    std::sort(candidates.begin(), candidates.end(), [](const Resource* a, const Resource* b) {
+                        return a->flush_order < b->flush_order;
+                    });
+                    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+                }
+                uint64_t visited = 0, skipped = tracked_.size() - candidates.size(), untracked = 0;
+                for (Resource* r : candidates) {
                     if (r->cpu_address() == 0 || r->shadow_bytes() == 0) {
                         continue;
                     }
                     const bool skip = r->flush_primed && r->flush_visit_seq != seq;
-                    if (skip && !crosscheck) {
-                        // No page of it written since `from`: its own next take may start at `to`.
-                        r->advance_write_cursor(to);
-                        ++skipped;
-                        continue;
+                    // Clean indexed buffers need no object touch. On their next actual visit,
+                    // apply the position the last skipped flush would have stored. Do not rewind
+                    // an entry compared in the immediately preceding flush (its own take can be newer).
+                    if (r->flush_primed && r->flush_last_compare_seq + 1 < seq) {
+                        r->advance_write_cursor(buffer_skip_cursor_);
                     }
                     r->set_slot_indexed(false);
                     const uint64_t uploaded = r->flush_shadow(encoder, &mark_pass_);
                     ++visited;
+                    r->flush_last_compare_seq = seq;
                     if (skip) {
                         ++skipped;
                         if (uploaded != 0) {
@@ -2540,7 +2566,10 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                         r->flush_primed = false;
                         ++untracked;
                     }
+                    if (r->flush_primed) buffer_unprimed_.erase(r);
+                    else buffer_unprimed_.insert(r);
                 }
+                buffer_skip_cursor_ = to;
                 count_work(Work::FlushBuffersVisited, visited);
                 count_work(Work::FlushBuffersSkipped, skipped);
                 count_work(Work::FlushBuffersUntracked, untracked);
