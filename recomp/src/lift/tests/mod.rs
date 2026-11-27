@@ -12,6 +12,7 @@ mod exec_unwind;
 mod exec_x87;
 mod flags_across_calls;
 mod registers_across_calls;
+mod state_boundary;
 #[cfg(target_arch = "x86_64")]
 mod host_diff;
 #[cfg(target_arch = "x86_64")]
