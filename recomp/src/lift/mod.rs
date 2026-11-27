@@ -771,6 +771,21 @@ pub fn emit_module_with_dispatch(
         out.push('\n');
         out.push_str(text);
     }
+    // The variable header/helpers are already emitted. Reserve known definitions
+    // plus final attributes/metadata and a bound for dispatcher text and linkage.
+    let function_bytes = sorted.iter().fold(0usize, |n, f| {
+        n.saturating_add(f.ir.len()).saturating_add(1)
+    });
+    let dispatch_bytes = dispatch.map_or(0, |d| {
+        sorted.iter().enumerate().fold(d.dispatcher_symbol.len(), |n, (i, f)| {
+            // 72 fixed dispatcher bytes + at most 22 linkage bytes, and three indices.
+            let digits = i.checked_ilog10().unwrap_or(0) as usize + 1;
+            n.saturating_add(f.symbol.len()).saturating_add(94 + 3 * digits)
+        })
+    });
+    if function_bytes.saturating_add(dispatch_bytes) > out.capacity() {
+        out.reserve(function_bytes.saturating_add(dispatch_bytes).saturating_add(1024));
+    }
     for func in &sorted {
         out.push('\n');
         match dispatch {

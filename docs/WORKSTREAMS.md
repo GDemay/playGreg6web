@@ -89,6 +89,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 ---
 
+- [ ] **Performance #2155 — Module emission buffer capacity** — `IN PROGRESS` (@GDemay; synthetic inputs, no game assets). Reserve known function text after the actual header/helper prefix, including symbol lengths and decimal-index/linkage bounds for default dispatch. Complete byte-output oracles cover dispatch, tiny-function batches, long symbols, raw IR and no-dispatch controls; fresh requested allocation/capacity evidence and required checks pending. No LLVM compilation, RSS, browser, or FPS improvement claimed.
+
 ## Track 2: Xbox / Win32 OS Shims (`runtime/os/`, C++20 + Emscripten)
 **Goal:** Reimplement console OS APIs backed by browser workers, pthreads, and HTTPFS.
 
