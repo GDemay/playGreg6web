@@ -88,6 +88,8 @@ test('RT_BVH_PRELUDE_VERSION and RT_BVH_PRELUDE_WGSL match C++ runtime/gpu/rt_bv
   const cppPrelude = extractCppPreludeWgsl(cppSrc);
   assert.equal(RT_BVH_PRELUDE_WGSL, cppPrelude);
   assert.ok(RT_BVH_PRELUDE_WGSL.includes('fn pg6_load32(addr: vec2<u32>) -> u32'));
+  assert.ok(RT_BVH_PRELUDE_WGSL.includes('fn pg6_resolve(addr: vec2<u32>) -> u32'));
+  assert.ok(RT_BVH_PRELUDE_WGSL.includes('fn pg6_isnan(x: f32) -> bool'));
   assert.ok(RT_BVH_PRELUDE_WGSL.includes('fn pg6_bvh_intersect('));
   assert.ok(RT_BVH_PRELUDE_WGSL.includes('@group(3) @binding(16)'));
   assert.ok(RT_BVH_PRELUDE_WGSL.includes('@group(3) @binding(21)'));
@@ -336,4 +338,30 @@ test('wgsl_pack_loader WgslPackCache applies RT BVH prelude on sync and ranged a
   assert.equal(asyncMock.shaderModules.length, 2);
   assert.equal(asyncMock.shaderModules[0].code, applyRtBvhPrelude(rtWgsl));
   assert.equal(asyncMock.shaderModules[1].code, normalWgsl);
+});
+
+test('applyRtBvhPrelude strips leading UTF-8 BOM and ignores RT helper names inside comments', () => {
+  // Leading UTF-8 BOM without directives must not be embedded mid-shader.
+  const bomNoDir = '\uFEFF@compute @workgroup_size(1) fn main() { _ = pg6_load32(vec2<u32>(0u)); }';
+  const outBomNoDir = applyRtBvhPrelude(bomNoDir);
+  assert.equal(outBomNoDir.indexOf('\uFEFF'), -1, 'BOM must not appear mid-shader');
+  assert.ok(outBomNoDir.startsWith(RT_BVH_PRELUDE_WGSL));
+
+  // Leading UTF-8 BOM with directives also produces clean WGSL without embedded BOM.
+  const bomWithDir = '\uFEFFenable f16;\n@compute @workgroup_size(1) fn main() { _ = pg6_load32(vec2<u32>(0u)); }';
+  const outBomWithDir = applyRtBvhPrelude(bomWithDir);
+  assert.equal(outBomWithDir.indexOf('\uFEFF'), -1, 'BOM must be stripped cleanly');
+  assert.ok(outBomWithDir.startsWith('enable f16;\n' + RT_BVH_PRELUDE_WGSL));
+
+  // Commented-out RT helper calls must NOT trigger prelude injection.
+  const commentedCall =
+    '// pg6_load32(vec2<u32>(0u))\n/* nested /* pg6_bvh_intersect(a) */ comment */\n@compute @workgroup_size(1) fn main() {}';
+  assert.equal(needsRtBvhPrelude(commentedCall), false);
+  assert.equal(applyRtBvhPrelude(commentedCall), commentedCall);
+
+  // Commented-out helper definition must NOT suppress injection when real code calls pg6_load32.
+  const commentedDef =
+    '/* fn pg6_load32(addr: vec2<u32>) -> u32 { return 0u; } */\n@compute @workgroup_size(1) fn main() { _ = pg6_load32(vec2<u32>(0u)); }';
+  assert.equal(needsRtBvhPrelude(commentedDef), true);
+  assert.ok(applyRtBvhPrelude(commentedDef).startsWith(RT_BVH_PRELUDE_WGSL));
 });

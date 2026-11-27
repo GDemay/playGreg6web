@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -90,7 +91,7 @@ public:
     ReadbackGate& operator=(const ReadbackGate&) = delete;
 
     // Host address of the u32 completion counter (the packets' done_addr).
-    uint64_t done_address() const { return reinterpret_cast<uintptr_t>(&done_); }
+    uint64_t done_address() const { return reinterpret_cast<uintptr_t>(&state_->done_); }
 
     // Issues one read-back that will write `bytes` at guest address `guest_va`; returns its 1-based
     // 32-bit sequence number (for packet headers). The range is marked written (guest_window) when
@@ -131,7 +132,7 @@ public:
     // Non-blocking counts of currently pending and total completed readbacks (64-bit wrap-safe).
     uint64_t pending_count() const;
     uint64_t completed_count() const;
-    size_t ring_capacity() const { return ring_capacity_; }
+    size_t ring_capacity() const { return state_->ring_capacity_; }
 
     // Optional consumer hint: wakes the background poller immediately with minimum latency.
     void notify();
@@ -166,37 +167,49 @@ private:
         uint32_t tag = 0;
         std::function<void()> on_complete;
     };
-    uint64_t peek_completed_locked() const;
-    uint64_t completed_locked();
+    // Shared state outlives ReadbackGate if destruction occurs on the poller thread from inside a
+    // parked callback (avoids self-join std::terminate() and post-callback UAF).
+    struct State {
+        const std::chrono::milliseconds timeout_;
+        const size_t ring_capacity_;
+        const bool hold_;
+        alignas(8) std::atomic<uint32_t> done_{0};
+        mutable std::mutex mutex_;
+        std::condition_variable cv_;
+        bool stop_ = false;
+        bool releasing_ = false;
+        std::thread::id releasing_thread_{};
+        uint64_t wake_gen_ = 0;
+        uint64_t issued_ = 0;
+        uint64_t bytes_ = 0;
+        uint64_t seen_ = 0;           // completions whose ranges were marked written
+        uint64_t reported_seen_ = 0;  // consumer completions already counted
+        uint64_t done_wraps_ = 0;     // high 32 bits of the u32 counter
+        uint32_t done_last_ = 0;
+        uint64_t timeouts_ = 0;
+        uint64_t signals_held_ = 0;
+        uint64_t pending_high_water_ = 0;
+        uint64_t ring_overflows_ = 0;
+        std::array<uint64_t, kKindCount> issued_by_kind_{};
+        std::array<uint64_t, kKindCount> completed_by_kind_{};
+        std::array<uint64_t, kKindCount> bytes_by_kind_{};
+        std::vector<ReadbackSlot> ring_;          // fixed-size metadata ring indexed by seq % ring_capacity_
+        std::deque<PendingRange> ranges_;         // issued, not yet marked written
+        std::deque<ReadbackSlot> completed_ring_; // bounded FIFO of newly completed slots for drain_completed_slots
+        std::deque<Parked> parked_;
+
+        State(bool hold, std::chrono::milliseconds timeout, size_t ring_capacity)
+            : timeout_(timeout), ring_capacity_(ring_capacity), hold_(hold), ring_(ring_capacity) {}
+    };
+    static uint64_t peek_completed_locked(const State& st);
+    static uint64_t completed_locked(State& st);
+    static size_t poll_state(State& st);
     void start_poller_locked();
     ReadbackSlot issue_slot_impl(uint64_t guest_va, uint64_t bytes, ReadbackKind kind, uint32_t tag,
                                  std::function<void()> on_complete = {});
 
-    const std::chrono::milliseconds timeout_;
-    const size_t ring_capacity_;
-    alignas(8) std::atomic<uint32_t> done_{0};
-    mutable std::mutex mutex_;
-    std::condition_variable cv_;
-    bool hold_;
-    bool stop_ = false;
-    uint64_t wake_gen_ = 0;
-    uint64_t issued_ = 0;
-    uint64_t bytes_ = 0;
-    uint64_t seen_ = 0;           // completions whose ranges were marked written
-    uint64_t reported_seen_ = 0;  // consumer completions already counted
-    uint64_t done_wraps_ = 0;     // high 32 bits of the u32 counter
-    uint32_t done_last_ = 0;
-    uint64_t timeouts_ = 0;
-    uint64_t signals_held_ = 0;
-    uint64_t pending_high_water_ = 0;
-    uint64_t ring_overflows_ = 0;
-    std::array<uint64_t, kKindCount> issued_by_kind_{};
-    std::array<uint64_t, kKindCount> completed_by_kind_{};
-    std::array<uint64_t, kKindCount> bytes_by_kind_{};
-    std::vector<ReadbackSlot> ring_;          // fixed-size metadata ring indexed by seq % ring_capacity_
-    std::deque<PendingRange> ranges_;         // issued, not yet marked written
-    std::deque<ReadbackSlot> completed_ring_; // bounded FIFO of newly completed slots for drain_completed_slots
-    std::deque<Parked> parked_;
+    const bool hold_;
+    std::shared_ptr<State> state_;
     std::thread poller_;
 };
 

@@ -284,6 +284,11 @@ struct BuildScratch {
         uint32_t prim_index = kNoChild;
         uint32_t prim_count = 0;
     };
+    struct BuildTask {
+        uint32_t node_idx = 0;
+        uint32_t begin = 0;
+        uint32_t end = 0;
+    };
     struct CollapseTask {
         uint32_t bin_node = 0;
         uint32_t box_index = 0;
@@ -293,6 +298,7 @@ struct BuildScratch {
     std::vector<Vec3> prim_centroids;
     std::vector<uint32_t> prim_indices;
     std::vector<BinNode> bin_nodes;
+    std::vector<BuildTask> build_stack;
     std::vector<CollapseTask> collapse_stack;
     std::vector<uint32_t> parent_ptrs;
 

@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <utility>
 
 namespace playgta6::gpu::rt_arena {
@@ -25,7 +27,19 @@ uint32_t f_bits(float f) {
     return u;
 }
 
+bool finite_3x4(const float m[3][4]) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (!std::isfinite(m[r][c])) return false;
+        }
+    }
+    return true;
+}
+
 bool invert_3x4(const float m[3][4], float out[3][4]) {
+    if (!finite_3x4(m)) {
+        return false;
+    }
     const double a00 = m[0][0], a01 = m[0][1], a02 = m[0][2], tx = m[0][3];
     const double a10 = m[1][0], a11 = m[1][1], a12 = m[1][2], ty = m[1][3];
     const double a20 = m[2][0], a21 = m[2][1], a22 = m[2][2], tz = m[2][3];
@@ -34,7 +48,7 @@ bool invert_3x4(const float m[3][4], float out[3][4]) {
     const double c01 = a12 * a20 - a10 * a22;
     const double c02 = a10 * a21 - a11 * a20;
     const double det = a00 * c00 + a01 * c01 + a02 * c02;
-    if (!(std::fabs(det) > 1e-12) || std::isnan(det) || std::isinf(det)) {
+    if (det == 0.0 || !std::isfinite(det)) {
         return false;
     }
     const double inv_det = 1.0 / det;
@@ -50,20 +64,25 @@ bool invert_3x4(const float m[3][4], float out[3][4]) {
     const double r21 = (a01 * a20 - a00 * a21) * inv_det;
     const double r22 = (a00 * a11 - a01 * a10) * inv_det;
 
-    out[0][0] = static_cast<float>(r00);
-    out[0][1] = static_cast<float>(r01);
-    out[0][2] = static_cast<float>(r02);
-    out[0][3] = static_cast<float>(-(r00 * tx + r01 * ty + r02 * tz));
+    float tmp[3][4];
+    tmp[0][0] = static_cast<float>(r00);
+    tmp[0][1] = static_cast<float>(r01);
+    tmp[0][2] = static_cast<float>(r02);
+    tmp[0][3] = static_cast<float>(-(r00 * tx + r01 * ty + r02 * tz));
 
-    out[1][0] = static_cast<float>(r10);
-    out[1][1] = static_cast<float>(r11);
-    out[1][2] = static_cast<float>(r12);
-    out[1][3] = static_cast<float>(-(r10 * tx + r11 * ty + r12 * tz));
+    tmp[1][0] = static_cast<float>(r10);
+    tmp[1][1] = static_cast<float>(r11);
+    tmp[1][2] = static_cast<float>(r12);
+    tmp[1][3] = static_cast<float>(-(r10 * tx + r11 * ty + r12 * tz));
 
-    out[2][0] = static_cast<float>(r20);
-    out[2][1] = static_cast<float>(r21);
-    out[2][2] = static_cast<float>(r22);
-    out[2][3] = static_cast<float>(-(r20 * tx + r21 * ty + r22 * tz));
+    tmp[2][0] = static_cast<float>(r20);
+    tmp[2][1] = static_cast<float>(r21);
+    tmp[2][2] = static_cast<float>(r22);
+    tmp[2][3] = static_cast<float>(-(r20 * tx + r21 * ty + r22 * tz));
+    if (!finite_3x4(tmp)) {
+        return false;
+    }
+    std::memcpy(out, tmp, sizeof(tmp));
     return true;
 }
 
@@ -84,15 +103,23 @@ const char* skip_reason_name(SkipReason r) {
 
 bool pack_instance_3x4(const Instance3x4& desc, uint32_t out_dwords[kInstance3x4Dwords]) {
     if (out_dwords == nullptr) return false;
+    auto write_inactive = [&]() {
+        std::memset(out_dwords, 0, kInstance3x4Dwords * sizeof(uint32_t));
+        out_dwords[15] = 0xFFFFFFFFu;
+    };
     if ((desc.blas_address & ~kAddressMask) != 0 || (desc.blas_address & 0xFFull) != 0) {
+        write_inactive();
         return false;
     }
     float inv[3][4];
     if (desc.transform_is_inverse) {
+        if (!finite_3x4(desc.transform)) {
+            write_inactive();
+            return false;
+        }
         std::memcpy(inv, desc.transform, sizeof(inv));
     } else if (!invert_3x4(desc.transform, inv)) {
-        std::memset(out_dwords, 0, kInstance3x4Dwords * sizeof(uint32_t));
-        out_dwords[15] = 0xFFFFFFFFu;
+        write_inactive();
         return false;
     }
     for (uint32_t r = 0; r < 3u; ++r) {
@@ -135,8 +162,8 @@ void Arena::touch_dir(uint32_t word) {
 
 bool Arena::take_dir_dirty(uint32_t* first, uint32_t* last) {
     if (dirty_first_ == 0xffffffffu) return false;
-    *first = dirty_first_;
-    *last = dirty_last_;
+    if (first != nullptr) *first = dirty_first_;
+    if (last != nullptr) *last = dirty_last_;
     dirty_first_ = 0xffffffffu;
     dirty_last_ = 0;
     return true;
@@ -198,17 +225,52 @@ bool Arena::alloc_slot(uint32_t* arena, uint32_t* slot) {
     return true;
 }
 
+bool Arena::reclaim_oldest_recycled_scratch() {
+    if (recycled_scratch_.empty()) {
+        return false;
+    }
+    const RecycledScratch old = recycled_scratch_.front();
+    recycled_scratch_.erase(recycled_scratch_.begin());
+    scratch_recycled_pages_ -= old.page_count;
+    // Release GPU ownership and current-dispatch epoch protection on discarded scratch pages so
+    // normal LRU eviction can immediately reclaim them even within the same dispatch.
+    for (uint32_t i = 0; i < old.page_count; ++i) {
+        auto it = pages_.find(old.first_page + i);
+        if (it != pages_.end()) {
+            it->second.gpu_owned = false;
+            it->second.dirty = false;
+            it->second.epoch = 0;
+        }
+    }
+    release_scratch_va_range(old.first_page, old.page_count);
+    ++stats_.scratch_evictions;
+    return true;
+}
+
 bool Arena::evict_one() {
-    for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
-        auto p = pages_.find(*it);
-        Info& i = p->second;
-        if (i.pins > 0 || i.epoch == epoch_ || i.gpu_owned) continue;
-        free_slots_.push_back((static_cast<uint64_t>(entry_arena(i.entry)) << 32) | entry_slot(i.entry));
-        set_entry(p->first, 0);
-        lru_.erase(i.lru);
-        pages_.erase(p);
-        ++stats_.evictions;
+    auto scan_lru = [&]() -> bool {
+        for (auto it = lru_.rbegin(); it != lru_.rend(); ++it) {
+            auto p = pages_.find(*it);
+            Info& i = p->second;
+            if (i.pins > 0 || i.epoch == epoch_ || i.gpu_owned) continue;
+            free_slots_.push_back((static_cast<uint64_t>(entry_arena(i.entry)) << 32) | entry_slot(i.entry));
+            set_entry(p->first, 0);
+            lru_.erase(i.lru);
+            pages_.erase(p);
+            ++stats_.evictions;
+            return true;
+        }
+        return false;
+    };
+    if (scan_lru()) {
         return true;
+    }
+    // Fall back to reclaiming unpinned idle recycled scratch blocks so idle scratch never causes
+    // false ArenaFull when regular RT buffers/BVHs need arena slots.
+    while (reclaim_oldest_recycled_scratch()) {
+        if (scan_lru()) {
+            return true;
+        }
     }
     return false;
 }
@@ -220,7 +282,7 @@ void Arena::unpin_pages(const std::vector<uint64_t>& pages) {
     }
 }
 
-Ensure Arena::ensure_page(uint64_t page, bool pin) {
+Ensure Arena::ensure_page_impl(uint64_t page, bool pin, bool queue_upload) {
     if (page >> (kAddressBits - kPageShift)) {
         ++stats_.out_of_range;
         return Ensure::OutOfRange;
@@ -237,8 +299,10 @@ Ensure Arena::ensure_page(uint64_t page, bool pin) {
             if (i.gpu_owned) {
                 ++stats_.skipped_gpu_owned;
             } else {
-                uploads_.push_back({page, entry_arena(i.entry), entry_slot(i.entry)});
-                ++stats_.uploads;
+                if (queue_upload) {
+                    uploads_.push_back({page, entry_arena(i.entry), entry_slot(i.entry)});
+                    ++stats_.uploads;
+                }
                 return Ensure::Uploaded;
             }
         }
@@ -265,9 +329,15 @@ Ensure Arena::ensure_page(uint64_t page, bool pin) {
     info.lru = lru_.begin();
     set_entry(page, info.entry);
     pages_.emplace(page, info);
-    uploads_.push_back({page, arena, slot});
-    ++stats_.uploads;
+    if (queue_upload) {
+        uploads_.push_back({page, arena, slot});
+        ++stats_.uploads;
+    }
     return Ensure::Uploaded;
+}
+
+Ensure Arena::ensure_page(uint64_t page, bool pin) {
+    return ensure_page_impl(page, pin, true);
 }
 
 Ensure Arena::ensure_range(uint64_t addr, uint64_t size, bool pin) {
@@ -282,7 +352,15 @@ Ensure Arena::ensure_range(uint64_t addr, uint64_t size, bool pin) {
     Ensure worst = Ensure::Resident;
     for (uint64_t p = first; p <= last; ++p) {
         const Ensure e = ensure_page(p, pin);
-        if (e == Ensure::ArenaFull || e == Ensure::TableFull || e == Ensure::OutOfRange) return e;
+        if (e == Ensure::ArenaFull || e == Ensure::TableFull || e == Ensure::OutOfRange) {
+            if (pin) {
+                for (uint64_t q = first; q < p; ++q) {
+                    auto qi = pages_.find(q);
+                    if (qi != pages_.end() && qi->second.pins > 0) --qi->second.pins;
+                }
+            }
+            return e;
+        }
         if (e == Ensure::Uploaded) worst = e;
     }
     return worst;
@@ -348,15 +426,47 @@ Ensure Arena::stage_structure(uint64_t structure_id, uint64_t gpu_addr, uint64_t
         ++stats_.out_of_range;
         return Ensure::OutOfRange;
     }
-    const Ensure res = pin_structure(structure_id, gpu_addr, byte_size);
-    if (res == Ensure::ArenaFull || res == Ensure::TableFull || res == Ensure::OutOfRange) {
-        return res;
+    // When the caller uploads staged BVH bytes directly via `out_writes` and marks pages
+    // GPU-owned, suppress queuing guest-memory uploads in `uploads_` so `take_uploads()` cannot
+    // subsequently overwrite the staged structure with stale/zero guest memory.
+    const bool queue_guest_uploads = !(out_writes != nullptr && mark_gpu_owned);
+    release_structure(structure_id);
+    const uint64_t span = byte_size ? byte_size : 1ull;
+    const uint64_t masked = gpu_addr & kAddressMask;
+    const uint64_t first = page_of(masked);
+    const uint64_t last = page_of(masked + span - 1ull);
+
+    std::vector<uint64_t> done;
+    if (!recycled_page_lists_.empty()) {
+        done = std::move(recycled_page_lists_.back());
+        recycled_page_lists_.pop_back();
+        done.clear();
     }
-    if (mark_gpu_owned && byte_size > 0) {
-        mark_gpu_written_range(gpu_addr, byte_size);
+    const uint64_t count = last - first + 1ull;
+    if (done.capacity() < count && count <= capacity_) {
+        done.reserve(static_cast<size_t>(count));
+    }
+
+    Ensure res = Ensure::Resident;
+    for (uint64_t p = first; p <= last; ++p) {
+        const Ensure e = ensure_page_impl(p, true, queue_guest_uploads);
+        if (e == Ensure::ArenaFull || e == Ensure::TableFull || e == Ensure::OutOfRange) {
+            unpin_pages(done);
+            if (recycled_page_lists_.size() < kMaxRecycledPageLists) {
+                done.clear();
+                recycled_page_lists_.push_back(std::move(done));
+            }
+            return e;
+        }
+        if (e == Ensure::Uploaded) res = e;
+        done.push_back(p);
+    }
+    structures_[structure_id] = std::move(done);
+
+    if (mark_gpu_owned) {
+        mark_gpu_written_range(gpu_addr, span);
     }
     if (out_writes != nullptr && byte_size > 0) {
-        const uint64_t masked = gpu_addr & kAddressMask;
         uint64_t src_off = 0;
         while (src_off < byte_size) {
             const uint64_t cur_addr = masked + src_off;
@@ -386,26 +496,71 @@ void Arena::set_scratch_budget_pages(uint32_t max_pages) {
 }
 
 void Arena::set_scratch_base(uint64_t base_addr) {
+    if (!active_scratch_.empty()) {
+        return;  // never alias active scratch allocations
+    }
+    while (reclaim_oldest_recycled_scratch()) {
+    }
+    free_scratch_va_.clear();
     scratch_base_ = (base_addr & kAddressMask) & ~(kPageBytes - 1u);
     scratch_next_page_ = scratch_base_ >> kPageShift;
+}
+
+void Arena::release_scratch_va_range(uint64_t first_page, uint32_t page_count) {
+    if (page_count == 0) return;
+    auto it = std::lower_bound(
+        free_scratch_va_.begin(), free_scratch_va_.end(), first_page,
+        [](const std::pair<uint64_t, uint32_t>& r, uint64_t p) { return r.first < p; });
+    it = free_scratch_va_.insert(it, {first_page, page_count});
+    if (it != free_scratch_va_.begin()) {
+        auto prev = std::prev(it);
+        if (prev->first + prev->second == it->first) {
+            prev->second += it->second;
+            it = free_scratch_va_.erase(it);
+            it = prev;
+        }
+    }
+    auto next = std::next(it);
+    if (next != free_scratch_va_.end() && it->first + it->second == next->first) {
+        it->second += next->second;
+        free_scratch_va_.erase(next);
+    }
+}
+
+bool Arena::alloc_scratch_va_range(uint32_t page_count, uint64_t* out_first_page) {
+    size_t best_idx = free_scratch_va_.size();
+    uint32_t best_len = 0xFFFFFFFFu;
+    for (size_t i = 0; i < free_scratch_va_.size(); ++i) {
+        if (free_scratch_va_[i].second >= page_count && free_scratch_va_[i].second < best_len) {
+            best_len = free_scratch_va_[i].second;
+            best_idx = i;
+            if (best_len == page_count) break;
+        }
+    }
+    if (best_idx < free_scratch_va_.size()) {
+        *out_first_page = free_scratch_va_[best_idx].first;
+        if (free_scratch_va_[best_idx].second == page_count) {
+            free_scratch_va_.erase(free_scratch_va_.begin() + static_cast<ptrdiff_t>(best_idx));
+        } else {
+            free_scratch_va_[best_idx].first += page_count;
+            free_scratch_va_[best_idx].second -= page_count;
+        }
+        return true;
+    }
+    const uint64_t max_page = kAddressMask >> kPageShift;
+    if (scratch_next_page_ > max_page || page_count - 1u > max_page - scratch_next_page_) {
+        return false;
+    }
+    *out_first_page = scratch_next_page_;
+    scratch_next_page_ += page_count;
+    return true;
 }
 
 void Arena::trim_recycled_scratch_to_budget(uint32_t reserve_for_new) {
     while (!recycled_scratch_.empty() &&
            static_cast<uint64_t>(scratch_live_pages_) + scratch_recycled_pages_ + reserve_for_new >
                scratch_budget_pages_) {
-        const RecycledScratch old = recycled_scratch_.front();
-        recycled_scratch_.erase(recycled_scratch_.begin());
-        scratch_recycled_pages_ -= old.page_count;
-        // Release GPU ownership on discarded scratch pages so normal LRU eviction can reclaim them.
-        for (uint32_t i = 0; i < old.page_count; ++i) {
-            auto it = pages_.find(old.first_page + i);
-            if (it != pages_.end()) {
-                it->second.gpu_owned = false;
-                it->second.dirty = false;
-            }
-        }
-        ++stats_.scratch_evictions;
+        reclaim_oldest_recycled_scratch();
     }
 }
 
@@ -414,7 +569,7 @@ Ensure Arena::acquire_scratch(uint64_t byte_size, ScratchAllocation* out) {
         *out = {};
     }
     const uint64_t span = byte_size ? byte_size : 1ull;
-    const uint64_t needed64 = (span + kPageBytes - 1u) / kPageBytes;
+    const uint64_t needed64 = 1ull + (span - 1ull) / kPageBytes;
     if (needed64 > scratch_budget_pages_ || needed64 > capacity_) {
         ++stats_.scratch_budget_exceeded;
         ++stats_.arena_full;
@@ -446,10 +601,15 @@ Ensure Arena::acquire_scratch(uint64_t byte_size, ScratchAllocation* out) {
                     auto it = pages_.find(chosen.first_page + j);
                     if (it != pages_.end() && it->second.pins > 0) --it->second.pins;
                 }
+                // Restore block to recycled pool so its pages are never leaked.
+                recycled_scratch_.push_back(chosen);
+                scratch_recycled_pages_ += chosen.page_count;
                 return e;
             }
-            mark_gpu_written(chosen.first_page + i);
             if (e == Ensure::Uploaded) worst = e;
+        }
+        for (uint32_t i = 0; i < chosen.page_count; ++i) {
+            mark_gpu_written(chosen.first_page + i);
         }
         scratch_live_pages_ += chosen.page_count;
         active_scratch_[chosen.pool_id] = chosen;
@@ -472,27 +632,32 @@ Ensure Arena::acquire_scratch(uint64_t byte_size, ScratchAllocation* out) {
     }
     trim_recycled_scratch_to_budget(needed);
 
-    const uint64_t max_page = kAddressMask >> kPageShift;
-    if (scratch_next_page_ > max_page || needed - 1u > max_page - scratch_next_page_) {
+    uint64_t first_page = 0;
+    if (!alloc_scratch_va_range(needed, &first_page)) {
         ++stats_.out_of_range;
         return Ensure::OutOfRange;
     }
-    const uint64_t first_page = scratch_next_page_;
     Ensure worst = Ensure::Resident;
     for (uint32_t i = 0; i < needed; ++i) {
         const Ensure e = ensure_page(first_page + i, true);
         if (e == Ensure::ArenaFull || e == Ensure::TableFull || e == Ensure::OutOfRange) {
             for (uint32_t j = 0; j < i; ++j) {
                 auto it = pages_.find(first_page + j);
-                if (it != pages_.end() && it->second.pins > 0) --it->second.pins;
+                if (it != pages_.end()) {
+                    if (it->second.pins > 0) --it->second.pins;
+                    it->second.gpu_owned = false;
+                    it->second.epoch = 0;
+                }
             }
+            release_scratch_va_range(first_page, needed);
             return e;
         }
-        mark_gpu_written(first_page + i);
         if (e == Ensure::Uploaded) worst = e;
     }
+    for (uint32_t i = 0; i < needed; ++i) {
+        mark_gpu_written(first_page + i);
+    }
 
-    scratch_next_page_ += needed;
     scratch_live_pages_ += needed;
     const uint32_t pool_id = scratch_next_id_++;
     const RecycledScratch entry{first_page, needed, pool_id};
@@ -601,7 +766,7 @@ Stats Arena::stats() const {
 
 std::string Arena::json() const {
     const Stats s = stats();
-    char buf[1024];
+    char buf[2048];
     std::snprintf(buf, sizeof buf,
                   "{\"arena_bytes\": %llu, \"pages_resident\": %llu, \"pages_pinned\": %llu, "
                   "\"pages_gpu_owned\": %llu, \"uploads\": %llu, \"evictions\": %llu, "
@@ -633,8 +798,11 @@ std::string Arena::json() const {
 
 namespace {
 std::mutex g_report_mutex;
+std::condition_variable g_report_cv;
 const void* g_report_owner = nullptr;
 std::function<std::string()> g_report_provider;
+size_t g_report_in_flight = 0;
+std::thread::id g_report_in_flight_thread{};
 }  // namespace
 
 void set_report_provider(const void* owner, std::function<std::string()> provider) {
@@ -644,10 +812,17 @@ void set_report_provider(const void* owner, std::function<std::string()> provide
 }
 
 void clear_report_provider(const void* owner) {
-    std::lock_guard<std::mutex> lock(g_report_mutex);
+    std::unique_lock<std::mutex> lock(g_report_mutex);
     if (g_report_owner == owner) {
         g_report_owner = nullptr;
         g_report_provider = nullptr;
+        // Wait for any in-flight report_json() invocation on another thread to finish before the
+        // owner is destroyed (prevents UAF on the captured owner pointer without holding the mutex
+        // during provider execution).
+        g_report_cv.wait(lock, [] {
+            return g_report_in_flight == 0 ||
+                   (g_report_in_flight == 1 && g_report_in_flight_thread == std::this_thread::get_id());
+        });
     }
 }
 
@@ -656,8 +831,23 @@ std::string report_json() {
     {
         std::lock_guard<std::mutex> lock(g_report_mutex);
         provider = g_report_provider;
+        if (!provider) {
+            return std::string("{}");
+        }
+        ++g_report_in_flight;
+        g_report_in_flight_thread = std::this_thread::get_id();
     }
-    return provider ? provider() : std::string("{}");
+    struct InFlightGuard {
+        ~InFlightGuard() {
+            std::lock_guard<std::mutex> lock(g_report_mutex);
+            --g_report_in_flight;
+            if (g_report_in_flight == 0) {
+                g_report_in_flight_thread = {};
+                g_report_cv.notify_all();
+            }
+        }
+    } guard;
+    return provider();
 }
 
 }  // namespace playgta6::gpu::rt_arena

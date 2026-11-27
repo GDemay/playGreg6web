@@ -427,6 +427,128 @@ void test_bounded_scratch_zero_alloc_steady_state() {
     CHECK(rscratch.budget_trims >= 1u && rscratch.bytes_allocated() <= 64u);
 }
 
+void test_hardening_nan_winding_and_bounds() {
+    // 1) NaN AABB bounds in Box32 must return all-miss, and kNoChild slots skip bound loads.
+    uint32_t box32[32] = {};
+    const uint32_t nan_bits = 0x7fc00000u;
+    box32[0] = make_node_ptr(4u, kNodeKindTri0);
+    box32[1] = kNoChild;
+    box32[2] = kNoChild;
+    box32[3] = kNoChild;
+    // Slot 0 has NaN min.x: must NOT be treated as an infinite box.
+    for (int i = 0; i < 6; ++i) box32[4 + i] = nan_bits;
+    uint32_t desc[4];
+    make_bvh_desc(0x10000ull, true, desc);
+    uint32_t bound_loads_on_empty_slot = 0;
+    const auto load_box = [&](uint64_t addr) -> uint32_t {
+        const uint64_t off = addr - 0x10000ull;
+        if (off >= 16ull + 24ull) {
+            ++bound_loads_on_empty_slot;
+        }
+        return (off < sizeof(box32)) ? box32[off / 4u] : 0u;
+    };
+    const Result nan_res =
+        intersect(desc, make_node_ptr(0u, kNodeKindBox32), 100.0f, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
+                  {INFINITY, INFINITY, 1.0f}, load_box);
+    CHECK(nan_res.w[0] == kNoChild && nan_res.w[1] == kNoChild && nan_res.w[2] == kNoChild &&
+          nan_res.w[3] == kNoChild);
+    CHECK(bound_loads_on_empty_slot == 0u);
+
+    // 2) Iterative BLAS builder handles NaN/Inf vertices and skewed meshes without crashing/UB.
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    const float pinf = std::numeric_limits<float>::infinity();
+    std::vector<Triangle> mixed;
+    mixed.reserve(260);
+    for (uint32_t i = 0; i < 256u; ++i) {
+        const float x = static_cast<float>(i) * 0.5f;
+        mixed.push_back({{x, 0.0f, 5.0f}, {x + 0.4f, 0.0f, 5.0f}, {x, 0.4f, 5.0f}, i, 0u});
+    }
+    mixed.push_back({{qnan, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, 900u, 0u});
+    mixed.push_back({{pinf, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}, 901u, 0u});
+    BuildScratch bs;
+    BvhStructure blas;
+    CHECK(build_blas(mixed.data(), static_cast<uint32_t>(mixed.size()), BoxFormat::Box32, bs, blas));
+    CHECK(!blas.empty());
+    CHECK(std::isfinite(blas.root_bounds.min.x) && std::isfinite(blas.root_bounds.max.x));
+
+    // Refit rejects truncated dwords cleanly instead of writing OOB.
+    BvhStructure truncated = blas;
+    truncated.dwords.resize(16);
+    RefitScratch rs;
+    CHECK(!refit_blas(mixed.data(), static_cast<uint32_t>(mixed.size()), rs, truncated));
+
+    // 3) Small valid 3D scale (1e-4 => det = 1e-12) succeeds; NaN translation and bad address fail & zero.
+    InstanceDesc small_inst{};
+    small_inst.transform[0][0] = 1e-4f;
+    small_inst.transform[1][1] = 1e-4f;
+    small_inst.transform[2][2] = 1e-4f;
+    small_inst.blas_address = 0x20000ull;
+    small_inst.blas_root_node = make_node_ptr(1u, kNodeKindBox32);
+    uint32_t inst_dw[16];
+    std::memset(inst_dw, 0xAA, sizeof(inst_dw));
+    CHECK(pack_instance_node(small_inst, inst_dw));
+    const PackedInstanceView decoded = unpack_instance_node(inst_dw);
+    CHECK(std::fabs(decoded.inv_transform[0][0] - 10000.0f) < 1.0f);
+
+    InstanceDesc bad_addr = small_inst;
+    bad_addr.blas_address = 0x20010ull;  // misaligned
+    std::memset(inst_dw, 0xAA, sizeof(inst_dw));
+    CHECK(!pack_instance_node(bad_addr, inst_dw));
+    CHECK(inst_dw[0] == 0u && inst_dw[12] == 0u && inst_dw[15] == kNoChild);
+
+    InstanceDesc nan_tx = small_inst;
+    nan_tx.transform[0][3] = qnan;
+    CHECK(!pack_instance_node(nan_tx, inst_dw));
+    CHECK(inst_dw[15] == kNoChild);
+
+    // 4) trace_tlas applies TriangleFrontCounterclockwise BEFORE back-face culling.
+    Triangle single_tri[1] = {{{-1.0f, -1.0f, 3.0f}, {1.0f, -1.0f, 3.0f}, {0.0f, 1.0f, 3.0f}, 7u, 0u}};
+    BvhStructure tri_blas;
+    CHECK(build_blas(single_tri, 1u, BoxFormat::Box32, bs, tri_blas));
+
+    // Determine natural winding for ray (0,0,0) -> (0,0,1).
+    constexpr uint64_t kBlasBase = 0x100000ull;
+    constexpr uint64_t kTlasBase = 0x200000ull;
+    auto make_mem_load = [&](const BvhStructure& b, const BvhStructure& t) {
+        return [&b, &t](uint64_t addr) -> uint32_t {
+            if (addr >= kBlasBase && addr < kBlasBase + b.byte_size()) {
+                return b.dwords[(addr - kBlasBase) / 4u];
+            }
+            if (addr >= kTlasBase && addr < kTlasBase + t.byte_size()) {
+                return t.dwords[(addr - kTlasBase) / 4u];
+            }
+            return 0u;
+        };
+    };
+    BvhStructure empty_tlas;
+    const TraceHit natural = trace_blas(kBlasBase, tri_blas.root_node, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
+                                        0.01f, 100.0f, make_mem_load(tri_blas, empty_tlas), true, false);
+    CHECK(natural.hit);
+
+    InstanceDesc inst{};
+    inst.blas_address = kBlasBase;
+    inst.blas_root_node = tri_blas.root_node;
+    inst.local_bounds = tri_blas.root_bounds;
+    inst.instance_id = 42u;
+    inst.instance_mask = 0xFFu;
+    inst.flags = InstanceFlags::TriangleFrontCounterclockwise;
+    BvhStructure tlas;
+    CHECK(build_tlas(&inst, 1u, BoxFormat::Box32, bs, tlas));
+    const auto load_both = make_mem_load(tri_blas, tlas);
+
+    // With CCW flip: if natural was front, flipped is back (culled); if natural was back, flipped is front (hit!).
+    const TraceHit culled = trace_tlas(kTlasBase, tlas.root_node, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
+                                       0.01f, 100.0f, 0xFFu, load_both, true, true);
+    CHECK(culled.hit == !natural.front_face);
+    if (culled.hit) {
+        CHECK(culled.front_face == true);
+    }
+    // Without culling, front_face is always flipped relative to natural.
+    const TraceHit unculled = trace_tlas(kTlasBase, tlas.root_node, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f},
+                                         0.01f, 100.0f, 0xFFu, load_both, true, false);
+    CHECK(unculled.hit && unculled.front_face == !natural.front_face);
+}
+
 }  // namespace
 
 int main() {
@@ -454,6 +576,8 @@ int main() {
     const std::string wgsl = prelude_wgsl();
     CHECK(wgsl.find("fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3<f32>, "
                     "dir: vec3<f32>,") != std::string::npos);
+    CHECK(wgsl.find("fn pg6_isnan(x: f32) -> bool") != std::string::npos);
+    CHECK(wgsl.find("fn pg6_resolve(addr: vec2<u32>) -> u32") != std::string::npos);
     CHECK(wgsl.find("-> vec4<u32>") != std::string::npos);
     for (int b = 16; b <= 21; ++b) {
         CHECK(wgsl.find("@group(3) @binding(" + std::to_string(b) + ")") != std::string::npos);
@@ -466,6 +590,7 @@ int main() {
     test_blas_build_and_refit(BoxFormat::Box16);
     test_tlas_arena_integration_and_refit();
     test_bounded_scratch_zero_alloc_steady_state();
+    test_hardening_nan_winding_and_bounds();
 
     if (g_failures == 0) std::printf("test_rt_bvh: OK (%zu vectors + BLAS/TLAS/refit/arena)\n", vectors.size());
     return g_failures == 0 ? 0 : 1;

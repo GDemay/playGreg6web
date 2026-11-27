@@ -18,7 +18,16 @@ uint32_t f_bits(float f) {
     std::memcpy(&u, &f, 4);
     return u;
 }
-bool isnan_(float f) { return f != f; }
+bool isnan_(float f) { return (f_bits(f) & 0x7fffffffu) > 0x7f800000u; }
+bool isfinite_vec3(Vec3 v) { return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z); }
+bool isfinite_3x4(const float m[3][4]) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (!std::isfinite(m[r][c])) return false;
+        }
+    }
+    return true;
+}
 
 // Exact binary16 -> binary32 (what unpack2x16float does).
 float half_f(uint32_t h) {
@@ -94,8 +103,8 @@ uint16_t f32_to_f16_rne(float f) {
 bool slab(const float mn[3], const float mx[3], const float o[3], const float inv[3], float extent, float* near_t) {
     float lo = 0.0f, hi = extent;
     for (int a = 0; a < 3; ++a) {
-        if (mn[a] > mx[a]) {
-            return false;  // empty slot
+        if (isnan_(mn[a]) || isnan_(mx[a]) || mn[a] > mx[a]) {
+            return false;  // empty or NaN slot
         }
         const float t0 = (mn[a] - o[a]) * inv[a];
         const float t1 = (mx[a] - o[a]) * inv[a];
@@ -172,7 +181,23 @@ inline uint64_t align_up(uint64_t v, uint64_t align) {
 
 inline float safe_inv(float d) { return d == 0.0f ? INFINITY : 1.0f / d; }
 
+inline Aabb sanitize_aabb(const Aabb& b) {
+    if (b.is_empty() || !isfinite_vec3(b.min) || !isfinite_vec3(b.max)) {
+        return Aabb::empty();
+    }
+    return b;
+}
+
+inline Vec3 safe_centroid(const Aabb& b) {
+    if (b.is_empty()) return {0.0f, 0.0f, 0.0f};
+    const Vec3 c = b.centroid();
+    return isfinite_vec3(c) ? c : Vec3{0.0f, 0.0f, 0.0f};
+}
+
 inline Aabb triangle_aabb(const Triangle& t) {
+    if (!isfinite_vec3(t.v0) || !isfinite_vec3(t.v1) || !isfinite_vec3(t.v2)) {
+        return Aabb::empty();
+    }
     Aabb b = Aabb::from_point(t.v0);
     b.expand(t.v1);
     b.expand(t.v2);
@@ -184,139 +209,179 @@ inline Aabb instance_world_aabb(const InstanceDesc& inst) {
         return Aabb::empty();
     }
     if (!inst.world_bounds.is_empty()) {
-        return inst.world_bounds;
+        return sanitize_aabb(inst.world_bounds);
     }
     if (inst.local_bounds.is_empty()) {
         return Aabb::empty();
     }
-    return transform_aabb_3x4(inst.local_bounds, inst.transform);
+    return sanitize_aabb(transform_aabb_3x4(inst.local_bounds, inst.transform));
 }
 
-// Recursive binned-SAH binary BVH builder operating purely on BuildScratch buffers.
+// Iterative binned-SAH binary BVH builder operating purely on BuildScratch buffers (zero recursion
+// stack overflow risk on skewed 3D meshes and zero NaN float-to-int Wasm traps).
 constexpr uint32_t kSahBins = 12;
 
-uint32_t build_binary_node(BuildScratch& s, uint32_t begin, uint32_t end) {
-    const uint32_t node_idx = static_cast<uint32_t>(s.bin_nodes.size());
+uint32_t build_binary_tree(BuildScratch& s, uint32_t total_count) {
+    s.bin_nodes.clear();
+    s.build_stack.clear();
     s.bin_nodes.push_back({});
-
-    Aabb bounds = Aabb::empty();
-    Aabb centroid_bounds = Aabb::empty();
-    for (uint32_t i = begin; i < end; ++i) {
-        const uint32_t p = s.prim_indices[i];
-        bounds.expand(s.prim_aabbs[p]);
-        centroid_bounds.expand(s.prim_centroids[p]);
-    }
-    const uint32_t count = end - begin;
-    if (count == 1u) {
-        BuildScratch::BinNode& leaf = s.bin_nodes[node_idx];
-        leaf.bounds = bounds;
-        leaf.left = kNoChild;
-        leaf.right = kNoChild;
-        leaf.prim_index = s.prim_indices[begin];
-        leaf.prim_count = 1u;
-        return node_idx;
-    }
-
-    int best_axis = -1;
-    uint32_t best_split_bin = 0;
-    float best_cost = std::numeric_limits<float>::infinity();
-    float best_min_c = 0.0f;
-    float best_scale = 0.0f;
+    s.build_stack.push_back({0u, 0u, total_count});
 
     struct Bin {
         Aabb bounds = Aabb::empty();
         uint32_t count = 0;
     };
 
-    const float parent_area = bounds.surface_area();
-    if (parent_area > 0.0f) {
-        for (int axis = 0; axis < 3; ++axis) {
-            const float c_min = axis_of(centroid_bounds.min, axis);
-            const float c_max = axis_of(centroid_bounds.max, axis);
-            const float span = c_max - c_min;
-            if (!(span > 1e-7f)) continue;
+    while (!s.build_stack.empty()) {
+        const BuildScratch::BuildTask task = s.build_stack.back();
+        s.build_stack.pop_back();
+        const uint32_t node_idx = task.node_idx;
+        const uint32_t begin = task.begin;
+        const uint32_t end = task.end;
 
-            Bin bins[kSahBins];
-            const float scale = static_cast<float>(kSahBins) / span;
-            for (uint32_t i = begin; i < end; ++i) {
-                const uint32_t p = s.prim_indices[i];
-                const float c = axis_of(s.prim_centroids[p], axis);
-                int b = static_cast<int>((c - c_min) * scale);
-                if (b < 0) b = 0;
-                if (b >= static_cast<int>(kSahBins)) b = static_cast<int>(kSahBins) - 1;
-                bins[b].bounds.expand(s.prim_aabbs[p]);
-                ++bins[b].count;
-            }
+        Aabb bounds = Aabb::empty();
+        Aabb centroid_bounds = Aabb::empty();
+        for (uint32_t i = begin; i < end; ++i) {
+            const uint32_t p = s.prim_indices[i];
+            bounds.expand(s.prim_aabbs[p]);
+            centroid_bounds.expand(s.prim_centroids[p]);
+        }
+        const uint32_t count = end - begin;
+        if (count == 1u) {
+            BuildScratch::BinNode& leaf = s.bin_nodes[node_idx];
+            leaf.bounds = bounds;
+            leaf.left = kNoChild;
+            leaf.right = kNoChild;
+            leaf.prim_index = s.prim_indices[begin];
+            leaf.prim_count = 1u;
+            continue;
+        }
 
-            Aabb right_bounds[kSahBins];
-            uint32_t right_counts[kSahBins];
-            Aabb acc_b = Aabb::empty();
-            uint32_t acc_c = 0;
-            for (int b = static_cast<int>(kSahBins) - 1; b >= 0; --b) {
-                acc_b.expand(bins[b].bounds);
-                acc_c += bins[b].count;
-                right_bounds[b] = acc_b;
-                right_counts[b] = acc_c;
-            }
+        int best_axis = -1;
+        uint32_t best_split_bin = 0;
+        float best_cost = std::numeric_limits<float>::infinity();
+        float best_min_c = 0.0f;
+        float best_scale = 0.0f;
 
-            Aabb left_b = Aabb::empty();
-            uint32_t left_c = 0;
-            for (uint32_t b = 0; b + 1u < kSahBins; ++b) {
-                left_b.expand(bins[b].bounds);
-                left_c += bins[b].count;
-                const uint32_t rc = right_counts[b + 1u];
-                if (left_c == 0 || rc == 0) continue;
-                const float cost =
-                    left_b.surface_area() * static_cast<float>(left_c) +
-                    right_bounds[b + 1u].surface_area() * static_cast<float>(rc);
-                if (cost < best_cost) {
-                    best_cost = cost;
-                    best_axis = axis;
-                    best_split_bin = b + 1u;
-                    best_min_c = c_min;
-                    best_scale = scale;
+        const float parent_area = bounds.surface_area();
+        if (std::isfinite(parent_area) && parent_area > 0.0f) {
+            for (int axis = 0; axis < 3; ++axis) {
+                const float c_min = axis_of(centroid_bounds.min, axis);
+                const float c_max = axis_of(centroid_bounds.max, axis);
+                const float span = c_max - c_min;
+                if (!(span > 1e-7f) || !std::isfinite(span)) continue;
+
+                const float scale = static_cast<float>(kSahBins) / span;
+                if (!std::isfinite(scale) || scale <= 0.0f) continue;
+
+                Bin bins[kSahBins];
+                for (uint32_t i = begin; i < end; ++i) {
+                    const uint32_t p = s.prim_indices[i];
+                    const float c = axis_of(s.prim_centroids[p], axis);
+                    const float scaled = (c - c_min) * scale;
+                    int b = 0;
+                    if (std::isfinite(scaled)) {
+                        if (scaled <= 0.0f) {
+                            b = 0;
+                        } else if (scaled >= static_cast<float>(kSahBins - 1u)) {
+                            b = static_cast<int>(kSahBins) - 1;
+                        } else {
+                            b = static_cast<int>(scaled);
+                        }
+                    }
+                    bins[b].bounds.expand(s.prim_aabbs[p]);
+                    ++bins[b].count;
+                }
+
+                Aabb right_bounds[kSahBins];
+                uint32_t right_counts[kSahBins];
+                Aabb acc_b = Aabb::empty();
+                uint32_t acc_c = 0;
+                for (int b = static_cast<int>(kSahBins) - 1; b >= 0; --b) {
+                    acc_b.expand(bins[b].bounds);
+                    acc_c += bins[b].count;
+                    right_bounds[b] = acc_b;
+                    right_counts[b] = acc_c;
+                }
+
+                Aabb left_b = Aabb::empty();
+                uint32_t left_c = 0;
+                for (uint32_t b = 0; b + 1u < kSahBins; ++b) {
+                    left_b.expand(bins[b].bounds);
+                    left_c += bins[b].count;
+                    const uint32_t rc = right_counts[b + 1u];
+                    if (left_c == 0 || rc == 0) continue;
+                    const float cost =
+                        left_b.surface_area() * static_cast<float>(left_c) +
+                        right_bounds[b + 1u].surface_area() * static_cast<float>(rc);
+                    if (std::isfinite(cost) && cost < best_cost) {
+                        best_cost = cost;
+                        best_axis = axis;
+                        best_split_bin = b + 1u;
+                        best_min_c = c_min;
+                        best_scale = scale;
+                    }
                 }
             }
         }
-    }
 
-    uint32_t mid = begin + count / 2u;
-    if (best_axis >= 0) {
-        auto it = std::partition(
-            s.prim_indices.begin() + static_cast<ptrdiff_t>(begin),
-            s.prim_indices.begin() + static_cast<ptrdiff_t>(end),
-            [&](uint32_t p) {
-                const float c = axis_of(s.prim_centroids[p], best_axis);
-                int b = static_cast<int>((c - best_min_c) * best_scale);
-                if (b < 0) b = 0;
-                if (b >= static_cast<int>(kSahBins)) b = static_cast<int>(kSahBins) - 1;
-                return static_cast<uint32_t>(b) < best_split_bin;
-            });
-        const uint32_t part = static_cast<uint32_t>(it - s.prim_indices.begin());
-        if (part > begin && part < end) {
-            mid = part;
+        uint32_t mid = begin + count / 2u;
+        if (best_axis >= 0) {
+            auto it = std::partition(
+                s.prim_indices.begin() + static_cast<ptrdiff_t>(begin),
+                s.prim_indices.begin() + static_cast<ptrdiff_t>(end),
+                [&](uint32_t p) {
+                    const float c = axis_of(s.prim_centroids[p], best_axis);
+                    const float scaled = (c - best_min_c) * best_scale;
+                    int b = 0;
+                    if (std::isfinite(scaled)) {
+                        if (scaled <= 0.0f) {
+                            b = 0;
+                        } else if (scaled >= static_cast<float>(kSahBins - 1u)) {
+                            b = static_cast<int>(kSahBins) - 1;
+                        } else {
+                            b = static_cast<int>(scaled);
+                        }
+                    }
+                    return static_cast<uint32_t>(b) < best_split_bin;
+                });
+            const uint32_t part = static_cast<uint32_t>(it - s.prim_indices.begin());
+            if (part > begin && part < end) {
+                mid = part;
+            }
+        } else {
+            const int axis = centroid_bounds.longest_axis();
+            std::nth_element(
+                s.prim_indices.begin() + static_cast<ptrdiff_t>(begin),
+                s.prim_indices.begin() + static_cast<ptrdiff_t>(mid),
+                s.prim_indices.begin() + static_cast<ptrdiff_t>(end),
+                [&](uint32_t a, uint32_t b) {
+                    const float ca = axis_of(s.prim_centroids[a], axis);
+                    const float cb = axis_of(s.prim_centroids[b], axis);
+                    const bool fa = std::isfinite(ca);
+                    const bool fb = std::isfinite(cb);
+                    if (fa != fb) return fa;
+                    return fa ? (ca < cb) : (a < b);
+                });
         }
-    } else {
-        const int axis = centroid_bounds.longest_axis();
-        std::nth_element(
-            s.prim_indices.begin() + static_cast<ptrdiff_t>(begin),
-            s.prim_indices.begin() + static_cast<ptrdiff_t>(mid),
-            s.prim_indices.begin() + static_cast<ptrdiff_t>(end),
-            [&](uint32_t a, uint32_t b) {
-                return axis_of(s.prim_centroids[a], axis) < axis_of(s.prim_centroids[b], axis);
-            });
+
+        const uint32_t left = static_cast<uint32_t>(s.bin_nodes.size());
+        s.bin_nodes.push_back({});
+        const uint32_t right = static_cast<uint32_t>(s.bin_nodes.size());
+        s.bin_nodes.push_back({});
+
+        BuildScratch::BinNode& node = s.bin_nodes[node_idx];
+        node.bounds = bounds;
+        node.left = left;
+        node.right = right;
+        node.prim_index = kNoChild;
+        node.prim_count = count;
+
+        // Push right then left so left is processed first (keeps stack bounded on balanced trees).
+        s.build_stack.push_back({right, mid, end});
+        s.build_stack.push_back({left, begin, mid});
     }
-
-    const uint32_t left = build_binary_node(s, begin, mid);
-    const uint32_t right = build_binary_node(s, mid, end);
-
-    BuildScratch::BinNode& node = s.bin_nodes[node_idx];
-    node.bounds = bounds;
-    node.left = left;
-    node.right = right;
-    node.prim_index = kNoChild;
-    node.prim_count = count;
-    return node_idx;
+    return 0u;
 }
 
 void write_header(BvhStructure& out) {
@@ -373,22 +438,13 @@ bool build_4wide_common(uint32_t count, bool is_tlas, BoxFormat format, uint32_t
         scratch.bin_nodes.reserve(static_cast<size_t>(count) * 2u);
     }
 
-    const uint32_t bin_root = build_binary_node(scratch, 0u, count);
+    const uint32_t bin_root = build_binary_tree(scratch, count);
 
     // First pass: collapse binary BVH into 4-wide topology (BFS / queue order in collapse_stack
     // guarantees every parent box index < all of its child box indices for O(N) reverse refit!).
     const uint32_t box_kind = static_cast<uint32_t>(format);
     const uint32_t box_dwords = (format == BoxFormat::Box32) ? kBox32NodeDwords : kBox16NodeDwords;
     const uint32_t box_slots = box_dwords / kNodeGranularityDwords;  // 2 for Box32, 1 for Box16
-
-    // Worst-case 4-wide box count is `count` (exact count computed during collapse).
-    struct QBox {
-        uint32_t child_bin[4] = {kNoChild, kNoChild, kNoChild, kNoChild};
-        uint32_t child_box[4] = {kNoChild, kNoChild, kNoChild, kNoChild};
-        bool child_is_leaf[4] = {false, false, false, false};
-        uint32_t child_prim[4] = {kNoChild, kNoChild, kNoChild, kNoChild};
-        uint32_t parent_box = kNoChild;
-    };
 
     // Reuse collapse_stack as a flat BFS queue of binary roots -> 4-wide box indices.
     scratch.collapse_stack.clear();
@@ -435,9 +491,16 @@ bool build_4wide_common(uint32_t count, bool is_tlas, BoxFormat format, uint32_t
     }
 
     const uint32_t box_count = static_cast<uint32_t>(scratch.collapse_stack.size());
-    const uint32_t box_slot_base = 1u;  // slot 0 = 64-byte header
-    const uint32_t elements_slot_base = box_slot_base + box_count * box_slots;
-    const uint32_t parent_slot_base = elements_slot_base + count;
+    const uint64_t box_slot_base64 = 1ull;  // slot 0 = 64-byte header
+    const uint64_t elements_slot_base64 = box_slot_base64 + static_cast<uint64_t>(box_count) * box_slots;
+    const uint64_t parent_slot_base64 = elements_slot_base64 + count;
+    // 32-bit node pointers encode (slot64 << 3) | kind, so total slots must stay < 2^29.
+    if (parent_slot_base64 >= (1ull << 29)) {
+        return false;
+    }
+    const uint32_t box_slot_base = static_cast<uint32_t>(box_slot_base64);
+    const uint32_t elements_slot_base = static_cast<uint32_t>(elements_slot_base64);
+    const uint32_t parent_slot_base = static_cast<uint32_t>(parent_slot_base64);
     const uint32_t total_node_slots = parent_slot_base;  // slots 0..parent_slot_base-1
     const uint32_t parent_table_dwords = total_node_slots;
     const uint64_t raw_bytes =
@@ -608,6 +671,12 @@ bool refit_4wide_common(uint32_t count, bool is_tlas, RefitScratch& scratch, Bvh
     const uint32_t box_slots = box_dwords / kNodeGranularityDwords;
     const uint32_t box_slot_base = bvh.box_offset_dwords / kNodeGranularityDwords;
     const uint32_t elements_slot_base = bvh.elements_offset_dwords / kNodeGranularityDwords;
+    if (static_cast<uint64_t>(bvh.box_offset_dwords) + static_cast<uint64_t>(bvh.box_count) * box_dwords >
+            bvh.dwords.size() ||
+        static_cast<uint64_t>(bvh.elements_offset_dwords) + static_cast<uint64_t>(count) * kNodeGranularityDwords >
+            bvh.dwords.size()) {
+        return false;
+    }
 
     scratch.box_aabbs.resize(bvh.box_count);
 
@@ -698,6 +767,11 @@ Result intersect(const uint32_t desc[4], uint64_t node, float extent, Vec3 origi
     bool hit[4];
     for (uint32_t i = 0; i < 4; ++i) {
         ptr[i] = load((addr + 4ull * i) & kAddressMask);
+        key[i] = 0.0f;
+        hit[i] = false;
+        if (ptr[i] == kNoChild) {
+            continue;
+        }
         float mn[3], mx[3];
         if (kind == 5) {
             for (uint32_t c = 0; c < 3; ++c) {
@@ -715,8 +789,7 @@ Result intersect(const uint32_t desc[4], uint64_t node, float extent, Vec3 origi
             mx[1] = half_f(c & 0xffffu);
             mx[2] = half_f(c >> 16);
         }
-        key[i] = 0.0f;
-        hit[i] = ptr[i] != kNoChild && slab(mn, mx, o, inv, extent, &key[i]);
+        hit[i] = slab(mn, mx, o, inv, extent, &key[i]);
     }
     for (uint32_t i = 0; i < 4; ++i) {
         if (!hit[i]) continue;
@@ -751,8 +824,8 @@ fn pg6_fault(page: u32) {
     }
 }
 
-// Dword at a 40-bit address (x = low 32 bits, y = bits 39:32). Unmapped: counts a fault, reads 0.
-fn pg6_load32(addr: vec2<u32>) -> u32 {
+// Resolves a 40-bit address through the two-level page directory once. Returns 0u on fault.
+fn pg6_resolve(addr: vec2<u32>) -> u32 {
     let page = (addr.x >> 16u) | ((addr.y & 0xffu) << 16u);
     let t = pg6_arena_dir[page >> 12u];
     if (t == 0u) {
@@ -764,13 +837,26 @@ fn pg6_load32(addr: vec2<u32>) -> u32 {
         pg6_fault(page);
         return 0u;
     }
-    let w = (e & 0x1fffffffu) * 16384u + ((addr.x & 0xffffu) >> 2u);
+    return e;
+}
+
+fn pg6_read_resolved(e: u32, page_byte_off: u32) -> u32 {
+    let w = (e & 0x1fffffffu) * 16384u + ((page_byte_off & 0xffffu) >> 2u);
     switch ((e >> 29u) & 3u) {
         case 0u: { return pg6_arena0[w]; }
         case 1u: { return pg6_arena1[w]; }
         case 2u: { return pg6_arena2[w]; }
         default: { return pg6_arena3[w]; }
     }
+}
+
+// Dword at a 40-bit address (x = low 32 bits, y = bits 39:32). Unmapped: counts a fault, reads 0.
+fn pg6_load32(addr: vec2<u32>) -> u32 {
+    let e = pg6_resolve(addr);
+    if (e == 0u) {
+        return 0u;
+    }
+    return pg6_read_resolved(e, addr.x);
 }
 
 fn pg6_add40(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
@@ -788,17 +874,26 @@ fn pg6_f(a: vec2<u32>, off: u32) -> f32 {
     return bitcast<f32>(pg6_load32(pg6_addr_off(a, off)));
 }
 
+fn pg6_f_resolved(e: u32, page_off: u32, off: u32) -> f32 {
+    return bitcast<f32>(pg6_read_resolved(e, page_off + off));
+}
+
+// Bit-exact IEEE-754 NaN test (immune to fast-math folding `x != x` to false on Metal/HLSL).
+fn pg6_isnan(x: f32) -> bool {
+    return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u;
+}
+
 // Slab test of one box: .x = 1.0 when entered, .y = the entry distance.
 fn pg6_slab(mn: vec3<f32>, mx: vec3<f32>, o: vec3<f32>, inv: vec3<f32>, extent: f32) -> vec2<f32> {
     var lo = 0.0;
     var hi = extent;
     for (var a = 0u; a < 3u; a = a + 1u) {
-        if (mn[a] > mx[a]) {
+        if (pg6_isnan(mn[a]) || pg6_isnan(mx[a]) || mn[a] > mx[a]) {
             return vec2<f32>(0.0, 0.0);
         }
         let t0 = (mn[a] - o[a]) * inv[a];
         let t1 = (mx[a] - o[a]) * inv[a];
-        if (t0 != t0 || t1 != t1) {
+        if (pg6_isnan(t0) || pg6_isnan(t1)) {
             continue;
         }
         var a0 = t1;
@@ -821,10 +916,10 @@ fn pg6_tri_miss() -> vec4<u32> {
 }
 
 fn pg6_vec_nan(v: vec3<f32>) -> bool {
-    return v.x != v.x || v.y != v.y || v.z != v.z;
+    return pg6_isnan(v.x) || pg6_isnan(v.y) || pg6_isnan(v.z);
 }
 
-fn pg6_triangle(addr: vec2<u32>, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<u32> {
+fn pg6_triangle(e: u32, page_off: u32, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<u32> {
     var vi = vec3<u32>(0u, 1u, 2u);
     if (kind == 1u) { vi = vec3<u32>(1u, 3u, 2u); }
     if (kind == 2u) { vi = vec3<u32>(2u, 3u, 4u); }
@@ -832,7 +927,8 @@ fn pg6_triangle(addr: vec2<u32>, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<
     var v: array<vec3<f32>, 3>;
     for (var i = 0u; i < 3u; i = i + 1u) {
         let b = vi[i] * 12u;
-        v[i] = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u)) - o;
+        v[i] = vec3<f32>(pg6_f_resolved(e, page_off, b), pg6_f_resolved(e, page_off, b + 4u),
+                         pg6_f_resolved(e, page_off, b + 8u)) - o;
     }
     var kz = 0u;
     var az = abs(d.x);
@@ -868,10 +964,10 @@ fn pg6_triangle(addr: vec2<u32>, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<
     }
     let det = u + vv + w;
     let t_num = u * pz[0] + vv * pz[1] + w * pz[2];
-    if (det == 0.0 || det != det || t_num != t_num || u != u || vv != vv || w != w) {
+    if (det == 0.0 || pg6_isnan(det) || pg6_isnan(t_num) || pg6_isnan(u) || pg6_isnan(vv) || pg6_isnan(w)) {
         return pg6_tri_miss();
     }
-    let sel = (pg6_load32(pg6_addr_off(addr, 60u)) >> (8u * kind)) & 0xffu;
+    let sel = (pg6_read_resolved(e, page_off + 60u) >> (8u * kind)) & 0xffu;
     var wt = array<f32, 4>(u, vv, w, 0.0);
     return vec4<u32>(bitcast<u32>(t_num), bitcast<u32>(det), bitcast<u32>(wt[sel & 3u]),
                      bitcast<u32>(wt[(sel >> 2u) & 3u]));
@@ -885,47 +981,65 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
     if (kind >= 6u) {
         return pg6_tri_miss();
     }
-    let nan_ray = extent != extent || pg6_vec_nan(origin) || pg6_vec_nan(dir) || pg6_vec_nan(inv_dir);
-    // address = (base256 << 8) + ((ptr >> 3) << 6), 40 bits
+    let nan_ray = pg6_isnan(extent) || pg6_vec_nan(origin) || pg6_vec_nan(dir) || pg6_vec_nan(inv_dir);
+    // address = (base256 << 8) + ((ptr >> 3) << 6), 40 bits (guaranteed 64-byte aligned)
     let base = vec2<u32>(desc.x << 8u, ((desc.y & 0xffu) << 8u) | (desc.x >> 24u));
     let idx = vec2<u32>((node.x >> 3u) | (node.y << 29u), node.y >> 3u);
     let off = vec2<u32>(idx.x << 6u, (idx.y << 6u) | (idx.x >> 26u));
     let addr = pg6_add40(base, off);
+    let page_off = addr.x & 0xffffu;
     if (kind < 4u) {
         if (nan_ray) {
             return pg6_tri_miss();
         }
-        return pg6_triangle(addr, kind, origin, dir);
+        let e0 = pg6_resolve(addr);
+        if (e0 == 0u) {
+            return pg6_tri_miss();
+        }
+        return pg6_triangle(e0, page_off, kind, origin, dir);
     }
     if (nan_ray) {
         return vec4<u32>(0xffffffffu);
     }
+    let e0 = pg6_resolve(addr);
+    if (e0 == 0u) {
+        return vec4<u32>(0xffffffffu);
+    }
+    let single_page = kind == 4u || page_off <= 0xff80u;
     var ptr: array<u32, 4>;
     var key: array<f32, 4>;
     var hit: array<bool, 4>;
     for (var i = 0u; i < 4u; i = i + 1u) {
-        ptr[i] = pg6_load32(pg6_addr_off(addr, 4u * i));
+        ptr[i] = pg6_read_resolved(e0, page_off + 4u * i);
+        key[i] = 0.0;
+        hit[i] = false;
+        if (ptr[i] == 0xffffffffu) {
+            continue;
+        }
         var mn: vec3<f32>;
         var mx: vec3<f32>;
         if (kind == 5u) {
             let b = 16u + 24u * i;
-            mn = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u));
-            mx = vec3<f32>(pg6_f(addr, b + 12u), pg6_f(addr, b + 16u), pg6_f(addr, b + 20u));
+            if (single_page) {
+                mn = vec3<f32>(pg6_f_resolved(e0, page_off, b), pg6_f_resolved(e0, page_off, b + 4u),
+                               pg6_f_resolved(e0, page_off, b + 8u));
+                mx = vec3<f32>(pg6_f_resolved(e0, page_off, b + 12u), pg6_f_resolved(e0, page_off, b + 16u),
+                               pg6_f_resolved(e0, page_off, b + 20u));
+            } else {
+                mn = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u));
+                mx = vec3<f32>(pg6_f(addr, b + 12u), pg6_f(addr, b + 16u), pg6_f(addr, b + 20u));
+            }
         } else {
             let b = 16u + 12u * i;
-            let a = unpack2x16float(pg6_load32(pg6_addr_off(addr, b)));
-            let bb = unpack2x16float(pg6_load32(pg6_addr_off(addr, b + 4u)));
-            let c = unpack2x16float(pg6_load32(pg6_addr_off(addr, b + 8u)));
+            let a = unpack2x16float(pg6_read_resolved(e0, page_off + b));
+            let bb = unpack2x16float(pg6_read_resolved(e0, page_off + b + 4u));
+            let c = unpack2x16float(pg6_read_resolved(e0, page_off + b + 8u));
             mn = vec3<f32>(a.x, a.y, bb.x);
             mx = vec3<f32>(bb.y, c.x, c.y);
         }
-        key[i] = 0.0;
-        hit[i] = false;
-        if (ptr[i] != 0xffffffffu) {
-            let s = pg6_slab(mn, mx, origin, inv_dir, extent);
-            hit[i] = s.x > 0.5;
-            key[i] = s.y;
-        }
+        let s = pg6_slab(mn, mx, origin, inv_dir, extent);
+        hit[i] = s.x > 0.5;
+        key[i] = s.y;
     }
     var out = vec4<u32>(0xffffffffu);
     let sort = (desc.y >> 31u) != 0u;
@@ -988,6 +1102,9 @@ void make_bvh_desc(uint64_t base_addr, bool sort_boxes, uint32_t out_desc[4]) {
 }
 
 bool invert_affine_3x4(const float m[3][4], float out_inv[3][4]) {
+    if (!isfinite_3x4(m)) {
+        return false;
+    }
     const double a00 = m[0][0], a01 = m[0][1], a02 = m[0][2], tx = m[0][3];
     const double a10 = m[1][0], a11 = m[1][1], a12 = m[1][2], ty = m[1][3];
     const double a20 = m[2][0], a21 = m[2][1], a22 = m[2][2], tz = m[2][3];
@@ -996,7 +1113,7 @@ bool invert_affine_3x4(const float m[3][4], float out_inv[3][4]) {
     const double c01 = a12 * a20 - a10 * a22;
     const double c02 = a10 * a21 - a11 * a20;
     const double det = a00 * c00 + a01 * c01 + a02 * c02;
-    if (!(std::fabs(det) > 1e-12) || std::isnan(det) || std::isinf(det)) {
+    if (det == 0.0 || !std::isfinite(det)) {
         return false;
     }
     const double inv_det = 1.0 / det;
@@ -1012,20 +1129,25 @@ bool invert_affine_3x4(const float m[3][4], float out_inv[3][4]) {
     const double r21 = (a01 * a20 - a00 * a21) * inv_det;
     const double r22 = (a00 * a11 - a01 * a10) * inv_det;
 
-    out_inv[0][0] = static_cast<float>(r00);
-    out_inv[0][1] = static_cast<float>(r01);
-    out_inv[0][2] = static_cast<float>(r02);
-    out_inv[0][3] = static_cast<float>(-(r00 * tx + r01 * ty + r02 * tz));
+    float tmp[3][4];
+    tmp[0][0] = static_cast<float>(r00);
+    tmp[0][1] = static_cast<float>(r01);
+    tmp[0][2] = static_cast<float>(r02);
+    tmp[0][3] = static_cast<float>(-(r00 * tx + r01 * ty + r02 * tz));
 
-    out_inv[1][0] = static_cast<float>(r10);
-    out_inv[1][1] = static_cast<float>(r11);
-    out_inv[1][2] = static_cast<float>(r12);
-    out_inv[1][3] = static_cast<float>(-(r10 * tx + r11 * ty + r12 * tz));
+    tmp[1][0] = static_cast<float>(r10);
+    tmp[1][1] = static_cast<float>(r11);
+    tmp[1][2] = static_cast<float>(r12);
+    tmp[1][3] = static_cast<float>(-(r10 * tx + r11 * ty + r12 * tz));
 
-    out_inv[2][0] = static_cast<float>(r20);
-    out_inv[2][1] = static_cast<float>(r21);
-    out_inv[2][2] = static_cast<float>(r22);
-    out_inv[2][3] = static_cast<float>(-(r20 * tx + r21 * ty + r22 * tz));
+    tmp[2][0] = static_cast<float>(r20);
+    tmp[2][1] = static_cast<float>(r21);
+    tmp[2][2] = static_cast<float>(r22);
+    tmp[2][3] = static_cast<float>(-(r20 * tx + r21 * ty + r22 * tz));
+    if (!isfinite_3x4(tmp)) {
+        return false;
+    }
+    std::memcpy(out_inv, tmp, sizeof(tmp));
     return true;
 }
 
@@ -1046,7 +1168,9 @@ Vec3 transform_vector_3x4(const float m[3][4], Vec3 v) {
 }
 
 Aabb transform_aabb_3x4(const Aabb& local, const float m[3][4]) {
-    if (local.is_empty()) return Aabb::empty();
+    if (local.is_empty() || !isfinite_vec3(local.min) || !isfinite_vec3(local.max) || !isfinite_3x4(m)) {
+        return Aabb::empty();
+    }
     const float mn[3] = {local.min.x, local.min.y, local.min.z};
     const float mx[3] = {local.max.x, local.max.y, local.max.z};
     float out_mn[3] = {m[0][3], m[1][3], m[2][3]};
@@ -1059,7 +1183,7 @@ Aabb transform_aabb_3x4(const Aabb& local, const float m[3][4]) {
             out_mx[r] += a < b ? b : a;
         }
     }
-    return {{out_mn[0], out_mn[1], out_mn[2]}, {out_mx[0], out_mx[1], out_mx[2]}};
+    return sanitize_aabb({{out_mn[0], out_mn[1], out_mn[2]}, {out_mx[0], out_mx[1], out_mx[2]}});
 }
 
 void pack_triangle_node(const Triangle& tri, uint32_t out_dwords[16]) {
@@ -1146,16 +1270,24 @@ void pack_box16_node(const uint32_t child_ptrs[4], const Aabb child_bounds[4], u
 }
 
 bool pack_instance_node(const InstanceDesc& inst, uint32_t out_dwords[16]) {
+    if (out_dwords == nullptr) return false;
+    auto write_inactive = [&]() {
+        std::memset(out_dwords, 0, 16u * sizeof(uint32_t));
+        out_dwords[15] = kNoChild;
+    };
     if ((inst.blas_address & ~kAddressMask) != 0 || (inst.blas_address & 0xFFull) != 0) {
+        write_inactive();
         return false;
     }
     float inv[3][4];
     if (inst.has_inv_transform) {
+        if (!isfinite_3x4(inst.inv_transform)) {
+            write_inactive();
+            return false;
+        }
         std::memcpy(inv, inst.inv_transform, sizeof(inv));
     } else if (!invert_affine_3x4(inst.transform, inv)) {
-        // Singular transform: pack zeroed inactive instance (mask = 0, root = kNoChild).
-        std::memset(out_dwords, 0, 16u * sizeof(uint32_t));
-        out_dwords[15] = kNoChild;
+        write_inactive();
         return false;
     }
     for (uint32_t r = 0; r < 3u; ++r) {
@@ -1230,6 +1362,7 @@ void BuildScratch::reserve(uint32_t max_primitives) {
     prim_centroids.reserve(max_primitives);
     prim_indices.reserve(max_primitives);
     bin_nodes.reserve(static_cast<size_t>(max_primitives) * 2u);
+    build_stack.reserve(max_primitives > 0u ? std::max<size_t>(64u, max_primitives) : 1u);
     collapse_stack.reserve(max_primitives > 0u ? max_primitives : 1u);
     peak_bytes = std::max(peak_bytes, bytes_allocated());
 }
@@ -1242,6 +1375,7 @@ void BuildScratch::set_budget_bytes(size_t bytes) {
 size_t BuildScratch::bytes_allocated() const {
     return prim_aabbs.capacity() * sizeof(Aabb) + prim_centroids.capacity() * sizeof(Vec3) +
            prim_indices.capacity() * sizeof(uint32_t) + bin_nodes.capacity() * sizeof(BinNode) +
+           build_stack.capacity() * sizeof(BuildTask) +
            collapse_stack.capacity() * sizeof(CollapseTask) + parent_ptrs.capacity() * sizeof(uint32_t);
 }
 
@@ -1255,6 +1389,8 @@ void BuildScratch::trim_to_budget() {
     prim_indices.shrink_to_fit();
     bin_nodes.clear();
     bin_nodes.shrink_to_fit();
+    build_stack.clear();
+    build_stack.shrink_to_fit();
     collapse_stack.clear();
     collapse_stack.shrink_to_fit();
     parent_ptrs.clear();
@@ -1294,7 +1430,7 @@ bool build_blas(const Triangle* triangles, uint32_t count, BoxFormat format, Bui
     for (uint32_t i = 0; i < count; ++i) {
         const Aabb b = triangle_aabb(triangles[i]);
         scratch.prim_aabbs[i] = b;
-        scratch.prim_centroids[i] = b.centroid();
+        scratch.prim_centroids[i] = safe_centroid(b);
     }
     return build_4wide_common(count, false, format, kNodeKindTri0, scratch, out,
                               [triangles](uint32_t i, uint32_t* dst16) { pack_triangle_node(triangles[i], dst16); });
@@ -1303,6 +1439,11 @@ bool build_blas(const Triangle* triangles, uint32_t count, BoxFormat format, Bui
 bool refit_blas(const Triangle* triangles, uint32_t count, RefitScratch& scratch, BvhStructure& blas) {
     if (count > 0u && triangles == nullptr) return false;
     if (blas.is_tlas || blas.element_count != count) return false;
+    if (count > 0u &&
+        static_cast<uint64_t>(blas.elements_offset_dwords) + static_cast<uint64_t>(count) * kNodeGranularityDwords >
+            blas.dwords.size()) {
+        return false;
+    }
     scratch.leaf_aabbs.resize(count);
     for (uint32_t i = 0; i < count; ++i) {
         scratch.leaf_aabbs[i] = triangle_aabb(triangles[i]);
@@ -1320,26 +1461,29 @@ bool build_tlas(const InstanceDesc* instances, uint32_t count, BoxFormat format,
     scratch.prim_centroids.resize(count);
     for (uint32_t i = 0; i < count; ++i) {
         float inv_check[3][4];
-        const bool transform_ok =
-            instances[i].has_inv_transform || invert_affine_3x4(instances[i].transform, inv_check);
+        const bool transform_ok = instances[i].has_inv_transform
+                                      ? isfinite_3x4(instances[i].inv_transform)
+                                      : invert_affine_3x4(instances[i].transform, inv_check);
         const bool addr_ok =
             (instances[i].blas_address & ~kAddressMask) == 0 && (instances[i].blas_address & 0xFFull) == 0;
         const Aabb b = (transform_ok && addr_ok) ? instance_world_aabb(instances[i]) : Aabb::empty();
         scratch.prim_aabbs[i] = b;
-        scratch.prim_centroids[i] = b.is_empty() ? Vec3{0.0f, 0.0f, 0.0f} : b.centroid();
+        scratch.prim_centroids[i] = safe_centroid(b);
     }
     return build_4wide_common(count, true, format, kNodeKindInstance, scratch, out,
                               [instances](uint32_t i, uint32_t* dst16) {
-                                  if (!pack_instance_node(instances[i], dst16)) {
-                                      std::memset(dst16, 0, 16u * sizeof(uint32_t));
-                                      dst16[15] = kNoChild;
-                                  }
+                                  pack_instance_node(instances[i], dst16);
                               });
 }
 
 bool refit_tlas(const InstanceDesc* instances, uint32_t count, RefitScratch& scratch, BvhStructure& tlas) {
     if (count > 0u && instances == nullptr) return false;
     if (!tlas.is_tlas || tlas.element_count != count) return false;
+    if (count > 0u &&
+        static_cast<uint64_t>(tlas.elements_offset_dwords) + static_cast<uint64_t>(count) * kNodeGranularityDwords >
+            tlas.dwords.size()) {
+        return false;
+    }
     scratch.leaf_aabbs.resize(count);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t* dst =
@@ -1347,53 +1491,77 @@ bool refit_tlas(const InstanceDesc* instances, uint32_t count, RefitScratch& scr
         if (pack_instance_node(instances[i], dst)) {
             scratch.leaf_aabbs[i] = instance_world_aabb(instances[i]);
         } else {
-            std::memset(dst, 0, 16u * sizeof(uint32_t));
-            dst[15] = kNoChild;
             scratch.leaf_aabbs[i] = Aabb::empty();
         }
     }
     return refit_4wide_common(count, true, scratch, tlas);
 }
 
-TraceHit trace_blas(uint64_t base_addr, uint32_t root_node, Vec3 origin, Vec3 dir, float t_min, float t_max,
-                    const LoadU32& load, bool sort_boxes, bool cull_back_faces) {
+namespace {
+
+TraceHit trace_blas_impl(uint64_t base_addr, uint32_t root_node, Vec3 origin, Vec3 dir, float t_min, float t_max,
+                         const LoadU32& load, bool sort_boxes, bool cull_back_faces, bool flip_winding) {
     TraceHit best{};
     best.t = t_max;
     if (root_node == kNoChild || !(t_min <= t_max)) {
         return best;
     }
 
+    const uint64_t aligned_base = base_addr & kAddressMask & ~0xFFull;
     uint32_t desc[4];
-    make_bvh_desc(base_addr, sort_boxes, desc);
+    make_bvh_desc(aligned_base, sort_boxes, desc);
     const Vec3 inv_dir = {safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z)};
 
-    constexpr uint32_t kStackCap = 64;
-    uint32_t stack[kStackCap];
+    constexpr uint32_t kInlineStackCap = 128;
+    uint32_t inline_stack[kInlineStackCap];
     uint32_t sp = 0;
-    stack[sp++] = root_node;
+    std::vector<uint32_t> overflow_stack;
+    auto push_node = [&](uint32_t n) {
+        if (overflow_stack.empty() && sp < kInlineStackCap) {
+            inline_stack[sp++] = n;
+        } else {
+            if (overflow_stack.empty()) {
+                overflow_stack.assign(inline_stack, inline_stack + sp);
+                sp = 0;
+            }
+            overflow_stack.push_back(n);
+        }
+    };
+    auto pop_node = [&]() -> uint32_t {
+        if (!overflow_stack.empty()) {
+            const uint32_t n = overflow_stack.back();
+            overflow_stack.pop_back();
+            return n;
+        }
+        return inline_stack[--sp];
+    };
+    auto stack_empty = [&]() -> bool { return sp == 0u && overflow_stack.empty(); };
 
-    while (sp > 0u) {
-        const uint32_t node = stack[--sp];
+    push_node(root_node);
+
+    while (!stack_empty()) {
+        const uint32_t node = pop_node();
         ++best.nodes_visited;
         const uint32_t kind = node_ptr_kind(node);
         const Result r = intersect(desc, node, best.t, origin, dir, inv_dir, load);
         if (kind == kNodeKindBox16 || kind == kNodeKindBox32) {
             // Push far-to-near so nearest child is popped first when sort_boxes is true.
             for (int i = 3; i >= 0; --i) {
-                if (r.w[i] != kNoChild && sp < kStackCap) {
-                    stack[sp++] = r.w[i];
+                if (r.w[i] != kNoChild) {
+                    push_node(r.w[i]);
                 }
             }
         } else if (kind < 4u) {
             const float t_num = bits_f(r.w[0]);
             const float t_den = bits_f(r.w[1]);
-            if (std::isinf(t_num) || t_den == 0.0f) continue;
-            const bool front = t_den > 0.0f;
+            if (!std::isfinite(t_num) || !std::isfinite(t_den) || t_den == 0.0f) continue;
+            const bool front = flip_winding ? (t_den < 0.0f) : (t_den > 0.0f);
             if (cull_back_faces && !front) continue;
             const float t = t_num / t_den;
+            if (!std::isfinite(t)) continue;
             if (t >= t_min && (t < best.t || (!best.hit && t <= best.t))) {
                 const uint64_t node_addr =
-                    ((base_addr & kAddressMask) + (static_cast<uint64_t>(node_ptr_slot(node)) << 6)) & kAddressMask;
+                    (aligned_base + (static_cast<uint64_t>(node_ptr_slot(node)) << 6)) & kAddressMask;
                 best.hit = true;
                 best.t = t;
                 best.u = bits_f(r.w[2]) / t_den;
@@ -1406,6 +1574,13 @@ TraceHit trace_blas(uint64_t base_addr, uint32_t root_node, Vec3 origin, Vec3 di
     return best;
 }
 
+}  // namespace
+
+TraceHit trace_blas(uint64_t base_addr, uint32_t root_node, Vec3 origin, Vec3 dir, float t_min, float t_max,
+                    const LoadU32& load, bool sort_boxes, bool cull_back_faces) {
+    return trace_blas_impl(base_addr, root_node, origin, dir, t_min, t_max, load, sort_boxes, cull_back_faces, false);
+}
+
 TraceHit trace_tlas(uint64_t tlas_base_addr, uint32_t tlas_root_node, Vec3 origin, Vec3 dir, float t_min,
                     float t_max, uint8_t ray_mask, const LoadU32& load, bool sort_boxes,
                     bool cull_back_faces) {
@@ -1415,34 +1590,57 @@ TraceHit trace_tlas(uint64_t tlas_base_addr, uint32_t tlas_root_node, Vec3 origi
         return best;
     }
 
+    const uint64_t aligned_base = tlas_base_addr & kAddressMask & ~0xFFull;
     uint32_t desc[4];
-    make_bvh_desc(tlas_base_addr, sort_boxes, desc);
+    make_bvh_desc(aligned_base, sort_boxes, desc);
     const Vec3 inv_dir = {safe_inv(dir.x), safe_inv(dir.y), safe_inv(dir.z)};
 
     // Read elements_offset_bytes from TLAS header dw13 for instance_index calculation.
-    const uint32_t elements_offset_bytes = load(((tlas_base_addr & kAddressMask) + 13ull * 4ull) & kAddressMask);
+    const uint32_t elements_offset_bytes = load((aligned_base + 13ull * 4ull) & kAddressMask);
     const uint32_t elements_slot_base = elements_offset_bytes / kNodeGranularityBytes;
 
-    constexpr uint32_t kStackCap = 64;
-    uint32_t stack[kStackCap];
+    constexpr uint32_t kInlineStackCap = 128;
+    uint32_t inline_stack[kInlineStackCap];
     uint32_t sp = 0;
-    stack[sp++] = tlas_root_node;
+    std::vector<uint32_t> overflow_stack;
+    auto push_node = [&](uint32_t n) {
+        if (overflow_stack.empty() && sp < kInlineStackCap) {
+            inline_stack[sp++] = n;
+        } else {
+            if (overflow_stack.empty()) {
+                overflow_stack.assign(inline_stack, inline_stack + sp);
+                sp = 0;
+            }
+            overflow_stack.push_back(n);
+        }
+    };
+    auto pop_node = [&]() -> uint32_t {
+        if (!overflow_stack.empty()) {
+            const uint32_t n = overflow_stack.back();
+            overflow_stack.pop_back();
+            return n;
+        }
+        return inline_stack[--sp];
+    };
+    auto stack_empty = [&]() -> bool { return sp == 0u && overflow_stack.empty(); };
 
-    while (sp > 0u) {
-        const uint32_t node = stack[--sp];
+    push_node(tlas_root_node);
+
+    while (!stack_empty()) {
+        const uint32_t node = pop_node();
         ++best.nodes_visited;
         const uint32_t kind = node_ptr_kind(node);
         if (kind == kNodeKindBox16 || kind == kNodeKindBox32) {
             const Result r = intersect(desc, node, best.t, origin, dir, inv_dir, load);
             for (int i = 3; i >= 0; --i) {
-                if (r.w[i] != kNoChild && sp < kStackCap) {
-                    stack[sp++] = r.w[i];
+                if (r.w[i] != kNoChild) {
+                    push_node(r.w[i]);
                 }
             }
         } else if (kind == kNodeKindInstance) {
             const uint32_t slot = node_ptr_slot(node);
             const uint64_t inst_addr =
-                ((tlas_base_addr & kAddressMask) + (static_cast<uint64_t>(slot) << 6)) & kAddressMask;
+                (aligned_base + (static_cast<uint64_t>(slot) << 6)) & kAddressMask;
             uint32_t words[16];
             for (uint32_t i = 0; i < 16u; ++i) {
                 words[i] = load((inst_addr + 4ull * i) & kAddressMask);
@@ -1454,17 +1652,17 @@ TraceHit trace_tlas(uint64_t tlas_base_addr, uint32_t tlas_root_node, Vec3 origi
             const Vec3 local_o = transform_point_3x4(inst.inv_transform, origin);
             const Vec3 local_d = transform_vector_3x4(inst.inv_transform, dir);
             const bool cull_back = cull_back_faces && ((inst.flags & InstanceFlags::TriangleCullDisable) == 0u);
+            const bool flip_winding = (inst.flags & InstanceFlags::TriangleFrontCounterclockwise) != 0u;
             const TraceHit sub =
-                trace_blas(inst.blas_address, inst.blas_root_node, local_o, local_d, t_min, best.t, load,
-                           sort_boxes, cull_back);
+                trace_blas_impl(inst.blas_address, inst.blas_root_node, local_o, local_d, t_min, best.t, load,
+                                sort_boxes, cull_back, flip_winding);
             best.nodes_visited += sub.nodes_visited;
             if (sub.hit && (sub.t < best.t || (!best.hit && sub.t <= best.t))) {
                 best.hit = true;
                 best.t = sub.t;
                 best.u = sub.u;
                 best.v = sub.v;
-                best.front_face =
-                    (inst.flags & InstanceFlags::TriangleFrontCounterclockwise) ? !sub.front_face : sub.front_face;
+                best.front_face = sub.front_face;
                 best.primitive_index = sub.primitive_index;
                 best.instance_index = slot >= elements_slot_base ? (slot - elements_slot_base) : 0u;
                 best.instance_id = inst.instance_id;
