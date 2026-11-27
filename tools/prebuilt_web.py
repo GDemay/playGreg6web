@@ -23,6 +23,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 MANIFEST = "prebuilt.json"
@@ -122,17 +123,41 @@ def info(prebuilt: Path, repo: Path | None) -> str:
     return line
 
 
+SWAP_ATTEMPTS = 5
+SWAP_DELAYS = (0.5, 1.0, 2.0, 4.0)
+
+
+def _retry(what: str, fn, *args) -> None:
+    """Run fn(*args), retrying on OSError (a dir held open by a server/AV/indexer) with backoff."""
+    last: OSError | None = None
+    for attempt in range(SWAP_ATTEMPTS):
+        try:
+            fn(*args)
+            return
+        except OSError as e:
+            last = e
+            if attempt < SWAP_ATTEMPTS - 1:
+                print(f"swap: {what} failed ({e}); retry {attempt + 1}/{SWAP_ATTEMPTS - 1} in {SWAP_DELAYS[attempt]}s",
+                      file=sys.stderr)
+                time.sleep(SWAP_DELAYS[attempt])
+    raise OSError(f"swap: {what} still failing after {SWAP_ATTEMPTS} attempts; something is probably holding the "
+                  f"directory open (a running server, antivirus, explorer): {last}") from last
+
+
 def swap(new: Path, target: Path) -> None:
     old = target.with_name(target.name + ".old")
     if old.exists():
-        shutil.rmtree(old)
+        _retry(f"removing stale {old}", shutil.rmtree, old)
     if target.exists():
-        os.replace(target, old)
+        _retry(f"moving {target} aside to {old}", os.replace, target, old)
     try:
-        os.replace(new, target)
-    except OSError:
+        _retry(f"moving {new} into {target}", os.replace, new, target)
+    except OSError as e:
         if old.exists():
-            os.replace(old, target)
+            try:
+                _retry(f"rolling back {old} to {target}", os.replace, old, target)
+            except OSError as rb:
+                raise OSError(f"{e}; ROLLBACK ALSO FAILED, previous build is at {old}: {rb}") from e
         raise
     shutil.rmtree(old, ignore_errors=True)
 
