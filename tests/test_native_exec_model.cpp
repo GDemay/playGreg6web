@@ -278,6 +278,19 @@ void test_shader_payloads() {
     CHECK(resolve_shader_entry_point("@vertex fn only() {}", std::nullopt, "vertex") == "only");
     CHECK(resolve_shader_entry_point("", std::nullopt, "compute") == "cs_main");
     CHECK(resolve_shader_entry_point("", std::string("custom"), "fragment") == "custom");
+    // All cached stage resolutions match the old individual path for alternate-stage reuse,
+    // comments, absent stages and explicit names that do or do not exist in this module.
+    for (const std::string& source : {code, std::string{}, std::string("@compute fn custom() {}"),
+                                      std::string("/* @fragment fn ignored() {} */ @vertex fn v() {}")}) {
+        for (const std::optional<std::string>& explicit_ep : {std::optional<std::string>{},
+                                                               std::optional<std::string>{"vs_other"},
+                                                               std::optional<std::string>{"bad-name"}}) {
+            const auto all = resolve_all_shader_entry_points(source, explicit_ep);
+            CHECK(all[0] == resolve_shader_entry_point(source, explicit_ep, "vertex"));
+            CHECK(all[1] == resolve_shader_entry_point(source, explicit_ep, "fragment"));
+            CHECK(all[2] == resolve_shader_entry_point(source, explicit_ep, "compute"));
+        }
+    }
     CHECK(wgsl_declares_group0("@group( 0 ) @binding(1) var s: sampler;"));
     CHECK(!wgsl_declares_group0("@group(1) @binding(0) var s: sampler;"));
     CHECK(strip_wgsl_comments("a /* b /* c */ d */ e // f\ng") == "a    e \ng");

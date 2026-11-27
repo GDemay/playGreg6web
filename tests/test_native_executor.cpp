@@ -22,6 +22,8 @@
 #include "gpu/state_bridge.h"
 #include "gpu/gpu_time.h"
 #include "gpu/native_exec/native_executor.h"
+#include "gpu/native_exec/binding_access_model.h"
+#include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/state_bridge.h"
 #include "gpu/native_exec/reflection_model.h"
 #include "gpu/native_exec/shader_quarantine.h"
@@ -976,12 +978,13 @@ const char* kComputeGroup3 = R"(
 }
 )";
 
-void test_layout_fit_missing_group(NativeExecutor& ex) {
+void test_layout_fit_missing_group(NativeExecutor& ex, bool packed = false) {
     const ExecutorStats before = ex.stats();
     gpu::CommandEncoder setup;
     setup.create_buffer(130, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
     setup.create_buffer(131, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
-    setup.create_shader_module(132, GpuShaderStage::Compute, kComputeGroup3);
+    setup.create_shader_module(132, GpuShaderStage::Compute,
+                               packed ? "0x00b16b00b5c0ffea" : kComputeGroup3);
     create_layouts(setup, 133, 134, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
     GpuCreateComputePipeline2Payload cp;
     std::memset(&cp, 0, sizeof cp);
@@ -2709,8 +2712,9 @@ void test_shader_workers(const char* wait_ms) {
     cp.pipeline_layout_id = 113;
     emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
     create_bind_group(setup, 115, 112, {bg_entry(0, GpuBindResourceType::Buffer, 110)});
-    // The layout is destroyed right away: the deferred pipeline keeps the one it was created with.
+    // The deferred pipeline keeps the layout and shader alive after their IDs are destroyed.
     emit(setup, GpuOpcode::DestroyResource, bytes_of(uint32_t{113}));
+    emit(setup, GpuOpcode::DestroyResource, bytes_of(uint32_t{111}));
     const auto t0 = std::chrono::steady_clock::now();
     run(ex, setup);
     const uint64_t setup_ns = static_cast<uint64_t>(
@@ -2912,6 +2916,158 @@ void test_norm16_volume_filtered_read(NativeExecutor& ex) {
     FrameImage img;
     std::string err;
     CHECK(ex.read_last_frame(&img, &err) && px_near(img, 1, 1, 128, 128, 128, 255, 2));
+}
+
+// #2086's all-group cache must remain available after a worker drops the pack text.
+void test_worker_group_metadata() {
+    ExecutorOptions opts;
+    opts.width = kW; opts.height = kH; opts.async_pipelines = true;
+    set_env("PG6_PIPELINE_WAIT_MS", "10000");
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    set_env("PG6_PIPELINE_WAIT_MS", "");
+    if (!ex) { CHECK(status == NativeExecutor::CreateStatus::NoAdapter); return; }
+    if (ex->stats().shader_workers == 0) return;
+    const std::string path = "test_worker_group_metadata.wgsl.pack";
+    CHECK(write_one_shader_pack(path, 0x00b16b00b5c0ffeaull, 3, kComputeGroup3));
+    CHECK(ex->load_wgsl_pack(path, &error));
+    test_layout_fit_missing_group(*ex, true);
+    CHECK(ex->stats().shader_async == 1);
+    CHECK(ex->stats().shader_code_rereads == 0);
+    if (!std::getenv("PG6_KEEP_WGSL")) CHECK(ex->stats().shader_scans == 8);
+    if (!std::getenv("PG6_NO_BINDING_ACCESS")) CHECK(ex->stats().shader_access_scans == 1);
+    std::error_code ec; std::filesystem::remove(path, ec);
+}
+
+// A pack module containing both stages is created as vertex, then reused as fragment by v2.
+// The v1 pipeline is built after the worker has finished, so its group-zero check must use cached
+// metadata as well. Rendering and the missing-group skip exercise the decisions after release.
+void test_shader_pack_identity(const char* raw_case) {
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.async_pipelines = true;
+    set_env("PG6_PIPELINE_WAIT_MS", "10000");
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto exu = NativeExecutor::create(opts, &status, &error);
+    set_env("PG6_PIPELINE_WAIT_MS", "");
+    if (!exu) { CHECK(status == NativeExecutor::CreateStatus::NoAdapter); return; }
+    NativeExecutor& ex = *exu;
+    if (ex.stats().shader_workers == 0) return;
+    const std::string path = "test_released_shader_source.wgsl.pack";
+    const uint64_t hash = 0x00b16b00b5c0fff0ull;
+    const std::string scenario = raw_case;
+    // This comment makes the conservative fragment-output scanner return nullopt while the actual
+    // WGSL still has a valid fragment entry point. Its cached unknown result must not cause rereads.
+    const std::string prefix = scenario == "unknown-mask" ? "// @fragment fn fs_main() -> MysteryReturn\n" : "";
+    // Padding forces a later seek out of stdio's old buffer for in-place overwrite tests.
+    const std::string original = prefix + "@group(0) @binding(2) var<storage, read_write> spare: array<u32>;\n" +
+                                 std::string(kTexturedTriangle) + "\n// " + std::string(16384, 'x') + "\n";
+    if (scenario == "unknown-mask") CHECK(!wgsl_fragment_output_mask(original, "fs_main").has_value());
+    std::string changed = original;
+    const size_t fragment_pos = changed.find("fs_main");
+    CHECK(fragment_pos != std::string::npos);
+    changed.replace(fragment_pos, 7, "fs_fake");
+    changed.insert(changed.find("@vertex"), "fn future_write() { spare[0] = 1u; }\n");
+    CHECK(scan_binding_access(original).of(0, 2) == BindingAccess::Unreferenced);
+    CHECK(scan_binding_access(changed).of(0, 2) == BindingAccess::Written);
+    CHECK(write_one_shader_pack(path, hash, 1, original));
+    CHECK(ex.load_wgsl_pack(path, &error));
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    emit(setup, GpuOpcode::CreateTexture2,
+         bytes_of(texture2(400, 1, 1, GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst, 22)));
+    GpuWriteTexturePayload wt{};
+    wt.texture_id = 400; wt.width = 1; wt.height = 1; wt.depth_or_layers = 1;
+    wt.bytes_per_row = 256; wt.rows_per_image = 1; wt.data_len = 4;
+    auto payload = bytes_of(wt);
+    payload.insert(payload.end(), {255, 128, 0, 255});
+    emit(setup, GpuOpcode::WriteTexture, payload);
+    setup.create_sampler(401);
+    setup.create_shader_module(402, GpuShaderStage::Vertex, "0x00b16b00b5c0fff0");
+    setup.create_shader_module(410, GpuShaderStage::Vertex, "0x00b16b00b5c0fff0");
+    create_layouts(setup, 403, 404,
+                   {layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture, 0, 2),
+                    layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Sampler, 0)});
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(409, 402, 0, 404)));
+    setup.create_render_pipeline(406, 402, 402, 0);
+    emit(setup, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(413, 410, 0, 404)));
+    setup.create_render_pipeline(411, 410, 410, 0);
+    create_bind_group(setup, 407, 403, {bg_entry(0, GpuBindResourceType::TextureView, 400),
+                                        bg_entry(1, GpuBindResourceType::Sampler, 401)});
+    const GpuBindGroupEntry entries[2] = {
+        {0, static_cast<uint32_t>(GpuBindResourceType::TextureView), 400, 0, 0, 0},
+        {1, static_cast<uint32_t>(GpuBindResourceType::Sampler), 401, 0, 0, 0},
+    };
+    setup.create_bind_group(408, 406, 0, entries, 2);
+    run(ex, setup);
+    // The v1 packet waits for worker materialization. Replacing the pack must not change the
+    // source metadata of an existing module that was already compiled from the first pack.
+    const std::string other = "test_released_shader_replacement.wgsl.pack";
+    if (scenario == "missing") {
+        CHECK(write_one_shader_pack(other, hash + 1, 3, "@compute @workgroup_size(1) fn cs_main() {}"));
+        CHECK(ex.load_wgsl_pack(other, &error));
+    } else if (scenario == "same-hash") {
+        CHECK(write_one_shader_pack(other, hash, 1, changed));
+        CHECK(ex.load_wgsl_pack(other, &error));
+    } else if (scenario == "in-place") {
+        if (!write_one_shader_pack(path, hash, 1, changed)) {
+            std::printf("shader pack identity: in-place overwrite unsupported\n");
+            return;
+        }
+    } else if (scenario == "truncated") {
+        std::error_code resize_error;
+        std::filesystem::resize_file(path, 36, resize_error);
+        if (resize_error) {
+            std::printf("shader pack identity: in-place truncate unsupported\n");
+            return;
+        }
+    } else if (scenario == "failed-open") {
+        std::error_code ec;
+        std::filesystem::remove(other, ec);
+        CHECK(!ex.load_wgsl_pack(other, &error));
+    } else {
+        CHECK(scenario == "unchanged" || scenario == "unknown-mask");
+    }
+    gpu::CommandEncoder later;
+    emit(later, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(405, 402, 402, 404)));
+    emit(later, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(412, 410, 410, 404)));
+    emit(later, GpuOpcode::CreateRenderPipeline2, bytes_of(pipeline_to_bgra(414, 402, 402, 404)));
+    run(ex, later);
+    for (uint32_t pipe : {405u, 412u, 414u, 406u}) {
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        if (pipe != 406u) {
+            const auto pass = swapchain_pass(GpuLoadOp::Clear, 0, 0, 0, 1);
+            frame.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof pass);
+        }
+        frame.set_pipeline(pipe);
+        if (pipe != 406u) set_bind_group2(frame, 0, 407);
+        else frame.set_bind_group(0, 408);
+        frame.draw(3);
+        if (pipe != 406u) frame.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+        frame.present();
+        run(ex, frame);
+        ex.wait_idle(); ex.poll();
+        CHECK(frame_is(ex, {0, 128, 255, 255}));
+    }
+    gpu::CommandEncoder skip;
+    skip.begin_frame(); skip.set_pipeline(406); skip.draw(3); skip.present();
+    run(ex, skip);
+    CHECK(ex.stats().shader_async == before.shader_async + 2);
+    CHECK(ex.stats().shader_async_max_bytes == original.size());
+    if (!std::getenv("PG6_KEEP_WGSL")) CHECK(ex.stats().shader_scans == before.shader_scans + 16);
+    if (!std::getenv("PG6_NO_BINDING_ACCESS")) {
+        CHECK(ex.stats().shader_access_scans == before.shader_access_scans + 2);
+        CHECK(ex.stats().shader_rw_never_written == before.shader_rw_never_written + 2);
+    }
+    CHECK(ex.stats().draws == before.draws + 4);
+    CHECK(ex.stats().draws_skipped == before.draws_skipped + 1);
+    CHECK(ex.stats().device_errors == before.device_errors);
+    CHECK(ex.stats().shader_code_rereads == before.shader_code_rereads);
+    std::error_code ec; std::filesystem::remove(path, ec); std::filesystem::remove(other, ec);
 }
 
 void test_depth_texture_float_layout(NativeExecutor& ex) {
@@ -4514,6 +4670,9 @@ int main() {
     test_async_pipelines_and_blob_cache();
     test_shader_workers("0");
     test_shader_workers("10000");
+    test_worker_group_metadata();
+    for (const char* scenario : {"unchanged", "unknown-mask", "missing", "same-hash", "in-place", "truncated", "failed-open"})
+        test_shader_pack_identity(scenario);
     test_remap_reflected_layout(true);
     test_remap_reflected_layout(false);
     test_dawn_validation_fixes(*ex);

@@ -1,0 +1,303 @@
+{
+  "baseline_commit": "be4c597725345de8005196ef4b60c64b747208ba",
+  "patch": "worktree containing this benchmark and shader identity fix",
+  "date": "2026-11-27",
+  "environment": {
+    "cpu": "AMD EPYC 7763",
+    "os": "Linux 6.8.0-1070-azure x86_64",
+    "compiler": "g++ 13.3.0",
+    "flags": "-std=c++20 -O3 -DNDEBUG",
+    "machine": "dedicated GitHub Codespace, 4 vCPU, 15 GiB memory",
+    "adapter": "not used by this benchmark"
+  },
+  "workload": "12 synthetic WGSL sources, one third vertex, fragment and compute; approximately 64 KiB or 3 MiB each. Generated with unique unused helper functions; no game material. Harness models the production worker metadata scans: old code resolves the declared stage and only a fragment-stage mask; proposed code resolves all stage entrypoints and a fragment mask, while both parse group 0, all groups and declarations before releasing source storage. Generation and original explicit entry-point extraction are outside the timed region.",
+  "sampling": "Seven process-level samples per variant and workload, alternating baseline/patch order. Each scan_ns sums 12 sequential scan durations. Binaries were built before timing; process listing showed no concurrent builds or CPU-intensive work. Source capacity is summed immediately before and after releasing each source. The checksum is a work counter, not proof of rendered output.",
+  "commands": [
+    "c++ -std=c++20 -O3 -DNDEBUG -I BASE/runtime PATCH/tools/bench_shader_identity.cpp -o bench-base",
+    "c++ -std=c++20 -O3 -DNDEBUG -DPROPOSED -I PATCH/runtime PATCH/tools/bench_shader_identity.cpp -o bench-patch",
+    "Run each executable with arguments 12 65536 and 12 3145728, alternating order seven times. BASE and PATCH are separate checkouts."
+  ],
+  "limitations": "Synthetic scanner-model benchmark only: measured before #2167, it excludes the subsequently added binding-access scan and does not measure the complete current worker. No actual native executor, pack I/O, Dawn compilation, GPU, browser, process RSS or game timing. Both variants implement upstream source release, so its memory saving is not a new benefit of this fix. Scan timing depends on shader text shape and does not establish a game or startup speedup. Capacity includes implementation-specific small-string capacity.",
+  "samples": [
+    {
+      "sample": 0,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13869850,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 0,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13641553,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 0,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 674024048,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 0,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 652290390,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 1,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13327728,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 1,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13590320,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 1,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 649324747,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 1,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 666376326,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 2,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13660828,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 2,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13342927,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 2,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 666955283,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 2,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 650075714,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 3,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13112428,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 3,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13567830,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 3,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 652109521,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 3,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 665803099,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 4,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13720721,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 4,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13159106,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 4,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 666776184,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 4,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 648180432,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 5,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13452362,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 5,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13687679,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 5,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 649914988,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 5,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 709247056,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 6,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13612458,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 6,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 65536,
+      "scan_ns": 13347755,
+      "before_capacity": 786268,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 6,
+      "variant": "base",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 673645081,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    },
+    {
+      "sample": 6,
+      "variant": "patch",
+      "count": 12,
+      "target_bytes": 3145728,
+      "scan_ns": 646621849,
+      "before_capacity": 37748632,
+      "after_capacity": 180,
+      "checksum": 100
+    }
+  ]
+}
