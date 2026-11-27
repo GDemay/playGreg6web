@@ -2010,7 +2010,60 @@ void test_xg() {
         std::vector<uint8_t> back;
         CHECK(gfx10::detile_from_surface(gd, c.mip, written.data(), written.size(), back).ok);
         CHECK(back == lin);
+        // CopyFromSubresource (slot 9) reads the same subresource back into linear rows with a
+        // padded pitch (CopyInto then CopyFrom is the identity); padding bytes stay untouched.
+        {
+            const uint32_t pitch = row + 48;
+            const uint32_t slice_pitch = pitch * rows + 64;
+            const size_t out_len = size_t{slice_pitch} * md;
+            const uint64_t tout_lin = com::guest_alloc(out_len);
+            CHECK(com::write_guest(tout_lin, std::vector<uint8_t>(out_len, 0xCD).data(), out_len));
+            CHECK(as_hr(fx.vcall(tcomp, 9, {I(tout_lin), I(0), I(sub), I(0), I(tdst), I(pitch), I(slice_pitch)})) == 0);
+            const std::vector<uint8_t> got = guest_bytes(tout_lin, out_len);
+            bool same = true;
+            for (uint32_t z = 0; z < md; ++z) {
+                for (uint32_t y = 0; y < rows; ++y) {
+                    const uint8_t* g = got.data() + size_t{z} * slice_pitch + size_t{y} * pitch;
+                    same = same && std::memcmp(g, lin.data() + (size_t{z} * rows + y) * row, row) == 0 && g[row] == 0xCD;
+                }
+            }
+            CHECK(same);
+            CHECK(as_hr(fx.vcall(tcomp, 9, {I(tout_lin), I(0), I(sub), I(0), I(tdst), I(row - 1), I(slice_pitch)})) ==
+                  com::E_INVALIDARG_HR);
+            CHECK(as_hr(fx.vcall(tcomp, 9, {I(tout_lin), I(0), I(sub), I(1), I(tdst), I(pitch), I(slice_pitch)})) ==
+                  com::E_INVALIDARG_HR);
+            CHECK(as_hr(fx.vcall(tcomp, 9, {I(tout_lin), I(0), I(c.mips * slices), I(0), I(tdst), I(pitch),
+                                             I(slice_pitch)})) == com::E_INVALIDARG_HR);
+            CHECK(as_hr(fx.vcall(tcomp, 9, {I(0), I(0), I(sub), I(0), I(tdst), I(pitch), I(slice_pitch)})) ==
+                  com::E_POINTER_HR);
+        }
         CHECK(fx.vcall(tcomp, 1) == 0);
+    }
+    // Slot 9 on the depth/stencil planes: each plane reads back what slot 8 wrote to it.
+    {
+        const uint64_t dd = xg_desc(3, 200, 120, 1, 2, 118);
+        CHECK(com::write_guest(dd + 0x2C, uint32_t{0x105}));
+        const uint64_t dout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(dd), I(dout)})) == 0);
+        const uint64_t dc = load64(dout);
+        const uint64_t dva = com::guest_alloc(0x40000);
+        for (uint32_t p = 0; p < 2; ++p) {
+            const uint32_t bpe = p == 0 ? 2u : 1u;
+            const uint32_t mw = p == 0 ? 100u : 200u;  // plane 0 mip 1, plane 1 mip 0
+            const uint32_t mh = p == 0 ? 60u : 120u;
+            const uint32_t sub = p == 0 ? 1u : 0u;
+            std::vector<uint8_t> lin(size_t{mw} * mh * bpe);
+            for (size_t i = 0; i < lin.size(); ++i) {
+                lin[i] = static_cast<uint8_t>(i * 11u + p);
+            }
+            const uint64_t sva = com::guest_alloc(lin.size());
+            CHECK(com::write_guest(sva, lin.data(), lin.size()));
+            CHECK(as_hr(fx.vcall(dc, 8, {I(dva), I(p), I(sub), I(sva), I(mw * bpe), I(lin.size())})) == 0);
+            const uint64_t back = com::guest_alloc(lin.size());
+            CHECK(as_hr(fx.vcall(dc, 9, {I(back), I(p), I(sub), I(0), I(dva), I(mw * bpe), I(lin.size())})) == 0);
+            CHECK(guest_bytes(back, lin.size()) == lin);
+        }
+        CHECK(fx.vcall(dc, 1) == 0);
     }
     {
         const uint64_t rdesc = xg_desc(3, 256, 256, 1, 1, 28);
@@ -2025,6 +2078,18 @@ void test_xg() {
         std::memcpy(&rm, guest_bytes(rlayout, ga::kXgResourceLayoutSize).data() + ga::kXgLayoutPlaneOffset +
                              ga::kXgPlaneMipOffset, sizeof(rm));
         CHECK(rm.pitch_bytes == 1024 && rm.size_bytes == 256u * 1024u);
+        // The linear answer round-trips through slots 8 and 9 too (host computer's rows).
+        std::vector<uint8_t> lin(256u * 256u * 4u);
+        for (size_t i = 0; i < lin.size(); ++i) {
+            lin[i] = static_cast<uint8_t>(i * 5u + (i >> 11));
+        }
+        const uint64_t rsrc = com::guest_alloc(lin.size());
+        CHECK(com::write_guest(rsrc, lin.data(), lin.size()));
+        const uint64_t rres = com::guest_alloc(rm.size_bytes + 0x1000);
+        CHECK(as_hr(fx.vcall(rcomp, 8, {I(rres), I(0), I(0), I(rsrc), I(1024), I(lin.size())})) == 0);
+        const uint64_t rback = com::guest_alloc(lin.size());
+        CHECK(as_hr(fx.vcall(rcomp, 9, {I(rback), I(0), I(0), I(0), I(rres), I(1024), I(lin.size())})) == 0);
+        CHECK(guest_bytes(rback, lin.size()) == lin);
         CHECK(fx.vcall(rcomp, 1) == 0);
     }
 }

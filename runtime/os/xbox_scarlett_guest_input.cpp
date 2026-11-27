@@ -1016,6 +1016,70 @@ public:
         return hr;
     }
 
+    // 9 CopyFromSubresource(linearDst, plane, subresource, reserved, tiledSrc, rowPitch, slicePitch):
+    // the inverse of slot 8 (resource layout -> linear rows). Shape from the title's one call site
+    // (sub_140979E30): rdx = its linear buffer, r8 = 0, r9 = subresource, a 32-bit 0 on the stack,
+    // then the resource base and the destination row / slice pitch; HRESULT, success when >= 0.
+    // When the wanted pitches differ from the ones it passes, the title copies the linear result
+    // row by row into the final buffer itself. The 32-bit fourth argument is always 0 there; its
+    // meaning is unknown, so a non-zero value is refused (E_INVALIDARG) instead of guessed.
+    HResult CopyFromSubresource(uint64_t dst, uint32_t plane, uint32_t subresource, uint32_t reserved, uint64_t src,
+                                uint32_t row_pitch, uint32_t slice_pitch) {
+        if (dst == 0 || src == 0) {
+            return com::E_POINTER_HR;
+        }
+        if (layout_.mip_levels == 0) {
+            return com::E_INVALIDARG_HR;
+        }
+        if (reserved != 0) {
+            if (xg_reserved_refusals().fetch_add(1) == 0) {
+                diag("xg_xs: CopyFromSubresource with non-zero fourth argument 0x" + hex32(reserved) +
+                     " refused (meaning unknown; counted)");
+            }
+            return com::E_INVALIDARG_HR;
+        }
+        if (tiled_) {
+            return copy_from_tiled(dst, plane, subresource, src, row_pitch, slice_pitch);
+        }
+        if (plane != 0) {
+            return com::E_INVALIDARG_HR;
+        }
+        const Pg6XgMipLevelLayout& ml = layout_.mips[subresource % layout_.mip_levels];
+        const uint32_t depth = desc_.dimension == 4 ? ml.depth : 1u;
+        const ElementInfo e = element_info(desc_.format);
+        const uint64_t row_bytes = uint64_t{ceil_div(ml.width, e.block)} * e.bytes;
+        if (row_pitch < row_bytes || (depth > 1 && slice_pitch < uint64_t{row_pitch} * ml.padded_rows)) {
+            return com::E_INVALIDARG_HR;
+        }
+        const uint64_t dst_len = depth > 1 ? uint64_t{slice_pitch} * (depth - 1) + uint64_t{row_pitch} * ml.padded_rows
+                                           : uint64_t{row_pitch} * ml.padded_rows;
+        const void* s = com::guest_to_host(src, layout_.size_bytes);
+        void* d = com::guest_to_host(dst, dst_len);
+        // Ranges that are not one host piece go through bounce copies (as in slot 8).
+        std::vector<uint8_t> src_bounce;
+        std::vector<uint8_t> dst_bounce;
+        if (s == nullptr) {
+            src_bounce.resize(static_cast<size_t>(layout_.size_bytes));
+            if (!com::read_guest(src, src_bounce.data(), src_bounce.size())) {
+                return com::E_INVALIDARG_HR;
+            }
+            s = src_bounce.data();
+        }
+        if (d == nullptr) {
+            dst_bounce.resize(static_cast<size_t>(dst_len));
+            if (!com::read_guest(dst, dst_bounce.data(), dst_bounce.size())) {
+                return com::E_INVALIDARG_HR;
+            }
+            d = dst_bounce.data();
+        }
+        const HResult hr = host_->CopyFromSubresource(d, row_pitch, slice_pitch, s, plane, subresource);
+        if (!dst_bounce.empty() && !com::write_guest(dst, dst_bounce.data(), dst_bounce.size())) {
+            return com::E_INVALIDARG_HR;
+        }
+        guest_window::mark_written(dst, static_cast<size_t>(dst_len));  // O37
+        return hr;
+    }
+
     // 6 GetTexelElementOffsetBytes(plane, mipLevel, x, y, zOrSlice, sample, bitOffset*) -> UINT64:
     // byte offset from the resource base of element (x, y) of the mip in slice zOrSlice. The title
     // passes element coordinates (for BC formats it divides texel coordinates by 4 itself). Tiled
@@ -1264,6 +1328,56 @@ private:
         return kOk;
     }
 
+    // Inverse of copy_into_tiled: detile mip `subresource % mips` of its slice (and plane) from the
+    // GFX10 surface at `src` (gpu/gfx10_detile.h, the same placement slot 8 writes) into linear rows
+    // at `dst` with the caller's pitches.
+    HResult copy_from_tiled(uint64_t dst, uint32_t plane, uint32_t subresource, uint64_t src, uint32_t row_pitch,
+                            uint32_t slice_pitch) {
+        namespace gfx10 = playgta6::gpu::gfx10;
+        if (plane >= (planar_ ? 2u : 1u) || subresource >= tiled_desc_.mip_levels * slices_) {
+            return com::E_INVALIDARG_HR;
+        }
+        const gfx10::TextureLayoutDesc& td = planar_ ? plane_desc_[plane] : tiled_desc_;
+        const uint64_t chain_bytes = planar_ ? plane_chain_[plane] : chain_bytes_;
+        if (planar_) {
+            src += plane_offset_[plane];
+        }
+        const gfx10::FormatGeometry g = gfx10::format_geometry(td.dxgi_format);
+        const uint32_t mip = subresource % tiled_desc_.mip_levels;
+        src += uint64_t{subresource / td.mip_levels} * chain_bytes;
+        const uint32_t w = std::max(1u, td.width >> mip);
+        const uint32_t h = std::max(1u, td.height >> mip);
+        const uint32_t d = std::max(1u, td.depth >> mip);
+        const uint32_t row_bytes = (w + g.block_width - 1u) / g.block_width * g.bytes_per_block;
+        const uint32_t rows = (h + g.block_height - 1u) / g.block_height;
+        if (row_pitch < row_bytes || (d > 1 && slice_pitch < uint64_t{row_pitch} * rows)) {
+            return com::E_INVALIDARG_HR;
+        }
+        std::vector<uint8_t> surface(chain_bytes);
+        std::vector<uint8_t> linear;
+        if (!com::read_guest(src, surface.data(), surface.size()) ||
+            !gfx10::detile_from_surface(td, mip, surface.data(), surface.size(), linear).ok ||
+            linear.size() < size_t{row_bytes} * rows * d) {
+            return com::E_INVALIDARG_HR;
+        }
+        for (uint32_t z = 0; z < d; ++z) {
+            for (uint32_t y = 0; y < rows; ++y) {
+                const uint64_t to = dst + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
+                if (!com::write_guest(to, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
+                    return com::E_INVALIDARG_HR;
+                }
+            }
+        }
+        const uint64_t span = uint64_t{d - 1} * slice_pitch + uint64_t{rows - 1} * row_pitch + row_bytes;
+        guest_window::mark_written(dst, static_cast<size_t>(span));  // O37
+        return kOk;
+    }
+
+    static std::atomic<uint64_t>& xg_reserved_refusals() {
+        static std::atomic<uint64_t> n{0};
+        return n;
+    }
+
     static std::string hex32(uint32_t v) {
         char b[12];
         std::snprintf(b, sizeof(b), "%x", v);
@@ -1373,7 +1487,7 @@ constexpr com::MethodDesc kXgMethods[] = {
     XM::method<&XgComputer::GetTexelElementOffsetBytes>("GetTexelElementOffsetBytes"),  // 6
     {},                                                                   // 7 unknown
     XM::method<&XgComputer::CopyIntoSubresource>("CopyIntoSubresource"),  // 8
-    {},                                                                   // 9 unknown
+    XM::method<&XgComputer::CopyFromSubresource>("CopyFromSubresource"),  // 9
     XM::method<&XgComputer::GetResourceTiling>("GetResourceTiling"),      // 10
 };
 constexpr auto kIXgComputer =
