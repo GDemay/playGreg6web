@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -33,6 +35,7 @@
 #include "os/audio_downmix.h"
 #include "os/bcpack.h"
 #include "os/httpfs_mailbox.h"
+#include "os/guest_window.h"
 #include "os/vmem.h"
 #include "os/xapu_opus.h"
 #include "os/win32_compat.h"
@@ -2010,6 +2013,9 @@ void test_xg() {
         std::vector<uint8_t> back;
         CHECK(gfx10::detile_from_surface(gd, c.mip, written.data(), written.size(), back).ok);
         CHECK(back == lin);
+        const uint64_t tight_back = com::guest_alloc(lin.size());
+        CHECK(as_hr(fx.vcall(tcomp, 9, {I(tight_back), I(0), I(sub), I(0), I(tdst), I(row), I(row * rows)})) == 0);
+        CHECK(guest_bytes(tight_back, lin.size()) == lin);
         // CopyFromSubresource (slot 9) reads the same subresource back into linear rows with a
         // padded pitch (CopyInto then CopyFrom is the identity); padding bytes stay untouched.
         {
@@ -2092,6 +2098,84 @@ void test_xg() {
         CHECK(guest_bytes(rback, lin.size()) == lin);
         CHECK(fx.vcall(rcomp, 1) == 0);
     }
+}
+
+// Bulk guest-memory transfers must retain row-wise failure and alias behavior.
+void test_xg_tight_copy_failures_and_aliases() {
+    Fixture fx;
+    const uint64_t create = fx.export_address("xg_xs.dll", "XGCreateTextureComputer");
+    const uint64_t desc = xg_desc(3, 100, 60, 1, 1, 28);
+    CHECK(com::write_guest(desc + 0x2C, uint32_t{0x105}));
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
+    const uint64_t comp = load64(out);
+    namespace gx = playgta6::gpu::gfx10;
+    const gx::TextureLayoutDesc td{28, 100, 60, 1, 1, 0x105, 0};
+    const size_t chain = gx::surface_bytes(td);
+    const uint32_t row = 400, rows = 60;
+    const std::vector<uint8_t> linear = pattern_data(size_t{row} * rows);
+    const uint64_t source = com::guest_alloc(linear.size());
+    CHECK(com::write_guest(source, linear.data(), linear.size()));
+    const uint64_t surface = com::guest_alloc(chain);
+    std::vector<uint8_t> expected(chain, 0xCD);
+    CHECK(gx::tile_into_surface(td, 0, linear.data(), linear.size(), expected.data(), expected.size()));
+    CHECK(com::write_guest(surface, std::vector<uint8_t>(chain, 0xCD).data(), chain));
+    CHECK(as_hr(fx.vcall(comp, 8, {I(surface), I(0), I(0), I(source), I(row), I(linear.size())})) == 0);
+    CHECK(guest_bytes(surface, chain) == expected);
+
+    // A failed bulk destination validation must still copy the first ten complete rows;
+    // row eleven crosses the committed-page boundary, so the final 96 bytes stay untouched.
+    const uint64_t partial = fx.arena.reserve(0, 65536);
+    CHECK(partial != 0 && fx.arena.commit(partial, 4096));
+    CHECK(com::write_guest(partial, std::vector<uint8_t>(4096, 0xCD).data(), 4096));
+    CHECK(as_hr(fx.vcall(comp, 9, {I(partial), I(0), I(0), I(0), I(surface), I(row), I(linear.size())})) ==
+          com::E_INVALIDARG_HR);
+    const auto partial_bytes = guest_bytes(partial, 4096);
+    CHECK(std::equal(linear.begin(), linear.begin() + 4000, partial_bytes.begin()));
+    CHECK(std::all_of(partial_bytes.begin() + 4000, partial_bytes.end(), [](uint8_t v) { return v == 0xCD; }));
+    CHECK(as_hr(fx.vcall(comp, 8, {I(surface), I(0), I(0), I(partial), I(row), I(linear.size())})) ==
+          com::E_INVALIDARG_HR);
+    CHECK(guest_bytes(surface, chain) == expected);
+
+    // Both directions snapshot their inputs before modifying overlapping guest memory.
+    CHECK(com::write_guest(surface, linear.data(), linear.size()));
+    auto alias_expected = guest_bytes(surface, chain);
+    CHECK(gx::tile_into_surface(td, 0, linear.data(), linear.size(), alias_expected.data(), alias_expected.size()));
+    CHECK(as_hr(fx.vcall(comp, 8, {I(surface), I(0), I(0), I(surface), I(row), I(linear.size())})) == 0);
+    CHECK(guest_bytes(surface, chain) == alias_expected);
+    CHECK(as_hr(fx.vcall(comp, 9, {I(surface), I(0), I(0), I(0), I(surface), I(row), I(linear.size())})) == 0);
+    std::copy(linear.begin(), linear.end(), alias_expected.begin());
+    CHECK(guest_bytes(surface, chain) == alias_expected);
+
+    // A translated range can cross non-adjacent host slots. A bulk access may copy a
+    // prefix before discovering an unmapped slot: replaying rows must leave exactly
+    // the same partial row bytes, not an all-or-nothing arena-style result.
+    namespace gw = playgta6::os::guest_window;
+    const uint64_t pages = fx.arena.virtual_alloc(0, 3 * gw::kSlotBytes, os::kMemReserve | os::kMemCommit,
+                                                 os::PageProtect::ReadWrite);
+    CHECK(pages != 0);
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    CHECK(gw::map_slot(gw::kWindowBase, fx.arena.translate(pages)));
+    CHECK(gw::map_slot(gw::kWindowBase + gw::kSlotBytes, fx.arena.translate(pages + 2 * gw::kSlotBytes)));
+    const uint64_t split = gw::kWindowBase + gw::kSlotBytes - 1000;
+    CHECK(com::write_guest(split, linear.data(), linear.size()));
+    CHECK(com::write_guest(surface, expected.data(), expected.size()));
+    CHECK(as_hr(fx.vcall(comp, 8, {I(surface), I(0), I(0), I(split), I(row), I(linear.size())})) == 0);
+    CHECK(guest_bytes(surface, chain) == expected);
+    CHECK(com::write_guest(split, std::vector<uint8_t>(linear.size(), 0xCD).data(), linear.size()));
+    CHECK(as_hr(fx.vcall(comp, 9, {I(split), I(0), I(0), I(0), I(surface), I(row), I(linear.size())})) == 0);
+    CHECK(guest_bytes(split, linear.size()) == linear);
+    CHECK(gw::unmap_slot(gw::kWindowBase + gw::kSlotBytes));
+    CHECK(com::write_guest(split, std::vector<uint8_t>(1000, 0xCD).data(), 1000));
+    CHECK(as_hr(fx.vcall(comp, 9, {I(split), I(0), I(0), I(0), I(surface), I(row), I(linear.size())})) ==
+          com::E_INVALIDARG_HR);
+    CHECK(guest_bytes(split, 1000) == std::vector<uint8_t>(linear.begin(), linear.begin() + 1000));
+    CHECK(as_hr(fx.vcall(comp, 8, {I(surface), I(0), I(0), I(split), I(row), I(linear.size())})) ==
+          com::E_INVALIDARG_HR);
+    CHECK(guest_bytes(surface, chain) == expected);
+    gw::reset_for_testing();
+    CHECK(fx.vcall(comp, 1) == 0);
 }
 
 // AcpHalCreate: a guest object without an IUnknown prefix. Connect (0), submit (2), disconnect
@@ -3665,7 +3749,74 @@ void test_mmdevice_end_of_stream_and_reset() {
     win32::CloseHandle(event);
 }
 
-int main() {
+// Measures the public guest COM slots, including dispatch, staging, tiling and copying.
+// Fixture construction, initial source tiling and complete output checks are not timed.
+int benchmark_texture_copy(int argc, char** argv) {
+    if (argc != 9) {
+        std::fprintf(stderr, "usage: --benchmark-texture-copy width height format padding slot iterations layout\n");
+        return 2;
+    }
+    const uint32_t width = static_cast<uint32_t>(std::strtoul(argv[2], nullptr, 0));
+    const uint32_t height = static_cast<uint32_t>(std::strtoul(argv[3], nullptr, 0));
+    const uint32_t format = static_cast<uint32_t>(std::strtoul(argv[4], nullptr, 0));
+    const uint32_t padding = static_cast<uint32_t>(std::strtoul(argv[5], nullptr, 0));
+    const uint32_t slot = static_cast<uint32_t>(std::strtoul(argv[6], nullptr, 0));
+    const uint32_t iterations = static_cast<uint32_t>(std::strtoul(argv[7], nullptr, 0));
+    const uint32_t layout = static_cast<uint32_t>(std::strtoul(argv[8], nullptr, 0));
+    if (width == 0 || height == 0 || width > 4096 || height > 4096 || padding > 256 ||
+        (slot != 8 && slot != 9) || iterations == 0 || iterations > 1000 || (format != 28 && format != 71)) return 2;
+    Fixture fx;
+    namespace gx = playgta6::gpu::gfx10;
+    const auto fg = gx::format_geometry(format);
+    const uint32_t row = (width + fg.block_width - 1) / fg.block_width * fg.bytes_per_block;
+    const uint32_t rows = (height + fg.block_height - 1) / fg.block_height;
+    const uint32_t pitch = row + padding;
+    const uint32_t slice = pitch * rows;
+    const gx::TextureLayoutDesc td{format, width, height, 1, 1, layout, 0};
+    const size_t chain = gx::surface_bytes(td);
+    if (chain == 0) return 2;
+    const uint64_t create = fx.export_address("xg_xs.dll", "XGCreateTextureComputer");
+    const uint64_t desc = xg_desc(3, width, height, 1, 1, format);
+    CHECK(com::write_guest(desc + 0x2C, layout));
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
+    const uint64_t comp = load64(out);
+    const auto linear = pattern_data(size_t{row} * rows);
+    std::vector<uint8_t> pitched(slice, 0xCD);
+    for (uint32_t y = 0; y < rows; ++y) std::memcpy(pitched.data() + size_t{y} * pitch, linear.data() + size_t{y} * row, row);
+    std::vector<uint8_t> tiled(chain, 0xCD);
+    CHECK(gx::tile_into_surface(td, 0, linear.data(), linear.size(), tiled.data(), tiled.size()));
+    const uint64_t source = com::guest_alloc(slice), surface = com::guest_alloc(chain), destination = com::guest_alloc(slice);
+    CHECK(com::write_guest(source, pitched.data(), pitched.size()));
+    CHECK(com::write_guest(surface, tiled.data(), tiled.size()));
+    CHECK(com::write_guest(destination, std::vector<uint8_t>(slice, 0xCD).data(), slice));
+    const auto run = [&]() {
+        return slot == 8 ? as_hr(fx.vcall(comp, 8, {I(surface), I(0), I(0), I(source), I(pitch), I(slice)}))
+                         : as_hr(fx.vcall(comp, 9, {I(destination), I(0), I(0), I(0), I(surface), I(pitch), I(slice)}));
+    };
+    CHECK(run() == 0);
+    const std::clock_t cpu_start = std::clock();
+    const auto wall_start = std::chrono::steady_clock::now();
+    bool calls_ok = true;
+    for (uint32_t i = 0; i < iterations; ++i) calls_ok = run() == 0 && calls_ok;
+    const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall_start).count();
+    const double cpu_ms = 1000.0 * (std::clock() - cpu_start) / CLOCKS_PER_SEC;
+    const auto observed = slot == 8 ? guest_bytes(surface, chain) : guest_bytes(destination, slice);
+    const bool bytes_ok = observed == (slot == 8 ? tiled : pitched);
+    uint64_t output_hash = 0xcbf29ce484222325ull;
+    for (const uint8_t byte : observed) output_hash = (output_hash ^ byte) * 0x100000001b3ull;
+    CHECK(calls_ok && bytes_ok);
+    CHECK(fx.vcall(comp, 1) == 0);
+    std::printf("{\"width\":%u,\"height\":%u,\"format\":%u,\"layout\":%u,\"padding_bytes\":%u,"
+                "\"slot\":%u,\"iterations\":%u,\"linear_bytes\":%zu,\"wall_ms\":%.6f,\"cpu_ms\":%.6f,\"output_hash\":\"%016llx\",\"correct\":%s}\n",
+                width, height, format, layout, padding, slot, iterations, linear.size(), wall_ms, cpu_ms, static_cast<unsigned long long>(output_hash),
+                g_failures == 0 ? "true" : "false");
+    return g_failures == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--benchmark-texture-copy") return benchmark_texture_copy(argc, argv);
+
     test_inflate();
     test_inflate_lz77_fast_paths();
     test_factory_identity_and_stubs();
@@ -3688,6 +3839,7 @@ int main() {
     test_game_input_stable_pad();
     test_game_input_battery_ffb_and_callbacks();
     test_xg();
+    test_xg_tight_copy_failures_and_aliases();
     test_acp_hal();
     test_acp_hal_xma_commands();
     test_acp_hal_xma_decode_worker();

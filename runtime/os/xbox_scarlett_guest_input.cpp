@@ -1311,11 +1311,17 @@ private:
             return com::E_INVALIDARG_HR;
         }
         std::vector<uint8_t> linear(size_t{row_bytes} * rows * d);
-        for (uint32_t z = 0; z < d; ++z) {
-            for (uint32_t y = 0; y < rows; ++y) {
-                const uint64_t from = src + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
-                if (!com::read_guest(from, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
-                    return com::E_INVALIDARG_HR;
+        // Tight images are one contiguous guest-memory read instead of one bridge call per
+        // row. Staging still snapshots the source before any surface writes (including aliases).
+        // A failed bulk read falls back to the original row validation/copy order.
+        const bool tight = row_pitch == row_bytes && (d == 1 || slice_pitch == uint64_t{row_bytes} * rows);
+        if (!tight || !com::read_guest(src, linear.data(), linear.size())) {
+            for (uint32_t z = 0; z < d; ++z) {
+                for (uint32_t y = 0; y < rows; ++y) {
+                    const uint64_t from = src + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
+                    if (!com::read_guest(from, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
+                        return com::E_INVALIDARG_HR;
+                    }
                 }
             }
         }
@@ -1360,11 +1366,18 @@ private:
             linear.size() < size_t{row_bytes} * rows * d) {
             return com::E_INVALIDARG_HR;
         }
-        for (uint32_t z = 0; z < d; ++z) {
-            for (uint32_t y = 0; y < rows; ++y) {
-                const uint64_t to = dst + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
-                if (!com::write_guest(to, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
-                    return com::E_INVALIDARG_HR;
+        // The detiler owns `linear`, so overlapping guest source/destination ranges remain
+        // safe. On failure, replay row writes to retain the previous partial-output behavior;
+        // padded rows/slices always take that original path and leave padding untouched.
+        const bool tight = row_pitch == row_bytes && (d == 1 || slice_pitch == uint64_t{row_bytes} * rows);
+        const size_t linear_bytes = size_t{row_bytes} * rows * d;
+        if (!tight || !com::write_guest(dst, linear.data(), linear_bytes)) {
+            for (uint32_t z = 0; z < d; ++z) {
+                for (uint32_t y = 0; y < rows; ++y) {
+                    const uint64_t to = dst + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
+                    if (!com::write_guest(to, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
+                        return com::E_INVALIDARG_HR;
+                    }
                 }
             }
         }
