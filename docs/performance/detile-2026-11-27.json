@@ -1,0 +1,171 @@
+{
+  "benchmark": "synthetic actual detile_surface_subresource; independent scalar surface_element_offset oracle",
+  "baseline": "14d1b86644dbc35fbf32d9522c505972545a7d8a",
+  "patch": "31e033c8ee34719766e5f4e34405220bb7a599a9",
+  "environment": {"os": "Linux", "kernel": "6.8.0-1070-azure", "arch": "x86_64", "vcpus": 4, "cpu": "AMD EPYC 7763 64-Core Processor", "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0", "flags": "-std=c++20 -O3 -DNDEBUG"},
+  "sampling": "separate prebuilt binaries, one untimed outer invocation per variant/workload, seven alternating A/B samples; each invocation seeds and scalar-checks fixture outside timing and warms one detile before three timed updates; no concurrent builds/tests",
+  "unmeasured": "GPU upload, game frame rate, browser/Wasm execution, real texture-update frequency; BC7 and 16-byte scalar paths and an unchanged linear path included as controls",
+  "cases": [
+    {
+      "arguments": [4096, 4096, 61, 5, 3],
+      "samples": {
+        "before": [
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 104.362999, "ms_per_update": 34.787666, "cpu_ms": 104.378, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 103.531065, "ms_per_update": 34.510355, "cpu_ms": 103.546, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 104.911062, "ms_per_update": 34.970354, "cpu_ms": 104.927, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 105.393742, "ms_per_update": 35.131247, "cpu_ms": 105.401, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 104.276406, "ms_per_update": 34.758802, "cpu_ms": 104.267, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 103.817731, "ms_per_update": 34.60591, "cpu_ms": 103.822, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 103.80627, "ms_per_update": 34.60209, "cpu_ms": 103.788, "digest": "dab461a3937d9d84", "correct": true}
+        ],
+        "after": [
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 24.433667, "ms_per_update": 8.144556, "cpu_ms": 24.447, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 22.282972, "ms_per_update": 7.427657, "cpu_ms": 22.297, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 23.47114, "ms_per_update": 7.823713, "cpu_ms": 23.486, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 24.619153, "ms_per_update": 8.206384, "cpu_ms": 24.634, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 23.548524, "ms_per_update": 7.849508, "cpu_ms": 23.562, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 23.319738, "ms_per_update": 7.773246, "cpu_ms": 23.335, "digest": "dab461a3937d9d84", "correct": true},
+          {"width": 4096, "height": 4096, "depth": 1, "dxgi_format": 61, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 23.227044, "ms_per_update": 7.742348, "cpu_ms": 23.242, "digest": "dab461a3937d9d84", "correct": true}
+        ]
+      }
+    },
+    {
+      "arguments": [2048, 2048, 28, 5, 3],
+      "samples": {
+        "before": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 41.871746, "ms_per_update": 13.957249, "cpu_ms": 41.888, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 40.169428, "ms_per_update": 13.389809, "cpu_ms": 40.174, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 48.733443, "ms_per_update": 16.244481, "cpu_ms": 48.748, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 43.598148, "ms_per_update": 14.532716, "cpu_ms": 43.614, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 44.112678, "ms_per_update": 14.704226, "cpu_ms": 44.127, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 43.732258, "ms_per_update": 14.577419, "cpu_ms": 43.747, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 41.130472, "ms_per_update": 13.710157, "cpu_ms": 41.144, "digest": "0c6093a7917b1d50", "correct": true}
+        ],
+        "after": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 17.297837, "ms_per_update": 5.765946, "cpu_ms": 17.313, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 17.430525, "ms_per_update": 5.810175, "cpu_ms": 17.445, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 17.083377, "ms_per_update": 5.694459, "cpu_ms": 17.099, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 17.131938, "ms_per_update": 5.710646, "cpu_ms": 17.148, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 17.049474, "ms_per_update": 5.683158, "cpu_ms": 17.064, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 15.839856, "ms_per_update": 5.279952, "cpu_ms": 15.855, "digest": "0c6093a7917b1d50", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 261, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 18.263941, "ms_per_update": 6.08798, "cpu_ms": 18.279, "digest": "0c6093a7917b1d50", "correct": true}
+        ]
+      }
+    },
+    {
+      "arguments": [2048, 1024, 98, 5, 3],
+      "samples": {
+        "before": [
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.961816, "ms_per_update": 0.320605, "cpu_ms": 0.97, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 1.048757, "ms_per_update": 0.349586, "cpu_ms": 1.055, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 1.032608, "ms_per_update": 0.344203, "cpu_ms": 1.039, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.976293, "ms_per_update": 0.325431, "cpu_ms": 0.982, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.961174, "ms_per_update": 0.320391, "cpu_ms": 0.967, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.999405, "ms_per_update": 0.333135, "cpu_ms": 1.005, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 1.085756, "ms_per_update": 0.361919, "cpu_ms": 1.1, "digest": "175012d950e3ed3d", "correct": true}
+        ],
+        "after": [
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.757844, "ms_per_update": 0.252615, "cpu_ms": 0.764, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.881946, "ms_per_update": 0.293982, "cpu_ms": 0.89, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.76117, "ms_per_update": 0.253723, "cpu_ms": 0.768, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.742716, "ms_per_update": 0.247572, "cpu_ms": 0.749, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.760399, "ms_per_update": 0.253466, "cpu_ms": 0.766, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.756462, "ms_per_update": 0.252154, "cpu_ms": 0.762, "digest": "175012d950e3ed3d", "correct": true},
+          {"width": 2048, "height": 1024, "depth": 1, "dxgi_format": 98, "layout": 261, "iterations": 3, "output_bytes": 2097152, "elapsed_ms": 0.756663, "ms_per_update": 0.252221, "cpu_ms": 0.763, "digest": "175012d950e3ed3d", "correct": true}
+        ]
+      }
+    },
+    {
+      "arguments": [2048, 2048, 28, 25, 3],
+      "samples": {
+        "before": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 61.541691, "ms_per_update": 20.513897, "cpu_ms": 61.555, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 60.518991, "ms_per_update": 20.172997, "cpu_ms": 60.533, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 59.812022, "ms_per_update": 19.937341, "cpu_ms": 59.817, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 59.486474, "ms_per_update": 19.828825, "cpu_ms": 59.499, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 62.069336, "ms_per_update": 20.689779, "cpu_ms": 62.094, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 60.824642, "ms_per_update": 20.274881, "cpu_ms": 60.838, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 63.533077, "ms_per_update": 21.177692, "cpu_ms": 63.549, "digest": "40b1d3a3c1de6bfc", "correct": true}
+        ],
+        "after": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 23.199633, "ms_per_update": 7.733211, "cpu_ms": 23.215, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 22.872783, "ms_per_update": 7.624261, "cpu_ms": 22.887, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 23.35856, "ms_per_update": 7.786187, "cpu_ms": 23.372, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 22.58754, "ms_per_update": 7.52918, "cpu_ms": 22.602, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 23.5466, "ms_per_update": 7.848867, "cpu_ms": 23.584, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 22.91915, "ms_per_update": 7.639717, "cpu_ms": 22.915, "digest": "40b1d3a3c1de6bfc", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 281, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 25.983259, "ms_per_update": 8.661086, "cpu_ms": 25.999, "digest": "40b1d3a3c1de6bfc", "correct": true}
+        ]
+      }
+    },
+    {
+      "arguments": [2048, 2048, 2, 9, 3],
+      "samples": {
+        "before": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 52.331319, "ms_per_update": 17.443773, "cpu_ms": 52.347, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 51.931232, "ms_per_update": 17.310411, "cpu_ms": 51.95, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 53.87486, "ms_per_update": 17.958287, "cpu_ms": 53.88, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 51.684071, "ms_per_update": 17.228024, "cpu_ms": 51.686, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 51.513443, "ms_per_update": 17.171148, "cpu_ms": 51.53, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 52.198692, "ms_per_update": 17.399564, "cpu_ms": 52.214, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 59.852507, "ms_per_update": 19.950836, "cpu_ms": 59.871, "digest": "07dbde7113fc8bbf", "correct": true}
+        ],
+        "after": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 53.214397, "ms_per_update": 17.738132, "cpu_ms": 53.22, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 44.90082, "ms_per_update": 14.96694, "cpu_ms": 44.918, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 45.503635, "ms_per_update": 15.167878, "cpu_ms": 45.519, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 45.445647, "ms_per_update": 15.148549, "cpu_ms": 45.462, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 43.533046, "ms_per_update": 14.511015, "cpu_ms": 43.55, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 44.383143, "ms_per_update": 14.794381, "cpu_ms": 44.4, "digest": "07dbde7113fc8bbf", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 2, "layout": 265, "iterations": 3, "output_bytes": 67108864, "elapsed_ms": 51.154914, "ms_per_update": 17.051638, "cpu_ms": 51.172, "digest": "07dbde7113fc8bbf", "correct": true}
+        ]
+      }
+    },
+    {
+      "arguments": [2048, 2048, 28, 0, 3],
+      "samples": {
+        "before": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.543183, "ms_per_update": 1.181061, "cpu_ms": 3.558, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.591745, "ms_per_update": 1.197248, "cpu_ms": 3.607, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.603396, "ms_per_update": 1.201132, "cpu_ms": 3.619, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.978065, "ms_per_update": 1.326022, "cpu_ms": 3.994, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 4.081879, "ms_per_update": 1.360626, "cpu_ms": 4.097, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.657087, "ms_per_update": 1.219029, "cpu_ms": 3.673, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.494483, "ms_per_update": 1.164828, "cpu_ms": 3.51, "digest": "b40a71d7d93cbcd8", "correct": true}
+        ],
+        "after": [
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.715465, "ms_per_update": 1.238488, "cpu_ms": 3.73, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.462633, "ms_per_update": 1.154211, "cpu_ms": 3.479, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.647668, "ms_per_update": 1.215889, "cpu_ms": 3.663, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.365212, "ms_per_update": 1.121737, "cpu_ms": 3.38, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.69681, "ms_per_update": 1.23227, "cpu_ms": 3.711, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.426025, "ms_per_update": 1.142008, "cpu_ms": 3.431, "digest": "b40a71d7d93cbcd8", "correct": true},
+          {"width": 2048, "height": 2048, "depth": 1, "dxgi_format": 28, "layout": 256, "iterations": 3, "output_bytes": 16777216, "elapsed_ms": 3.771941, "ms_per_update": 1.257314, "cpu_ms": 3.788, "digest": "b40a71d7d93cbcd8", "correct": true}
+        ]
+      }
+    },
+    {
+      "arguments": [64, 64, 56, 5, 3, 32],
+      "samples": {
+        "before": [
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.837844, "ms_per_update": 0.279281, "cpu_ms": 0.843, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.829699, "ms_per_update": 0.276566, "cpu_ms": 0.836, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.840709, "ms_per_update": 0.280236, "cpu_ms": 0.846, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.863672, "ms_per_update": 0.287891, "cpu_ms": 0.869, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.844356, "ms_per_update": 0.281452, "cpu_ms": 0.852, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.868701, "ms_per_update": 0.289567, "cpu_ms": 0.875, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.864744, "ms_per_update": 0.288248, "cpu_ms": 0.87, "digest": "f9a648208e50508f", "correct": true}
+        ],
+        "after": [
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.756783, "ms_per_update": 0.252261, "cpu_ms": 0.763, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.762013, "ms_per_update": 0.254004, "cpu_ms": 0.767, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.726917, "ms_per_update": 0.242306, "cpu_ms": 0.732, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.726195, "ms_per_update": 0.242065, "cpu_ms": 0.732, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.726226, "ms_per_update": 0.242075, "cpu_ms": 0.734, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.73921, "ms_per_update": 0.246403, "cpu_ms": 0.746, "digest": "f9a648208e50508f", "correct": true},
+          {"width": 64, "height": 64, "depth": 32, "dxgi_format": 56, "layout": 261, "iterations": 3, "output_bytes": 262144, "elapsed_ms": 0.730944, "ms_per_update": 0.243648, "cpu_ms": 0.737, "digest": "f9a648208e50508f", "correct": true}
+        ]
+      }
+    }
+  ]
+}

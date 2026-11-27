@@ -748,6 +748,11 @@ void test_contiguous_run_edges() {
             verify_element_offsets(desc, 2u, seed++);
         }
     }
+    for (uint32_t format : {61u, 56u, 28u}) {
+        TextureLayoutDesc desc{format, 33u, 19u, 17u, 6u, 0x105u, 0u};
+        desc.pipe_bank_xor = 0xA5;
+        verify_element_offsets(desc, 1u, seed++);
+    }
 }
 
 void test_element_offsets() {
