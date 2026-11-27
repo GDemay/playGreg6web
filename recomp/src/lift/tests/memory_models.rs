@@ -19,7 +19,7 @@ use super::ir::random_program;
 use crate::cfg;
 use crate::discover::discover;
 use crate::lift::compile::{compile_to_wasm64_object, find_llvm_tool};
-use crate::lift::memory::{Window, WindowCheck};
+use crate::lift::memory::{SLOT_SHIFT, Window, WindowCheck};
 use crate::lift::{
     GuestBase, MemoryModel, emit_module, lift_function_with, lift_module, lift_module_with,
 };
@@ -203,6 +203,108 @@ fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
             .any(|l| l.trim_start().starts_with(&format!("{cond} = icmp ne i64"))),
         "{ir}"
     );
+}
+
+#[test]
+fn window_table_offsets_use_a_short_mask() {
+    // Every dynamic window table entry is addressed by its byte offset `(rel >>a 13) & -8`
+    // (`getelementptr i8`), never by a scaled slot index (`getelementptr i64, ..., rel >> 16`):
+    // wasm lowers the scaled index to `(rel >> 13) & 0x7fff_ffff_ffff_fff8`, a 9-byte
+    // `i64.const` per window check. Same entry for every address; the slot index the dirty
+    // marks use is unchanged.
+    use iced_x86::code_asm::*;
+    let f = super::asm_function(0x1000, |a| {
+        a.mov(rax, qword_ptr(rcx))?;
+        a.mov(qword_ptr(rdx), rax)?;
+        a.lock().add(dword_ptr(rsi), eax)?;
+        a.mov(byte_ptr(rdi), al)?;
+        a.ret()
+    });
+    let table = "ptr @__playgta6_window_table, i64 ";
+    let tool = find_llvm_tool();
+    for check in [WindowCheck::Branch, WindowCheck::Select] {
+        for runs in [false, true] {
+            let tag = format!("{check:?}/{runs}");
+            let ir = lift_module_with([&f], window(check, false, runs))
+                .expect("lifts")
+                .ir;
+            let defs: BTreeMap<&str, &str> = ir
+                .lines()
+                .filter_map(|l| l.trim_start().split_once(" = "))
+                .collect();
+            let def = |v: &str| defs.get(v).copied().unwrap_or("");
+            let mut entries = 0;
+            for line in ir.lines().filter(|l| l.contains(table)) {
+                let index = line.split(table).nth(1).expect("index").trim();
+                if !index.starts_with('%') {
+                    continue; // lift-time constant slot
+                }
+                assert!(line.contains("getelementptr i8, "), "{tag}: {line}
+{ir}");
+                // Select: `select i1 %inside, i64 %offset, i64 0`.
+                let offset = def(index)
+                    .strip_prefix("select i1 ")
+                    .and_then(|r| r.split(", i64 ").nth(1))
+                    .unwrap_or(index);
+                let and = def(offset);
+                let shifted = and
+                    .strip_prefix("and i64 ")
+                    .and_then(|r| r.strip_suffix(", -8"))
+                    .unwrap_or_else(|| panic!("{tag}: offset {and}
+{ir}"));
+                assert!(
+                    def(shifted).starts_with("ashr i64 ")
+                        && def(shifted).ends_with(&format!(", {}", SLOT_SHIFT - 3)),
+                    "{tag}: {shifted} = {}
+{ir}",
+                    def(shifted)
+                );
+                entries += 1;
+            }
+            assert!(entries >= 3, "{tag}: {entries} dynamic table entries
+{ir}");
+            if let Some(tool) = &tool {
+                let code = compile(tool, &ir, &tag);
+                let wide = sleb_i64_const((u64::MAX >> (SLOT_SHIFT - 3)) & !7);
+                assert!(
+                    !code.windows(wide.len()).any(|w| w == wide.as_slice()),
+                    "{tag}: wasm object still holds the 64-bit slot mask"
+                );
+            }
+        }
+    }
+}
+
+/// `i64.const value` as wasm encodes it (opcode `0x42`, signed LEB128).
+fn sleb_i64_const(value: u64) -> Vec<u8> {
+    let mut v = value as i64;
+    let mut out = vec![0x42];
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        let done = (v == 0 && byte & 0x40 == 0) || (v == -1 && byte & 0x40 != 0);
+        out.push(if done { byte } else { byte | 0x80 });
+        if done {
+            return out;
+        }
+    }
+}
+
+/// The wasm64 object of `ir` at `-O2`.
+fn compile(tool: &crate::lift::compile::LlvmTool, ir: &str, tag: &str) -> Vec<u8> {
+    let dir = env::temp_dir().join(format!(
+        "pg6_window_entry_{}_{}",
+        std::process::id(),
+        tag.replace('/', "-")
+    ));
+    fs::create_dir_all(&dir).expect("temp dir");
+    let ll = dir.join("m.ll");
+    let obj = dir.join("m.o");
+    fs::write(&ll, ir).expect("write ir");
+    compile_to_wasm64_object(tool, &ll, &obj).expect("compiles");
+    let bytes = fs::read(&obj).expect("object");
+    let _ = fs::remove_dir_all(&dir);
+    bytes
 }
 
 #[test]
@@ -536,7 +638,7 @@ fn avx256_stack_frame_and_burst_optimizations_reduce_window_checks() {
         .ir;
     assert_eq!(
         burst_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         1,
         "4 coalesced AVX loads must share one window_table lookup:\n{burst_ir}"
@@ -552,7 +654,7 @@ fn avx256_stack_frame_and_burst_optimizations_reduce_window_checks() {
         .ir;
     assert_eq!(
         rmw_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         1,
         "RMW under window-runs must reuse the load's window_table lookup:\n{rmw_ir}"
@@ -597,7 +699,7 @@ fn r63b_dual_base_interleaved_and_long_bursts() {
     );
     assert_eq!(
         dual_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         2,
         "dual-base burst must perform exactly 2 window_table lookups (1 per base):\n{dual_ir}"
@@ -633,7 +735,7 @@ fn r63b_dual_base_interleaved_and_long_bursts() {
     );
     assert_eq!(
         long_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         1,
         "{long_ir}"
@@ -653,7 +755,7 @@ fn r63b_dual_base_interleaved_and_long_bursts() {
     assert_eq!(both_ir.matches("\ngbf").count(), 1, "{both_ir}");
     assert_eq!(
         both_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         2,
         "{both_ir}"
@@ -680,7 +782,7 @@ fn r63b_dual_base_interleaved_and_long_bursts() {
         .ir;
     assert_eq!(
         stack_dual_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         1,
         "stack-flat rbp must be dropped from dual-base burst leaving 1-base burst on rcx:\n{stack_dual_ir}"
@@ -753,7 +855,7 @@ fn r64b_triple_base_and_32_insn_bursts() {
     );
     assert_eq!(
         triple_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         3,
         "3-base burst must perform exactly 3 window_table lookups (1 per base):\n{triple_ir}"
@@ -791,7 +893,7 @@ fn r64b_triple_base_and_32_insn_bursts() {
     );
     assert_eq!(
         long30_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         3,
         "30-instruction 3-base burst must emit 3 window_table lookups:\n{long30_ir}"
@@ -813,7 +915,7 @@ fn r64b_triple_base_and_32_insn_bursts() {
     assert_eq!(two_writes_ir.matches("\ngbf").count(), 1, "{two_writes_ir}");
     assert_eq!(
         two_writes_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         3,
         "{two_writes_ir}"
@@ -893,7 +995,7 @@ fn r67_extended_64_insn_and_indexed_window_bursts() {
     );
     assert_eq!(
         long48_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         1,
         "48-instruction burst must emit 1 window_table lookup:\n{long48_ir}"
@@ -923,7 +1025,7 @@ fn r67_extended_64_insn_and_indexed_window_bursts() {
     );
     assert_eq!(
         idx_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         1,
         "indexed burst must emit ONE window_table lookup:\n{idx_ir}"
@@ -952,7 +1054,7 @@ fn r67_extended_64_insn_and_indexed_window_bursts() {
     assert_eq!(mixed_ir.matches("\ngbc").count(), 2, "{mixed_ir}");
     assert_eq!(
         mixed_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         3,
         "3-base plain+indexed burst must emit 3 window_table lookups:\n{mixed_ir}"
@@ -997,7 +1099,7 @@ fn r67_extended_64_insn_and_indexed_window_bursts() {
     );
     assert_eq!(
         rsp_idx_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         1,
         "indexed [rsp + rax*8 + disp] must emit a window_table lookup:\n{rsp_idx_ir}"
@@ -1161,7 +1263,7 @@ fn r71_cross_bb_stack_and_const_base_propagation_elides_window_checks() {
         .ir;
     assert_eq!(
         cache_ir
-            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .matches("ptr @__playgta6_window_table, i64 ")
             .count(),
         2,
         "interleaved load/store on rcx and rdx must reuse both cached translations:\n{cache_ir}"

@@ -271,6 +271,32 @@ impl FunctionLifter<'_> {
         self.val(&format!("load i64, ptr {entry}, align 8"))
     }
 
+    /// Window table entry of the in-window offset `rel` ([`Self::window_offset`]).
+    fn window_entry(&mut self, rel: &str) -> String {
+        let offset = self.window_offset(rel);
+        self.window_entry_at(&offset)
+    }
+
+    /// Byte offset of the table entry of window offset `rel`: `(rel >>a (SLOT_SHIFT - 3)) & -8`,
+    /// equal to `(rel >> SLOT_SHIFT) * 8` for every `rel < 2^63` (every in-window offset; the
+    /// value is only used behind the window test or discarded by a `select` on it).
+    /// The scaled index `getelementptr i64, ..., rel >> 16` lowers on wasm to
+    /// `(rel >> 13) & 0x7fff_ffff_ffff_fff8`, a 9-byte `i64.const` per window check. The
+    /// arithmetic shift leaves the high bits unknown, so the `-8` stays a 1-byte constant, or
+    /// shrinks to the range the window test proves (`0x3f_fff8`, 4 bytes) behind a branch.
+    fn window_offset(&mut self, rel: &str) -> String {
+        let shifted = self.val(&format!("ashr i64 {rel}, {}", SLOT_SHIFT - 3));
+        self.val(&format!("and i64 {shifted}, -8"))
+    }
+
+    /// Window table entry at byte offset `offset` (a multiple of 8).
+    fn window_entry_at(&mut self, offset: &str) -> String {
+        let entry = self.val(&format!(
+            "getelementptr i8, ptr @{WINDOW_TABLE_SYMBOL}, i64 {offset}"
+        ));
+        self.val(&format!("load i64, ptr {entry}, align 8"))
+    }
+
     /// Page-table slot index of `addr`, clamped to the trap entry `pages`.
     fn page_index(&mut self, addr: &str, pages: u64) -> String {
         self.support.insert(Support::Memory(Decl::PageTable));
@@ -412,8 +438,7 @@ impl FunctionLifter<'_> {
                     "br i1 {inside}, label %{win}, label %{join}, {UNLIKELY}"
                 ));
                 self.start_internal_block(&win);
-                let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+                let delta_win = self.window_entry(&rel);
                 self.emit(&format!("br label %{join}"));
                 self.start_internal_block(&join);
                 let delta = self.val(&format!(
@@ -431,8 +456,9 @@ impl FunctionLifter<'_> {
     fn window_select_delta(&mut self, addr: &str, w: Window) -> SelectDelta {
         let (inside, rel) = self.window_test(addr, w);
         let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-        let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 0"));
-        let entry = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+        let offset = self.window_offset(&rel);
+        let offset = self.val(&format!("select i1 {inside}, i64 {offset}, i64 0"));
+        let entry = self.window_entry_at(&offset);
         let flat = self.flat_base_val(w.flat);
         let delta = self.val(&format!("select i1 {inside}, i64 {entry}, i64 {flat}"));
         SelectDelta {
@@ -808,8 +834,7 @@ impl FunctionLifter<'_> {
                         "br i1 {inside}, label %{win}, label %{join}, {UNLIKELY}"
                     ));
                     self.start_internal_block(&win);
-                    let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                    let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+                    let delta_win = self.window_entry(&rel);
                     self.emit(&format!("br label %{join}"));
                     self.start_internal_block(&join);
                     let delta = self.val(&format!(
@@ -843,8 +868,7 @@ impl FunctionLifter<'_> {
                     "br i1 {fits}, label %{wtbl}, label %{slow}, {LIKELY}"
                 ));
                 self.start_internal_block(&wtbl);
-                let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+                let delta_win = self.window_entry(&rel);
                 self.emit(&format!("br label %{fast}"));
                 self.start_internal_block(&fast);
                 let delta = self.val(&format!(
@@ -992,7 +1016,7 @@ impl FunctionLifter<'_> {
             None
         };
         let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-        let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
+        let delta = self.window_entry(&rel);
         let host = self.val(&format!("add i64 {addr}, {delta}"));
         let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
         self.access_at(&ptr, access);
@@ -1234,7 +1258,7 @@ impl FunctionLifter<'_> {
 
                 self.start_internal_block(&wtbl);
                 let slot = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &slot);
+                let delta_win = self.window_entry(&rel);
                 self.emit(&format!("br label %{next}"));
 
                 self.start_internal_block(&next);
