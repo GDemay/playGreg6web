@@ -1,0 +1,64 @@
+name: Baseline native flush attribution
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: true
+        default: '14d1b86644dbc35fbf32d9522c505972545a7d8a'
+      benchmark_ref:
+        required: true
+        default: 'de63fc713efd6065f94f15360072b69007e2d864'
+permissions:
+  contents: read
+jobs:
+  windows-flush-profile:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: PlayGreg6Web/playGreg6web
+          ref: ${{ inputs.base_ref }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.benchmark_ref }}
+          path: benchmark
+      - name: Prepare temporary instrumentation and environment
+        shell: pwsh
+        run: |
+          Copy-Item benchmark/tests/bench_native_flush.cpp baseline/tests/bench_native_flush.cpp
+          @'
+          option(PLAYGTA6_PERFORMANCE_BENCHMARKS "Build manual performance probes" OFF)
+          if(PLAYGTA6_PERFORMANCE_BENCHMARKS)
+            add_executable(bench_native_flush ../tests/bench_native_flush.cpp)
+            target_link_libraries(bench_native_flush PRIVATE playgta6_core)
+          endif()
+          '@ | Add-Content baseline/runtime/CMakeLists.txt
+          python runner/tools/instrument_flush_probe.py baseline
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $machine = Get-CimInstance Win32_ComputerSystem
+          @{ os = [System.Environment]::OSVersion.VersionString; cpu = $cpu.Name; logical_cpus = [System.Environment]::ProcessorCount; memory_bytes = $machine.TotalPhysicalMemory; compiler = 'MSVC Visual Studio 2022 Release /O2 /MP4'; base_ref = (git -C baseline rev-parse HEAD); benchmark_ref = (git -C benchmark rev-parse HEAD); instrumentation_ref = (git -C runner rev-parse HEAD) } | ConvertTo-Json | Set-Content runner-environment.json
+      - name: Build one instrumented baseline binary
+        shell: pwsh
+        run: |
+          cmake -S baseline/runtime -B baseline-build -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON -DCMAKE_CXX_FLAGS=/MP4
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build baseline-build --config Release --parallel 4 --target bench_native_flush
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Bounded diagnostic with clean and resident-shadow controls
+        shell: pwsh
+        run: |
+          python runner/tools/perf_profile_native_flush.py baseline-build/Release/bench_native_flush.exe --output results/windows-flush-profile.json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-flush-profile
+          path: results/*.json
+          if-no-files-found: ignore
