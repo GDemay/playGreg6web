@@ -1924,6 +1924,76 @@ void test_pooled_a8_zero_fill_uses_host_format() {
     scene.release_all();
 }
 
+// With the GPU clear (the native executor), a reused texture is zeroed by one ClearTexture packet
+// instead of CPU zero writes, and chains over 64 KiB are reused from the large pool.
+void test_pooled_texture_gpu_clear() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    CHECK(dev != nullptr);
+    if (dev == nullptr) {
+        return;
+    }
+    playgta6::gpu::set_gpu_texture_clear(true);
+    const uint64_t va1 = com::guest_alloc(1u << 20);
+    const uint64_t va2 = com::guest_alloc(1u << 20);
+    const uint64_t va3 = com::guest_alloc(1u << 20);
+    CHECK(va1 != 0 && va2 != 0 && va3 != 0);
+    auto shape_of = [&](uint32_t w, uint32_t h, uint32_t mips) {
+        playgta6::gpu::SmallTextureShape s{};
+        s.owner = reinterpret_cast<uintptr_t>(dev);
+        s.dxgi_format = 28u;  // R8G8B8A8_UNORM
+        s.width = w;
+        s.height = h;
+        s.depth = 1u;
+        s.mip_levels = mips;
+        s.dim = static_cast<uint8_t>(GpuTextureDimension::Dim2D);
+        return s;
+    };
+    auto check_cleared = [&](size_t mark, uint32_t id) {
+        const auto ps = packets_since(fx, mark);
+        size_t clears = 0;
+        for (const Packet& p : ps) {
+            CHECK(!(p.opcode == GpuOpcode::WriteTexture && payload_as<GpuWriteTexturePayload>(p).texture_id == id));
+            CHECK(!(p.opcode == GpuOpcode::CreateTexture2 && payload_as<GpuCreateTexture2Payload>(p).id == id));
+            if (p.opcode == kGpuOpcodeClearTexture) {
+                CHECK(payload_as<GpuClearTexturePayload>(p).texture_id == id);
+                ++clears;
+            }
+        }
+        CHECK(clears == 1u);
+    };
+
+    // Small: 32x32 1 mip (4 KiB).
+    const uint32_t small_id = dev->ensure_address_texture(va1, 28u, 32u, 32u, 1u, 1u, 0u, GpuTextureDimension::Dim2D, false);
+    CHECK(small_id != 0);
+    CHECK(playgta6::gpu::texture_pool_for(4096).release(shape_of(32, 32, 1), small_id, 4096, nullptr, nullptr));
+    size_t mark = fx.captured.size();
+    CHECK(dev->ensure_address_texture(va2, 28u, 32u, 32u, 1u, 1u, 0u, GpuTextureDimension::Dim2D, false) == small_id);
+    check_cleared(mark, small_id);
+
+    // Large: 256x256 9 mips (~349 KiB) goes to the large pool and comes back from it.
+    const uint64_t big = playgta6::gpu::texture_chain_bytes(256u, 256u, 1u, 9u, 1u, 1u, 4u, 0u, 1u);
+    CHECK(big > playgta6::gpu::kSmallTextureMaxBytes);
+    CHECK(&playgta6::gpu::texture_pool_for(big) == &playgta6::gpu::large_texture_pool());
+    const uint32_t big_id = dev->ensure_address_texture(va1 + 4096, 28u, 256u, 256u, 1u, 9u, 0u, GpuTextureDimension::Dim2D, false);
+    CHECK(big_id != 0);
+    CHECK(playgta6::gpu::large_texture_pool().release(shape_of(256, 256, 9), big_id, big, nullptr, nullptr));
+    mark = fx.captured.size();
+    CHECK(dev->ensure_address_texture(va3, 28u, 256u, 256u, 1u, 9u, 0u, GpuTextureDimension::Dim2D, false) == big_id);
+    check_cleared(mark, big_id);
+    CHECK(playgta6::gpu::large_texture_pool().stats().hits >= 1u);
+
+    // Without the GPU clear the large pool is not used: a new texture is created.
+    playgta6::gpu::set_gpu_texture_clear(false);
+    CHECK(&playgta6::gpu::texture_pool_for(big) == &playgta6::gpu::small_texture_pool());
+    std::vector<uint32_t> drained_ids;
+    std::vector<uint64_t> drained_bytes;
+    playgta6::gpu::small_texture_pool().drain(reinterpret_cast<uintptr_t>(dev), &drained_ids, &drained_bytes);
+    playgta6::gpu::large_texture_pool().drain(reinterpret_cast<uintptr_t>(dev), &drained_ids, &drained_bytes);
+    scene.release_all();
+}
+
 void test_copies_and_barriers() {
     Fixture fx;
     Scene scene(fx);
@@ -9745,6 +9815,7 @@ int main() {
     test_gpu_readback();
     test_a8_upload_widened();
     test_pooled_a8_zero_fill_uses_host_format();
+    test_pooled_texture_gpu_clear();
     test_gpu_va_watch_hooks();
     test_srgb_sibling_view_formats();
     test_bc_upload_needs_feature();

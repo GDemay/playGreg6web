@@ -2082,6 +2082,23 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     // and defer DestroyResource until after Present for any in-frame victim.
     CommandEncoder drop;
     bridge_->advance_present_frame(stats().presents, drop);
+    // Parked large textures stay counted in the budget: give them back before the use nears the
+    // size-cap tiers or LRU reclamation, so they never cost a live texture its top levels.
+    if (const uint64_t parked_large = large_texture_pool().stats().parked_bytes; parked_large != 0) {
+        const TextureBudgetStats tb = texture_budget().stats();
+        const uint64_t limit = tb.budget_bytes / 100u * kLargeTexturePoolBudgetPercent;
+        if (tb.budget_bytes != 0 && tb.used_bytes + chain_bytes > limit) {
+            const uint64_t over = tb.used_bytes + chain_bytes - limit;
+            std::vector<uint32_t> ids;
+            std::vector<uint64_t> bytes;
+            large_texture_pool().trim(UINT32_MAX, parked_large - std::min(parked_large, over), &ids, &bytes);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                texture_budget().note_destroyed(bytes[i]);
+                bridge_->unregister_resource(ids[i]);
+                bridge_->destroy_or_defer_resource(ids[i], drop);
+            }
+        }
+    }
     if (const uint64_t reclaim_goal = texture_budget().bytes_to_reclaim(chain_bytes); reclaim_goal != 0u) {
         const std::vector<LruEvictCandidate> candidates =
             texture_budget().select_eviction_candidates(cur_frame, reclaim_goal);
@@ -2133,17 +2150,24 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         const uint32_t victim = oldest->second.id;
         const AddressTextureEntry victim_entry = oldest->second;
         const bool victim_in_frame = oldest_in_frame;
+        bool victim_shrunk = false;  // host texture re-created at a capped size: not the shape it is keyed by
+        {
+            std::lock_guard<std::mutex> tracked_lock(tracked_textures_mutex_);
+            const auto t = tracked_textures_.find(victim);
+            victim_shrunk = t != tracked_textures_.end() && (t->second.host_floor != 0 || t->second.host_saved_bytes != 0);
+        }
         note_address_texture_evicted(oldest->first);
         address_textures_.erase(oldest);
         untrack_guest_texture(victim);
         bridge_->unregister_resource(victim);
-        // Backlog 38: a small texture not referenced by the frame being recorded is parked for reuse
-        // instead of destroyed (it stays counted in the texture budget while parked).
+        // Backlog 38: a texture not referenced by the frame being recorded is parked for reuse instead
+        // of destroyed (it stays counted in the texture budget while parked). Chains over 64 KiB go to
+        // the large pool, only when the consumer zeroes reused textures on the GPU.
         std::vector<uint32_t> pool_evicted;
         std::vector<uint64_t> pool_evicted_bytes;
-        if (!victim_in_frame && victim_entry.budget_bytes != 0 &&
-            small_texture_pool().release(victim_entry.shape, victim, victim_entry.budget_bytes, &pool_evicted,
-                                         &pool_evicted_bytes)) {
+        if (!victim_in_frame && victim_entry.budget_bytes != 0 && !victim_shrunk &&
+            texture_pool_for(victim_entry.budget_bytes)
+                .release(victim_entry.shape, victim, victim_entry.budget_bytes, &pool_evicted, &pool_evicted_bytes)) {
             for (size_t i = 0; i < pool_evicted.size(); ++i) {
                 texture_budget().note_destroyed(pool_evicted_bytes[i]);
                 untrack_guest_texture(pool_evicted[i]);
@@ -2163,8 +2187,9 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     }
     small_texture_pool().note_address_miss(evicted_address_keys_.erase(AddressTextureKeyHash{}(key)) != 0);
 
-    // Backlog 38: the host texture of a released small texture of the same shape is reused; every
-    // texel of every mip is zeroed below, so nothing of its previous content stays visible.
+    // Backlog 38: the host texture of a released texture of the same shape is reused; every texel of
+    // every mip is zeroed below (on the GPU when the consumer can), so nothing of its previous
+    // content stays visible.
     const uint32_t features = bridge_->options().features;
     const pso::WgpuTextureFormat create_format = storage_base_format(mapping.format, uav, 1u, features);
     const bool can_store = uav && storage_capable(create_format, features);
@@ -2179,7 +2204,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     shape.mip_levels = safe_mips;
     shape.dim = static_cast<uint8_t>(dim);
     shape.storage = can_store;
-    const uint32_t reused_id = can_render_uav ? 0u : small_texture_pool().acquire(shape, chain_bytes);
+    const uint32_t reused_id = can_render_uav ? 0u : texture_pool_for(chain_bytes).acquire(shape, chain_bytes);
     const uint32_t id = reused_id != 0 ? reused_id : allocate_id();
     GpuCreateTexture2Payload payload{};
     payload.id = id;
@@ -2203,7 +2228,11 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     }
 
     CommandEncoder enc;
-    if (reused_id != 0) {
+    if (reused_id != 0 && gpu_texture_clear()) {
+        GpuClearTexturePayload clear{};
+        clear.texture_id = id;
+        enc.emit_packet(kGpuOpcodeClearTexture, &clear, sizeof(clear));
+    } else if (reused_id != 0) {
         const std::vector<ZeroWrite> zeros =
             zero_fill_writes(width, safe_height, safe_depth, safe_mips, is3d_tex, effective_layout.block_width,
                              effective_layout.block_height, effective_layout.block_bytes);

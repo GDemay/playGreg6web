@@ -75,6 +75,14 @@ enum class GpuOpcode : uint16_t {
     ReadbackTexture = 40,
 };
 
+// Native-executor extension opcodes: outside GpuOpcode (the cross-track ABI every consumer mirrors,
+// tools/repo_health.py), numbered down from 63 so they never collide with the next shared opcode.
+// The producer emits them only when the consumer is the native executor.
+//
+// Zero every texel of every subresource of a texture on the GPU (GpuClearTexturePayload): a
+// recycled texture then reads as a freshly created one (gpu/small_texture_pool.h gpu_texture_clear).
+inline constexpr GpuOpcode kGpuOpcodeClearTexture = static_cast<GpuOpcode>(63);
+
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
 namespace GpuBufferUsage {
 inline constexpr uint32_t MapRead = 0x0001u;
@@ -926,6 +934,16 @@ struct GpuReadbackTexturePayload {
     uint64_t dst_size;
 };
 static_assert(sizeof(GpuReadbackTexturePayload) == 72, "GpuReadbackTexturePayload layout must stay 72 bytes");
+
+// ClearTexture (kGpuOpcodeClearTexture, 63): every mip and layer / slice of `texture_id` becomes zero. Earlier texture
+// writes are wiped, later ones land on the zeroed texture; like a write, the clear is not ordered
+// against the frame's passes recorded before it, so the producer clears only textures the frame
+// being recorded has not used. Color, single-sample, COPY_DST textures only.
+struct GpuClearTexturePayload {
+    uint32_t texture_id;
+    uint32_t reserved;
+};
+static_assert(sizeof(GpuClearTexturePayload) == 8, "GpuClearTexturePayload layout must stay 8 bytes");
 
 }  // namespace playgta6
 

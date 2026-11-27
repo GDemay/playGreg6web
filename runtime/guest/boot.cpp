@@ -3024,6 +3024,16 @@ std::string build_report() {
              ", \"address_misses\": " + std::to_string(sp.address_misses) +
              ", \"address_evictions\": " + std::to_string(sp.address_evictions) +
              ", \"address_recreates\": " + std::to_string(sp.address_recreates) + "},\n";
+        // Chains over 64 KiB, pooled only when the consumer zeroes reused textures on the GPU (ClearTexture).
+        const gpu::SmallTexturePoolStats lp = gpu::large_texture_pool().stats();
+        o += "  \"large_texture_pool\": {\"gpu_clear\": " + std::string(gpu::gpu_texture_clear() ? "true" : "false") +
+             ", \"max_chain_bytes\": " + std::to_string(gpu::kLargeTextureMaxBytes) +
+             ", \"hits\": " + std::to_string(lp.hits) + ", \"misses\": " + std::to_string(lp.misses) +
+             ", \"bytes_reused\": " + std::to_string(lp.bytes_reused) + ", \"parked\": " + std::to_string(lp.parked_count) +
+             ", \"parked_bytes\": " + std::to_string(lp.parked_bytes) +
+             ", \"peak_parked_bytes\": " + std::to_string(lp.peak_parked_bytes) +
+             ", \"parked_total\": " + std::to_string(lp.parked_total) + ", \"evicted\": " + std::to_string(lp.evicted) +
+             ", \"rejected\": " + std::to_string(lp.rejected) + "},\n";
     }
     // Backlog 29: committed memory by kind (os/memory_budget.h).
     {
@@ -3055,7 +3065,8 @@ std::string build_report() {
             os::process_commit_map(lo, lo + b.arena->space_size(), &mb.commit_map);
         }
         mb.gpu_texture_bytes = gpu::texture_budget().stats().used_bytes;
-        mb.gpu_parked_bytes = gpu::small_texture_pool().stats().parked_bytes;
+        mb.gpu_parked_bytes =
+            gpu::small_texture_pool().stats().parked_bytes + gpu::large_texture_pool().stats().parked_bytes;
         o += "  \"memory_budget\": " + os::memory_budget_json(mb) + ",\n";
     }
     // Schema 2: the import calls up to the first Present, per guest thread and import (null until a

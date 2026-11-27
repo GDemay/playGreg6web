@@ -34,6 +34,7 @@
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/window_script.h"
 #include "gpu/native_exec/blob_cache.h"
+#include "gpu/native_exec/clear_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
@@ -527,6 +528,10 @@ struct NativeExecutor::Impl {
 
     std::unordered_map<uint32_t, BufferEntry> buffers;
     std::unordered_map<uint32_t, TextureEntry> textures;
+    // ClearTexture (clear_model.h): textures whose zeroing is encoded at the start of the next
+    // encoder that is submitted (or flushed before a write that needs it).
+    std::unordered_map<uint32_t, PendingClear> pending_clears;
+    wgpu::Buffer zero_buffer;  // CopySrc, never written: Dawn zero-initializes it
     std::unordered_map<uint32_t, wgpu::Sampler> samplers;
     std::unordered_map<uint32_t, ShaderEntry> shaders;
     std::unordered_map<uint32_t, BglEntry> bgls;
@@ -2060,6 +2065,10 @@ struct NativeExecutor::Impl {
                 if (n >= 48) write_texture(p);
                 else ++stats.op_errors;
                 break;
+            case kGpuOpcodeClearTexture:
+                if (n >= sizeof(GpuClearTexturePayload)) clear_texture(read_payload<GpuClearTexturePayload>(p).texture_id);
+                else packet_error(op, "ClearTexture: payload too short");
+                break;
             case GpuOpcode::CreateSampler:
                 if (n >= 32) create_sampler_v1(p);
                 else ++stats.op_errors;
@@ -2304,6 +2313,7 @@ struct NativeExecutor::Impl {
     void destroy_resource(uint32_t id) {
         buffers.erase(id);
         textures.erase(id);
+        pending_clears.erase(id);
         samplers.erase(id);
         bind_groups.erase(id);
         shaders.erase(id);
@@ -2622,6 +2632,7 @@ struct NativeExecutor::Impl {
                         uint32_t samples, uint32_t usage, uint8_t dimension, uint8_t format,
                         const std::vector<uint8_t>& requested_views) {
         textures.erase(id);
+        pending_clears.erase(id);  // a new texture is zero already
         std::vector<uint8_t> view_formats;
         uint8_t eff_format = format;
         bool bc3d = false;
@@ -2713,6 +2724,14 @@ struct NativeExecutor::Impl {
                 return;
             }
         }
+        if (!pending_clears.empty()) {
+            // The write lands on the queue before the encoder the pending clear goes into.
+            const auto pc = pending_clears.find(w.texture_id);
+            if (pc != pending_clears.end() &&
+                !pc->second.note_write(plan.mip, plan.ox, plan.oy, plan.oz, plan.width, plan.height, plan.depth)) {
+                flush_pending_clears();
+            }
+        }
         wgpu::TexelCopyTextureInfo dst{};
         dst.texture = t.texture;
         dst.mipLevel = plan.mip;
@@ -2727,6 +2746,87 @@ struct NativeExecutor::Impl {
         ++t.depth_gen;
         ++stats.texture_uploads;
         stats.texture_upload_bytes += w.data_len;
+    }
+
+    // ---- ClearTexture (opcode 63, clear_model.h) ----
+
+    static constexpr uint64_t kZeroBufferBytes = 4ull << 20;
+
+    // Records the texture as pending: its zero copies go into the next submitted encoder.
+    void clear_texture(uint32_t id) {
+        const uint16_t op = static_cast<uint16_t>(kGpuOpcodeClearTexture);
+        const auto it = textures.find(id);
+        if (it == textures.end()) {
+            ++stats.clears_missing;  // never created here (a lazy create): it is created zero later
+            return;
+        }
+        const TextureEntry& t = it->second;
+        const FormatInfo& fi = format_info(t.geom.format);
+        if (format_is_depth_or_stencil(t.geom.format) || t.sample_count > 1 || fi.bytes == 0 ||
+            (t.usage & GpuTextureUsage::CopyDst) == 0) {
+            packet_error(op, "ClearTexture " + std::to_string(id) + ": not a single-sample color COPY_DST texture");
+            return;
+        }
+        ClearGeometry g;
+        g.width = t.geom.width;
+        g.height = t.geom.height;
+        g.depth_or_layers = t.geom.depth_or_layers;
+        g.mips = t.geom.mips;
+        g.dimension = t.geom.dimension == 2 ? 2 : 1;
+        g.block_w = fi.compressed ? fi.block_w : 1;
+        g.block_h = fi.compressed ? fi.block_h : 1;
+        g.block_bytes = fi.bytes;
+        pending_clears[id].reset(g);
+        ++stats.textures_cleared;
+    }
+
+    // Copies from the zero buffer over every still-pending part (into an encoder with no open pass).
+    void encode_pending_clears(wgpu::CommandEncoder& enc) {
+        if (pending_clears.empty()) return;
+        if (!zero_buffer) {
+            wgpu::BufferDescriptor bd{};
+            bd.size = kZeroBufferBytes;
+            bd.usage = wgpu::BufferUsage::CopySrc;
+            zero_buffer = device.CreateBuffer(&bd);
+        }
+        std::vector<ZeroCopy> copies;
+        for (const auto& [id, pc] : pending_clears) {
+            const auto it = textures.find(id);
+            if (it == textures.end()) continue;
+            if (!pc.pending()) {
+                ++stats.clears_covered;  // every texel was written since the clear
+                continue;
+            }
+            copies.clear();
+            pc.zero_copies(kZeroBufferBytes, &copies);
+            for (const ZeroCopy& c : copies) {
+                wgpu::TexelCopyBufferInfo src{};
+                src.buffer = zero_buffer;
+                src.layout.offset = 0;
+                src.layout.bytesPerRow = c.bytes_per_row;
+                src.layout.rowsPerImage = c.rows_per_image;
+                wgpu::TexelCopyTextureInfo dst{};
+                dst.texture = it->second.texture;
+                dst.mipLevel = c.mip;
+                dst.origin = {0, c.y, c.z};
+                dst.aspect = wgpu::TextureAspect::All;
+                const wgpu::Extent3D extent{c.width, c.height, c.depth};
+                enc.CopyBufferToTexture(&src, &dst, &extent);
+                ++stats.clear_copies;
+                stats.clear_bytes += c.bytes;
+            }
+            ++it->second.depth_gen;
+        }
+        pending_clears.clear();
+    }
+
+    // A write needs a pending clear done first: submit the pending clears on their own.
+    void flush_pending_clears() {
+        wgpu::CommandEncoder enc = device.CreateCommandEncoder();
+        encode_pending_clears(enc);
+        wgpu::CommandBuffer cb = enc.Finish();
+        queue.Submit(1, &cb);
+        ++stats.clear_flushes;
     }
 
     // ---- depth twins ----
@@ -5247,6 +5347,7 @@ struct NativeExecutor::Impl {
         std::vector<PassCmd> tail(std::make_move_iterator(pass_cmds.begin() + static_cast<std::ptrdiff_t>(last + 1)),
                                   std::make_move_iterator(pass_cmds.end()));
         Encoder e{*this, *frame_target, device.CreateCommandEncoder()};
+        encode_pending_clears(e.enc);
         e.render_pass_opened = true;  // readbackOnly: the canvas already holds this frame's work
         e.cmds = &head;
         for (size_t i = 0; i < head.size(); ++i) {
@@ -5316,6 +5417,7 @@ struct NativeExecutor::Impl {
         const uint64_t tp0 = now_ns();
         FrameTarget& target = *frame_target;
         Encoder e{*this, target, device.CreateCommandEncoder()};
+        encode_pending_clears(e.enc);
         e.render_pass_opened = early_flushed;  // `ps.renderPassOpened = readbackOnly || earlyFlushedThisFrame`
         e.cmds = &pass_cmds;
         for (size_t i = 0; i < pass_cmds.size(); ++i) {
@@ -5927,6 +6029,12 @@ std::string NativeExecutor::stats_json() const {
     num("textures_created", st.textures_created);
     num("texture_uploads", st.texture_uploads);
     num("texture_upload_bytes", st.texture_upload_bytes);
+    num("textures_cleared", st.textures_cleared);
+    num("clear_copies", st.clear_copies);
+    num("clear_bytes", st.clear_bytes);
+    num("clear_flushes", st.clear_flushes);
+    num("clears_covered", st.clears_covered);
+    num("clears_missing", st.clears_missing);
     num("samplers_created", st.samplers_created);
     num("bind_group_layouts", st.bind_group_layouts);
     num("pipeline_layouts", st.pipeline_layouts);

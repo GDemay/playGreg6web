@@ -174,6 +174,15 @@ struct ExecutorStats {
     uint64_t textures_created = 0;
     uint64_t texture_uploads = 0;
     uint64_t texture_upload_bytes = 0;
+    // ClearTexture (clear_model.h): textures zeroed on the GPU, the zero-buffer copies and texel bytes
+    // that took, the extra submits a write forced, clears whose texels were all written before they
+    // were encoded (no copy), and clears of textures this executor never created.
+    uint64_t textures_cleared = 0;
+    uint64_t clear_copies = 0;
+    uint64_t clear_bytes = 0;
+    uint64_t clear_flushes = 0;
+    uint64_t clears_covered = 0;
+    uint64_t clears_missing = 0;
     uint64_t samplers_created = 0;
     uint64_t bind_group_layouts = 0;
     uint64_t pipeline_layouts = 0;

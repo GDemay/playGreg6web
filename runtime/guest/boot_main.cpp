@@ -131,6 +131,7 @@
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/frame_capture.h"
+#include "gpu/small_texture_pool.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/host_input.h"
@@ -1328,6 +1329,10 @@ bool start_live_window() {
     }
     g_live_started = true;
     playgta6::os::set_wgpu_submit_observer(&live_observer);
+    // The native executor zeroes recycled textures itself (ClearTexture): no CPU zero uploads, and
+    // textures over 64 KiB are pooled too. Not with a GPU capture, whose replays may run in a browser
+    // worker that does not have the packet.
+    playgta6::gpu::set_gpu_texture_clear(g_options.gpu_capture.empty());
     // frame_breakdown: the executor's busy time and the packet bytes, sampled at every present.
     guest::set_frame_counter_source([](uint64_t* executor_ns, uint64_t* submitted_bytes) {
         const ne::LivePumpStats st = g_live.stats();

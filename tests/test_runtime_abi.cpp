@@ -949,6 +949,7 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(static_cast<uint16_t>(GpuOpcode::CreateTexture2) == 35);
     CHECK(static_cast<uint16_t>(GpuOpcode::ReadbackBuffer) == 39);
     CHECK(static_cast<uint16_t>(GpuOpcode::ReadbackTexture) == 40);
+    CHECK(static_cast<uint16_t>(kGpuOpcodeClearTexture) == 63);
 
     CHECK(sizeof(GpuTextureViewDesc) == 16);
     CHECK(sizeof(GpuBindGroupLayoutEntry) == 24);
@@ -1021,6 +1022,7 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(offsetof(GpuReadbackTexturePayload, dst_addr) == 48);
     CHECK(offsetof(GpuReadbackTexturePayload, done_addr) == 56);
     CHECK(offsetof(GpuReadbackTexturePayload, dst_size) == 64);
+    CHECK(sizeof(GpuClearTexturePayload) == 8);
     CHECK(kGpuMaxTextureViewFormats == 8);
 
     // GpuBindGroupEntry2 starts with the exact v1 entry.

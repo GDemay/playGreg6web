@@ -78,14 +78,14 @@ void SmallTexturePool::reset() noexcept {
     lru_head_ = kInvalidNode;
     lru_tail_ = kInvalidNode;
     stats_ = SmallTexturePoolStats{};
-    max_count_ = kSmallTexturePoolMaxCount;
-    max_bytes_ = kSmallTexturePoolMaxBytes;
+    max_count_ = default_max_count_;
+    max_bytes_ = default_max_bytes_;
     enabled_ = true;
     enabled_atomic_.store(true, std::memory_order_relaxed);
 }
 
 uint32_t SmallTexturePool::acquire(const SmallTextureShape& shape, uint64_t chain_bytes) noexcept {
-    if (!poolable(chain_bytes) || !enabled_atomic_.load(std::memory_order_relaxed)) {
+    if (!accepts(chain_bytes) || !enabled_atomic_.load(std::memory_order_relaxed)) {
         return 0;
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -123,7 +123,7 @@ uint32_t SmallTexturePool::acquire(const SmallTextureShape& shape, uint64_t chai
 bool SmallTexturePool::release(const SmallTextureShape& shape, uint32_t id, uint64_t chain_bytes,
                                std::vector<uint32_t>* evicted, std::vector<uint64_t>* evicted_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!enabled_ || id == 0 || !poolable(chain_bytes) || max_count_ == 0 || chain_bytes > max_bytes_) {
+    if (!enabled_ || id == 0 || !accepts(chain_bytes) || max_count_ == 0 || chain_bytes > max_bytes_) {
         stats_.rejected += 1;
         return false;
     }
@@ -251,6 +251,29 @@ SmallTexturePoolStats SmallTexturePool::stats() const {
 SmallTexturePool& small_texture_pool() noexcept {
     static SmallTexturePool pool;
     return pool;
+}
+
+SmallTexturePool& large_texture_pool() noexcept {
+    static SmallTexturePool pool(kSmallTextureMaxBytes, kLargeTextureMaxBytes, kLargeTexturePoolMaxCount,
+                                 kLargeTexturePoolMaxBytes);
+    return pool;
+}
+
+namespace {
+std::atomic<bool> g_gpu_texture_clear{false};
+}  // namespace
+
+void set_gpu_texture_clear(bool on) noexcept {
+    g_gpu_texture_clear.store(on, std::memory_order_relaxed);
+}
+
+bool gpu_texture_clear() noexcept {
+    return g_gpu_texture_clear.load(std::memory_order_relaxed);
+}
+
+SmallTexturePool& texture_pool_for(uint64_t chain_bytes) noexcept {
+    SmallTexturePool& large = large_texture_pool();
+    return gpu_texture_clear() && large.accepts(chain_bytes) ? large : small_texture_pool();
 }
 
 std::vector<ZeroWrite> zero_fill_writes(uint32_t width, uint32_t height, uint32_t depth_or_layers, uint32_t mips,
