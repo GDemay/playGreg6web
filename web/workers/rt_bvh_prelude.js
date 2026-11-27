@@ -29,8 +29,8 @@ fn pg6_fault(page: u32) {
     }
 }
 
-// Dword at a 40-bit address (x = low 32 bits, y = bits 39:32). Unmapped: counts a fault, reads 0.
-fn pg6_load32(addr: vec2<u32>) -> u32 {
+// Resolves a 40-bit address through the two-level page directory once. Returns 0u on fault.
+fn pg6_resolve(addr: vec2<u32>) -> u32 {
     let page = (addr.x >> 16u) | ((addr.y & 0xffu) << 16u);
     let t = pg6_arena_dir[page >> 12u];
     if (t == 0u) {
@@ -42,13 +42,26 @@ fn pg6_load32(addr: vec2<u32>) -> u32 {
         pg6_fault(page);
         return 0u;
     }
-    let w = (e & 0x1fffffffu) * 16384u + ((addr.x & 0xffffu) >> 2u);
+    return e;
+}
+
+fn pg6_read_resolved(e: u32, page_byte_off: u32) -> u32 {
+    let w = (e & 0x1fffffffu) * 16384u + ((page_byte_off & 0xffffu) >> 2u);
     switch ((e >> 29u) & 3u) {
         case 0u: { return pg6_arena0[w]; }
         case 1u: { return pg6_arena1[w]; }
         case 2u: { return pg6_arena2[w]; }
         default: { return pg6_arena3[w]; }
     }
+}
+
+// Dword at a 40-bit address (x = low 32 bits, y = bits 39:32). Unmapped: counts a fault, reads 0.
+fn pg6_load32(addr: vec2<u32>) -> u32 {
+    let e = pg6_resolve(addr);
+    if (e == 0u) {
+        return 0u;
+    }
+    return pg6_read_resolved(e, addr.x);
 }
 
 fn pg6_add40(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
@@ -66,17 +79,26 @@ fn pg6_f(a: vec2<u32>, off: u32) -> f32 {
     return bitcast<f32>(pg6_load32(pg6_addr_off(a, off)));
 }
 
+fn pg6_f_resolved(e: u32, page_off: u32, off: u32) -> f32 {
+    return bitcast<f32>(pg6_read_resolved(e, page_off + off));
+}
+
+// Bit-exact IEEE-754 NaN test (immune to fast-math folding \`x != x\` to false on Metal/HLSL).
+fn pg6_isnan(x: f32) -> bool {
+    return (bitcast<u32>(x) & 0x7fffffffu) > 0x7f800000u;
+}
+
 // Slab test of one box: .x = 1.0 when entered, .y = the entry distance.
 fn pg6_slab(mn: vec3<f32>, mx: vec3<f32>, o: vec3<f32>, inv: vec3<f32>, extent: f32) -> vec2<f32> {
     var lo = 0.0;
     var hi = extent;
     for (var a = 0u; a < 3u; a = a + 1u) {
-        if (mn[a] > mx[a]) {
+        if (pg6_isnan(mn[a]) || pg6_isnan(mx[a]) || mn[a] > mx[a]) {
             return vec2<f32>(0.0, 0.0);
         }
         let t0 = (mn[a] - o[a]) * inv[a];
         let t1 = (mx[a] - o[a]) * inv[a];
-        if (t0 != t0 || t1 != t1) {
+        if (pg6_isnan(t0) || pg6_isnan(t1)) {
             continue;
         }
         var a0 = t1;
@@ -99,10 +121,10 @@ fn pg6_tri_miss() -> vec4<u32> {
 }
 
 fn pg6_vec_nan(v: vec3<f32>) -> bool {
-    return v.x != v.x || v.y != v.y || v.z != v.z;
+    return pg6_isnan(v.x) || pg6_isnan(v.y) || pg6_isnan(v.z);
 }
 
-fn pg6_triangle(addr: vec2<u32>, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<u32> {
+fn pg6_triangle(e: u32, page_off: u32, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<u32> {
     var vi = vec3<u32>(0u, 1u, 2u);
     if (kind == 1u) { vi = vec3<u32>(1u, 3u, 2u); }
     if (kind == 2u) { vi = vec3<u32>(2u, 3u, 4u); }
@@ -110,7 +132,8 @@ fn pg6_triangle(addr: vec2<u32>, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<
     var v: array<vec3<f32>, 3>;
     for (var i = 0u; i < 3u; i = i + 1u) {
         let b = vi[i] * 12u;
-        v[i] = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u)) - o;
+        v[i] = vec3<f32>(pg6_f_resolved(e, page_off, b), pg6_f_resolved(e, page_off, b + 4u),
+                         pg6_f_resolved(e, page_off, b + 8u)) - o;
     }
     var kz = 0u;
     var az = abs(d.x);
@@ -146,10 +169,10 @@ fn pg6_triangle(addr: vec2<u32>, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<
     }
     let det = u + vv + w;
     let t_num = u * pz[0] + vv * pz[1] + w * pz[2];
-    if (det == 0.0 || det != det || t_num != t_num || u != u || vv != vv || w != w) {
+    if (det == 0.0 || pg6_isnan(det) || pg6_isnan(t_num) || pg6_isnan(u) || pg6_isnan(vv) || pg6_isnan(w)) {
         return pg6_tri_miss();
     }
-    let sel = (pg6_load32(pg6_addr_off(addr, 60u)) >> (8u * kind)) & 0xffu;
+    let sel = (pg6_read_resolved(e, page_off + 60u) >> (8u * kind)) & 0xffu;
     var wt = array<f32, 4>(u, vv, w, 0.0);
     return vec4<u32>(bitcast<u32>(t_num), bitcast<u32>(det), bitcast<u32>(wt[sel & 3u]),
                      bitcast<u32>(wt[(sel >> 2u) & 3u]));
@@ -163,47 +186,65 @@ fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3
     if (kind >= 6u) {
         return pg6_tri_miss();
     }
-    let nan_ray = extent != extent || pg6_vec_nan(origin) || pg6_vec_nan(dir) || pg6_vec_nan(inv_dir);
-    // address = (base256 << 8) + ((ptr >> 3) << 6), 40 bits
+    let nan_ray = pg6_isnan(extent) || pg6_vec_nan(origin) || pg6_vec_nan(dir) || pg6_vec_nan(inv_dir);
+    // address = (base256 << 8) + ((ptr >> 3) << 6), 40 bits (guaranteed 64-byte aligned)
     let base = vec2<u32>(desc.x << 8u, ((desc.y & 0xffu) << 8u) | (desc.x >> 24u));
     let idx = vec2<u32>((node.x >> 3u) | (node.y << 29u), node.y >> 3u);
     let off = vec2<u32>(idx.x << 6u, (idx.y << 6u) | (idx.x >> 26u));
     let addr = pg6_add40(base, off);
+    let page_off = addr.x & 0xffffu;
     if (kind < 4u) {
         if (nan_ray) {
             return pg6_tri_miss();
         }
-        return pg6_triangle(addr, kind, origin, dir);
+        let e0 = pg6_resolve(addr);
+        if (e0 == 0u) {
+            return pg6_tri_miss();
+        }
+        return pg6_triangle(e0, page_off, kind, origin, dir);
     }
     if (nan_ray) {
         return vec4<u32>(0xffffffffu);
     }
+    let e0 = pg6_resolve(addr);
+    if (e0 == 0u) {
+        return vec4<u32>(0xffffffffu);
+    }
+    let single_page = kind == 4u || page_off <= 0xff80u;
     var ptr: array<u32, 4>;
     var key: array<f32, 4>;
     var hit: array<bool, 4>;
     for (var i = 0u; i < 4u; i = i + 1u) {
-        ptr[i] = pg6_load32(pg6_addr_off(addr, 4u * i));
+        ptr[i] = pg6_read_resolved(e0, page_off + 4u * i);
+        key[i] = 0.0;
+        hit[i] = false;
+        if (ptr[i] == 0xffffffffu) {
+            continue;
+        }
         var mn: vec3<f32>;
         var mx: vec3<f32>;
         if (kind == 5u) {
             let b = 16u + 24u * i;
-            mn = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u));
-            mx = vec3<f32>(pg6_f(addr, b + 12u), pg6_f(addr, b + 16u), pg6_f(addr, b + 20u));
+            if (single_page) {
+                mn = vec3<f32>(pg6_f_resolved(e0, page_off, b), pg6_f_resolved(e0, page_off, b + 4u),
+                               pg6_f_resolved(e0, page_off, b + 8u));
+                mx = vec3<f32>(pg6_f_resolved(e0, page_off, b + 12u), pg6_f_resolved(e0, page_off, b + 16u),
+                               pg6_f_resolved(e0, page_off, b + 20u));
+            } else {
+                mn = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u));
+                mx = vec3<f32>(pg6_f(addr, b + 12u), pg6_f(addr, b + 16u), pg6_f(addr, b + 20u));
+            }
         } else {
             let b = 16u + 12u * i;
-            let a = unpack2x16float(pg6_load32(pg6_addr_off(addr, b)));
-            let bb = unpack2x16float(pg6_load32(pg6_addr_off(addr, b + 4u)));
-            let c = unpack2x16float(pg6_load32(pg6_addr_off(addr, b + 8u)));
+            let a = unpack2x16float(pg6_read_resolved(e0, page_off + b));
+            let bb = unpack2x16float(pg6_read_resolved(e0, page_off + b + 4u));
+            let c = unpack2x16float(pg6_read_resolved(e0, page_off + b + 8u));
             mn = vec3<f32>(a.x, a.y, bb.x);
             mx = vec3<f32>(bb.y, c.x, c.y);
         }
-        key[i] = 0.0;
-        hit[i] = false;
-        if (ptr[i] != 0xffffffffu) {
-            let s = pg6_slab(mn, mx, origin, inv_dir, extent);
-            hit[i] = s.x > 0.5;
-            key[i] = s.y;
-        }
+        let s = pg6_slab(mn, mx, origin, inv_dir, extent);
+        hit[i] = s.x > 0.5;
+        key[i] = s.y;
     }
     var out = vec4<u32>(0xffffffffu);
     let sort = (desc.y >> 31u) != 0u;
@@ -409,9 +450,38 @@ function findGlobalDirectivesEnd(wgsl) {
   return lastDirectiveEnd;
 }
 
+function stripWgslComments(wgsl) {
+  const len = wgsl.length;
+  let out = '';
+  let chunkStart = 0;
+  let i = 0;
+  while (i < len) {
+    if (wgsl.charCodeAt(i) === 0x2f && i + 1 < len) {
+      const next = wgsl.charCodeAt(i + 1);
+      if (next === 0x2f || next === 0x2a) {
+        if (i > chunkStart) {
+          out += wgsl.slice(chunkStart, i);
+        }
+        out += ' ';
+        i = skipCommentAt(wgsl, i);
+        chunkStart = i;
+        continue;
+      }
+    }
+    i += 1;
+  }
+  if (chunkStart === 0) {
+    return wgsl;
+  }
+  if (chunkStart < len) {
+    out += wgsl.slice(chunkStart);
+  }
+  return out;
+}
+
 /**
- * Return `true` iff `wgsl` calls `pg6_bvh_intersect(` or `pg6_load32(` and does not
- * already define `fn pg6_load32(` or `fn pg6_bvh_intersect(`.
+ * Return `true` iff `wgsl` calls `pg6_bvh_intersect(` or `pg6_load32(` outside comments and does
+ * not already define `fn pg6_load32(` or `fn pg6_bvh_intersect(`.
  *
  * @param {string} wgsl
  * @returns {boolean}
@@ -420,12 +490,18 @@ export function needsRtBvhPrelude(wgsl) {
   if (typeof wgsl !== 'string' || wgsl.length === 0) {
     return false;
   }
-  return RT_HELPER_CALL_RE.test(wgsl) && !RT_HELPER_DEF_RE.test(wgsl);
+  // Fast pre-check before comment stripping.
+  if (!RT_HELPER_CALL_RE.test(wgsl)) {
+    return false;
+  }
+  const code = stripWgslComments(wgsl);
+  return RT_HELPER_CALL_RE.test(code) && !RT_HELPER_DEF_RE.test(code);
 }
 
 /**
  * Prepend `RT_BVH_PRELUDE_WGSL` when `wgsl` requires the runtime RT helpers, placing
  * the prelude after any leading WGSL `enable` / `requires` / `diagnostic` directives.
+ * Strips a leading UTF-8 BOM so it is never embedded mid-shader.
  * Returns `wgsl` unchanged if the prelude is not needed or is already present.
  *
  * @param {string} wgsl
@@ -435,12 +511,13 @@ export function applyRtBvhPrelude(wgsl) {
   if (!needsRtBvhPrelude(wgsl)) {
     return wgsl;
   }
-  const insertAt = findGlobalDirectivesEnd(wgsl);
+  const source = wgsl.charCodeAt(0) === 0xfeff ? wgsl.slice(1) : wgsl;
+  const insertAt = findGlobalDirectivesEnd(source);
   if (insertAt === 0) {
-    return `${RT_BVH_PRELUDE_WGSL}\n${wgsl}`;
+    return `${RT_BVH_PRELUDE_WGSL}\n${source}`;
   }
-  const prefix = wgsl.slice(0, insertAt);
-  const rest = wgsl.slice(insertAt);
+  const prefix = source.slice(0, insertAt);
+  const rest = source.slice(insertAt);
   const sepBefore = prefix.endsWith('\n') ? '' : '\n';
   const sepAfter = rest.startsWith('\n') || rest.startsWith('\r\n') ? '' : '\n';
   return `${prefix}${sepBefore}${RT_BVH_PRELUDE_WGSL}${sepAfter}${rest}`;

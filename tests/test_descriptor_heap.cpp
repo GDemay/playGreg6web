@@ -2576,6 +2576,326 @@ void test_state_tracker_flat_index_and_reset() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 29. Hardening regression tests (heap0 serial 0, TableWindow saturation,
+//     handle overflow, CBV alignment, slot source switch, batched copy stamps)
+// ---------------------------------------------------------------------------
+
+void test_heap0_serial_zero_vs_unbound_heap_indexed() {
+    DescriptorHeapRegistry reg;
+    // First heap created in a fresh registry has serial() == 0.
+    DescriptorHeap* heap0 = make_heap(reg, DescriptorHeapType::CbvSrvUav, 16, true);
+    CHECK(heap0->serial() == 0u);
+    const ViewDesc srv = texture2d_srv(0, 1);
+    CHECK(reg.create_shader_resource_view(777, &srv, cpu_at(heap0, 3)) == Status::Ok);
+
+    RootSignatureDesc rsd;
+    RootParameterDesc rc;
+    rc.parameter_type = RootParameterType::Constants32Bit;
+    rc.shader_register = 0;
+    rc.num_32bit_values = 2;
+    rsd.parameters.push_back(rc);
+    rsd.flags = RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed;
+    RootSignature rs;
+    CHECK(RootSignature::build(rsd, &rs).ok());
+
+    ShaderBinding b;
+    b.binding = 0;
+    b.register_class = DescriptorRangeType::Srv;
+    b.heap = HeapAccess::Resource;
+    b.heap_index_parameter = 0;
+    b.heap_index_dword = 0;
+    b.heap_shift = 5;  // * 32 bytes
+    const BindGroupPlan plan = BindGroupPlan::build(rs, std::span<const ShaderBinding>(&b, 1), WebGpuStage::Fragment);
+
+    RootArgumentState state;
+    CHECK(state.set_root_signature(BindPoint::Graphics, &rs) == Status::Ok);
+    CHECK(state.set_root_constant(BindPoint::Graphics, 0, 3, 0) == Status::Ok);
+
+    BindGroupCache cache;
+    // 1) Draw before binding heap0: caches Null entry.
+    BindGroupLookup l0 = cache.get_or_build(state, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+    CHECK(l0.status == Status::Ok && l0.rebuilt && l0.bind_group != nullptr);
+    CHECK(l0.bind_group->entries.size() == 1 && l0.bind_group->entries[0].kind == BindResourceKind::Null);
+    l0.bind_group->gpu_id = 101;
+
+    // 2) Bind heap0 (serial == 0): MUST NOT collide with unbound key and MUST resolve resource 777.
+    DescriptorHeap* heaps[1] = {heap0};
+    CHECK(state.set_descriptor_heaps(1, heaps) == Status::Ok);
+    BindGroupLookup l1 = cache.get_or_build(state, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+    CHECK(l1.status == Status::Ok && l1.rebuilt && l1.bind_group != nullptr);
+    CHECK(l1.bind_group != l0.bind_group);
+    CHECK(l1.bind_group->entries[0].kind == BindResourceKind::TextureView);
+    CHECK(l1.bind_group->entries[0].resource_id == 777);
+    l1.bind_group->gpu_id = 102;
+
+    // 3) Repeat lookup hits cache.
+    BindGroupLookup l2 = cache.get_or_build(state, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+    CHECK(l2.status == Status::Ok && !l2.rebuilt && l2.bind_group == l1.bind_group);
+
+    // 4) Unbind heap0: MUST NOT return stale heap0 bind group.
+    CHECK(state.set_descriptor_heaps(0, nullptr) == Status::Ok);
+    BindGroupLookup l3 = cache.get_or_build(state, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+    CHECK(l3.status == Status::Ok && !l3.rebuilt && l3.bind_group == l0.bind_group);
+    CHECK(l3.bind_group->entries[0].kind == BindResourceKind::Null);
+}
+
+void test_table_window_u32_span_saturation() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 8, true);
+    const ViewDesc srv = texture2d_srv(0, 1);
+    CHECK(reg.create_shader_resource_view(10, &srv, cpu_at(heap, 0)) == Status::Ok);
+
+    RootSignatureDesc rsd;
+    RootParameterDesc tbl;
+    tbl.parameter_type = RootParameterType::DescriptorTable;
+    tbl.ranges.push_back(DescriptorRangeDesc{DescriptorRangeType::Srv, kUnboundedDescriptorCount, 0, 0});
+    rsd.parameters.push_back(tbl);
+    RootSignature rs;
+    CHECK(RootSignature::build(rsd, &rs).ok());
+
+    // Direct table slots at 0 and 0xffffffffu would wrap (hi - lo + 1) to 0 without saturation.
+    ShaderBinding bindings[2];
+    bindings[0].binding = 0;
+    bindings[0].register_class = DescriptorRangeType::Srv;
+    bindings[0].table_parameter = 0;
+    bindings[0].table_slot = 0;
+    bindings[1].binding = 1;
+    bindings[1].register_class = DescriptorRangeType::Srv;
+    bindings[1].table_parameter = 0;
+    bindings[1].table_slot = 0xffffffffu;
+    const BindGroupPlan plan = BindGroupPlan::build(rs, bindings, WebGpuStage::Fragment);
+    CHECK(plan.table_windows().size() == 1);
+    CHECK(plan.table_windows()[0].first_offset == 0);
+    CHECK(plan.table_windows()[0].count == 0xffffffffu);
+
+    RootArgumentState state;
+    DescriptorHeap* heaps[1] = {heap};
+    CHECK(state.set_descriptor_heaps(1, heaps) == Status::Ok);
+    CHECK(state.set_root_signature(BindPoint::Graphics, &rs) == Status::Ok);
+    CHECK(state.set_descriptor_table(BindPoint::Graphics, 0, heap->gpu_start()) == Status::Ok);
+
+    BindGroupCache cache;
+    BindGroupLookup a = cache.get_or_build(state, BindPoint::Graphics, plan, 7, test_resolver, nullptr);
+    CHECK(a.status == Status::Ok && a.rebuilt && a.bind_group->entries[0].resource_id == 10);
+    a.bind_group->gpu_id = 55;
+
+    // Mutate slot 0: saturated window MUST detect invalidation instead of skipping with count == 0.
+    CHECK(reg.create_shader_resource_view(11, &srv, cpu_at(heap, 0)) == Status::Ok);
+    BindGroupLookup b = cache.get_or_build(state, BindPoint::Graphics, plan, 7, test_resolver, nullptr);
+    CHECK(b.status == Status::Ok && b.rebuilt && b.retired_gpu_id == 55);
+    CHECK(b.bind_group->entries[0].resource_id == 11);
+}
+
+void test_handle_overflow_guard_and_cbv_alignment_guard() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap0 = make_heap(reg, DescriptorHeapType::CbvSrvUav, 16, true);
+    DescriptorHeap* heap1 = make_heap(reg, DescriptorHeapType::CbvSrvUav, 16, true);
+    DescriptorHeap* samp0 = make_heap(reg, DescriptorHeapType::Sampler, 16, true);
+    (void)heap1;
+
+    // 32-byte increment: index (1 << 27) overflows 32-bit offset and must NOT alias heap1!
+    const CpuDescriptorHandle bad_cpu = heap0->cpu_handle(1u << 27);
+    const GpuDescriptorHandle bad_gpu = heap0->gpu_handle(1u << 27);
+    CHECK(bad_cpu.ptr == 0);
+    CHECK(bad_gpu.ptr == 0);
+    ResolvedDescriptor r;
+    CHECK(reg.resolve_cpu(bad_cpu, &r) == Status::InvalidHandle);
+    CHECK(reg.resolve_gpu(bad_gpu, &r) == Status::InvalidHandle);
+
+    // 16-byte sampler increment: index (1 << 28) overflows 32-bit offset.
+    CHECK(samp0->cpu_handle(1u << 28).ptr == 0);
+    CHECK(samp0->gpu_handle(1u << 28).ptr == 0);
+    // Out-of-capacity but non-overflowing index still yields HandleOutOfRange.
+    CHECK(reg.resolve_cpu(samp0->cpu_handle(16), &r) == Status::HandleOutOfRange);
+
+    // Invalid CBV alignments (0 or non-power-of-two) are ignored instead of causing div-by-zero.
+    reg.set_cbv_alignment(0);
+    reg.set_cbv_alignment(48);
+    ConstantBufferViewDesc cbv{0x10100, 256};
+    CHECK(reg.create_constant_buffer_view(&cbv, cpu_at(heap0, 0)) == Status::Ok);
+    reg.set_cbv_alignment(16);
+    ConstantBufferViewDesc cbv16{0x10010, 32};
+    CHECK(reg.create_constant_buffer_view(&cbv16, cpu_at(heap0, 1)) == Status::Ok);
+    ConstantBufferViewDesc cbv_bad{0x10008, 32};
+    CHECK(reg.create_constant_buffer_view(&cbv_bad, cpu_at(heap0, 2)) == Status::InvalidArgument);
+}
+
+void test_slot_source_switch_and_rebuild_clears_metadata() {
+    class EmptySlotSource final : public DescriptorSlotSource {
+    public:
+        bool reads(const DescriptorHeap&) const override { return true; }
+        bool snapshot(const DescriptorHeap&, uint32_t, uint32_t count, std::vector<uint8_t>* out) const override {
+            out->assign(static_cast<size_t>(count) * 4u, 0x5Au);
+            return true;
+        }
+        ViewDescriptor view(const DescriptorHeap&, uint32_t, DescriptorRangeType) const override {
+            ViewDescriptor v{};
+            v.kind = DescriptorKind::Srv;
+            v.dimension = ViewDimension::Texture2D;
+            v.resource_id = 9001;
+            return v;
+        }
+        bool sampler(const DescriptorHeap&, uint32_t, SamplerDesc*) const override { return false; }
+    };
+
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 8, true);
+    const ViewDesc srv = texture2d_srv(0, 1);
+    CHECK(reg.create_shader_resource_view(42, &srv, cpu_at(heap, 0)) == Status::Ok);
+
+    RootSignatureDesc rsd;
+    RootParameterDesc rc;
+    rc.parameter_type = RootParameterType::Constants32Bit;
+    rc.shader_register = 0;
+    rc.num_32bit_values = 1;
+    rsd.parameters.push_back(rc);
+    RootSignature rs;
+    CHECK(RootSignature::build(rsd, &rs).ok());
+
+    ShaderBinding b;
+    b.binding = 0;
+    b.register_class = DescriptorRangeType::Srv;
+    b.heap = HeapAccess::Resource;
+    b.heap_index_parameter = 0;
+    b.heap_index_dword = 0;
+    b.heap_shift = 5;
+    const BindGroupPlan plan = BindGroupPlan::build(rs, std::span<const ShaderBinding>(&b, 1), WebGpuStage::Fragment);
+
+    RootArgumentState state;
+    DescriptorHeap* heaps[1] = {heap};
+    CHECK(state.set_descriptor_heaps(1, heaps) == Status::Ok);
+    CHECK(state.set_root_signature(BindPoint::Graphics, &rs) == Status::Ok);
+    CHECK(state.set_root_constant(BindPoint::Graphics, 0, 0, 0) == Status::Ok);
+
+    BindGroupCache cache;
+    BindGroupLookup l0 = cache.get_or_build(state, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+    CHECK(l0.status == Status::Ok && l0.rebuilt && l0.bind_group->entries[0].resource_id == 42);
+    l0.bind_group->gpu_id = 301;
+    l0.bind_group->null_write_entries = 2;
+    l0.bind_group->view_ids.push_back(888);
+    l0.bind_group->relocations.push_back(CachedBindGroup::Relocation{0, false, 0x1000, 64, 64, 77, 0});
+    l0.bind_group->relocation_epoch = 5;
+    l0.bind_group->retire_epoch = 6;
+    l0.bind_group->residency_epoch = 7;
+    l0.bind_group->residency_key = 8;
+    cache.note_group_ids(*l0.bind_group);
+
+    // Switching slot_source_ MUST invalidate cached entry, retire gpu_id, and clear stale metadata.
+    EmptySlotSource src;
+    cache.set_slot_source(&src);
+    BindGroupLookup l1 = cache.get_or_build(state, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+    CHECK(l1.status == Status::Ok && l1.rebuilt && l1.retired_gpu_id == 301);
+    CHECK(l1.bind_group->entries[0].resource_id == 9001);
+    CHECK(l1.bind_group->null_write_entries == 0);
+    CHECK(l1.bind_group->view_ids.empty());
+    CHECK(l1.bind_group->relocations.empty());
+    CHECK(l1.bind_group->relocation_epoch == 0 && l1.bind_group->retire_epoch == 0);
+    CHECK(l1.bind_group->residency_epoch == 0 && l1.bind_group->residency_key == 0);
+
+    // Destroying the heap and calling refresh_table_entries MUST reset HeapIndexed entry to Null.
+    reg.destroy_heap(heap);
+    CHECK(refresh_table_entries(reg, src, plan, test_resolver, nullptr, l1.bind_group, true));
+    CHECK(l1.bind_group->entries[0].kind == BindResourceKind::Null);
+    CHECK(l1.bind_group->null_entries == 1);
+}
+
+void test_copy_descriptors_batched_gen_and_overlap_fastpath() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* src_cbv = make_heap(reg, DescriptorHeapType::CbvSrvUav, 256, false);
+    DescriptorHeap* dst_cbv = make_heap(reg, DescriptorHeapType::CbvSrvUav, 256, true);
+    DescriptorHeap* src_smp = make_heap(reg, DescriptorHeapType::Sampler, 64, false);
+    DescriptorHeap* dst_smp = make_heap(reg, DescriptorHeapType::Sampler, 64, true);
+
+    fill_srvs(reg, src_cbv, 0, 200, 1000);
+    for (uint32_t i = 0; i < 32; ++i) {
+        SamplerDesc s;
+        s.max_anisotropy = 1 + (i % 16);
+        s.mip_lod_bias = static_cast<float>(i) * 0.25f;
+        CHECK(reg.create_sampler(s, cpu_at(src_smp, i)) == Status::Ok);
+    }
+
+    // Batched copy_descriptors_simple bumps destination generation at most ONCE across 150 slots.
+    const uint64_t gen0 = dst_cbv->generation();
+    CHECK(reg.copy_descriptors_simple(150, cpu_at(dst_cbv, 10), cpu_at(src_cbv, 20), DescriptorHeapType::CbvSrvUav) ==
+          Status::Ok);
+    CHECK(dst_cbv->generation() == gen0 + 1);
+    for (uint32_t i = 0; i < 150; ++i) {
+        CHECK(dst_cbv->view(10 + i)->resource_id == 1020 + i);
+    }
+    CHECK(dst_cbv->range_changed_since(10, 150, gen0));
+    CHECK(!dst_cbv->range_changed_since(0, 10, gen0));
+    CHECK(!dst_cbv->range_changed_since(160, 96, gen0));
+    // Re-copying identical content must NOT bump generation.
+    CHECK(reg.copy_descriptors_simple(150, cpu_at(dst_cbv, 10), cpu_at(src_cbv, 20), DescriptorHeapType::CbvSrvUav) ==
+          Status::Ok);
+    CHECK(dst_cbv->generation() == gen0 + 1);
+
+    // 16-byte sampler heap copy_descriptors with zero-count ranges and disjoint heaps fast path.
+    const uint64_t sgen0 = dst_smp->generation();
+    CpuDescriptorHandle dst_starts[3] = {cpu_at(dst_smp, 4), CpuDescriptorHandle{0}, cpu_at(dst_smp, 20)};
+    uint32_t dst_sizes[3] = {8, 0, 8};
+    CpuDescriptorHandle src_starts[2] = {cpu_at(src_smp, 2), cpu_at(src_smp, 10)};
+    uint32_t src_sizes[2] = {10, 6};
+    CHECK(reg.copy_descriptors(3, dst_starts, dst_sizes, 2, src_starts, src_sizes, DescriptorHeapType::Sampler) ==
+          Status::Ok);
+    CHECK(dst_smp->range_changed_since(4, 8, sgen0));
+    CHECK(dst_smp->range_changed_since(20, 8, sgen0));
+    CHECK(dst_smp->sampler(4)->desc.max_anisotropy == src_smp->sampler(2)->desc.max_anisotropy);
+    CHECK(dst_smp->sampler(27)->desc.max_anisotropy == src_smp->sampler(15)->desc.max_anisotropy);
+
+    // Same-heap overlapping multi-range copy on 16-byte sampler heap stages cleanly.
+    CpuDescriptorHandle ov_dst[2] = {cpu_at(dst_smp, 6), cpu_at(dst_smp, 10)};
+    uint32_t ov_sizes[2] = {4, 4};
+    CpuDescriptorHandle ov_src[2] = {cpu_at(dst_smp, 4), cpu_at(dst_smp, 8)};
+    const float expected_bias_6 = dst_smp->sampler(4)->desc.mip_lod_bias;
+    const float expected_bias_13 = dst_smp->sampler(11)->desc.mip_lod_bias;
+    CHECK(reg.copy_descriptors(2, ov_dst, ov_sizes, 2, ov_src, ov_sizes, DescriptorHeapType::Sampler) == Status::Ok);
+    CHECK(dst_smp->sampler(6)->desc.mip_lod_bias == expected_bias_6);
+    CHECK(dst_smp->sampler(13)->desc.mip_lod_bias == expected_bias_13);
+
+    // Large-batch eviction (>8 resource IDs and >8 view IDs) exercises binary-search path.
+    RootSignatureDesc rsd;
+    RootParameterDesc tbl;
+    tbl.parameter_type = RootParameterType::DescriptorTable;
+    tbl.ranges.push_back(DescriptorRangeDesc{DescriptorRangeType::Srv, 1, 0, 0});
+    rsd.parameters.push_back(tbl);
+    RootSignature rs;
+    CHECK(RootSignature::build(rsd, &rs).ok());
+    ShaderBinding sb;
+    sb.binding = 0;
+    sb.register_class = DescriptorRangeType::Srv;
+    sb.shader_register = 0;
+    const BindGroupPlan plan = BindGroupPlan::build(rs, std::span<const ShaderBinding>(&sb, 1), WebGpuStage::Fragment);
+
+    RootArgumentState state;
+    DescriptorHeap* hs[1] = {dst_cbv};
+    CHECK(state.set_descriptor_heaps(1, hs) == Status::Ok);
+    CHECK(state.set_root_signature(BindPoint::Graphics, &rs) == Status::Ok);
+    BindGroupCache cache;
+    for (uint32_t i = 0; i < 20; ++i) {
+        CHECK(state.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(dst_cbv, 10 + i)) == Status::Ok);
+        BindGroupLookup lk = cache.get_or_build(state, BindPoint::Graphics, plan, 1, test_resolver, nullptr);
+        CHECK(lk.status == Status::Ok && lk.rebuilt);
+        lk.bind_group->gpu_id = 500 + i;
+        lk.bind_group->view_ids.push_back(9000 + i);
+        cache.note_group_ids(*lk.bind_group);
+    }
+    std::vector<uint32_t> evict_res;
+    std::vector<uint32_t> evict_views;
+    for (uint32_t i = 0; i < 10; ++i) {
+        evict_res.push_back(1020 + i);  // matches first 10
+    }
+    for (uint32_t i = 10; i < 20; ++i) {
+        evict_views.push_back(9000 + i);  // matches next 10 via view_ids
+    }
+    std::vector<uint32_t> retired;
+    const size_t dropped = cache.evict_resources_and_views(evict_res, evict_views, &retired);
+    CHECK(dropped == 20);
+    CHECK(retired.size() == 20);
+    CHECK(cache.size() == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -2608,6 +2928,11 @@ int main() {
     test_placed_heaps_sorted_lookup();
     test_bind_group_cache_flat_mru_erase_and_scale();
     test_state_tracker_flat_index_and_reset();
+    test_heap0_serial_zero_vs_unbound_heap_indexed();
+    test_table_window_u32_span_saturation();
+    test_handle_overflow_guard_and_cbv_alignment_guard();
+    test_slot_source_switch_and_rebuild_clears_metadata();
+    test_copy_descriptors_batched_gen_and_overlap_fastpath();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_descriptor_heap failed with %d failure(s)\n", g_failures);

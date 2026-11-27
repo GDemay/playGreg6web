@@ -452,12 +452,16 @@ private:
     friend class DescriptorHeapRegistry;
     DescriptorHeap(const DescriptorHeapDesc& desc, uint32_t serial);
     void stamp(uint32_t index) noexcept;
+    void stamp_block(uint32_t block_index, uint64_t gen) noexcept;
+    bool copy_range_from(uint32_t dst_index, const DescriptorHeap& src, uint32_t src_index, uint32_t count) noexcept;
+    bool write_views_batch(uint32_t dst_index, const ViewDescriptor* records, uint32_t count) noexcept;
+    bool write_samplers_batch(uint32_t dst_index, const SamplerDescriptor* records, uint32_t count) noexcept;
 
     DescriptorHeapDesc desc_{};
     uint32_t serial_ = 0;
     std::vector<ViewDescriptor> views_;
     std::vector<SamplerDescriptor> samplers_;
-    std::unique_ptr<uint64_t[]> slot_generations_;
+    std::unique_ptr<std::atomic<uint64_t>[]> slot_generations_;
     std::unique_ptr<std::atomic<uint64_t>[]> block_generations_;
     std::atomic<uint64_t> generation_{0};
 };
@@ -506,7 +510,11 @@ public:
     void destroy_heap(DescriptorHeap* heap);
     // Required alignment of a constant-buffer view's address and size (power of two). D3D12 on PC
     // requires 256 (the default); the Xbox title passes 16-byte aligned views.
-    void set_cbv_alignment(uint32_t alignment) noexcept { cbv_alignment_ = alignment; }
+    void set_cbv_alignment(uint32_t alignment) noexcept {
+        if (alignment != 0 && (alignment & (alignment - 1u)) == 0) {
+            cbv_alignment_ = alignment;
+        }
+    }
     uint32_t heap_count() const noexcept;
 
     Status resolve_cpu(CpuDescriptorHandle handle, ResolvedDescriptor* out) const noexcept;
@@ -554,6 +562,8 @@ public:
     }
 
 private:
+    Status resolve_locked(uint64_t ptr, uint32_t tag, ResolvedDescriptor* out) const noexcept;
+    Status resolve_range_locked(CpuDescriptorHandle start, uint32_t count, DescriptorHeapType type, ResolvedDescriptor* out) const noexcept;
     Status resolve(uint64_t ptr, uint32_t tag, ResolvedDescriptor* out) const noexcept;
     Status resolve_range(CpuDescriptorHandle start, uint32_t count, DescriptorHeapType type, ResolvedDescriptor* out) const noexcept;
     Status write_view_at(CpuDescriptorHandle dst, const ViewDescriptor& record) noexcept;
@@ -1064,6 +1074,7 @@ struct CachedBindGroup {
     // Memory-backed tables (DescriptorSlotSource): the words of every window read at the build and
     // the GPU handle of each table parameter's base (root parameter index, handle).
     bool from_memory = false;
+    const DescriptorSlotSource* built_source = nullptr;
     std::vector<uint8_t> built_words;
     std::vector<std::pair<uint32_t, uint64_t>> table_bases;
     // Heap-indexed entries: (plan entry index, GPU handle of the slot read, its generation at the
@@ -1199,6 +1210,13 @@ private:
     std::vector<uint64_t> id_filter_ = std::vector<uint64_t>(kIdFilterBits / 64, 0);
     size_t filter_notes_ = 0;  // note_group_ids calls since the filter was last rebuilt
 
+    struct ResolvedHeapSlot {
+        DescriptorHeap* heap = nullptr;
+        uint32_t index = 0;
+        bool valid = false;
+        bool cb_miss = false;
+    };
+
     std::vector<Slot> table_;
     size_t size_ = 0;
     size_t tombstones_ = 0;
@@ -1207,6 +1225,9 @@ private:
     std::vector<uint64_t> scratch_key_;
     std::vector<uint8_t> scratch_words_;
     mutable std::vector<uint8_t> scratch_window_;
+    std::vector<ResolvedHeapSlot> scratch_heap_slots_;
+    std::vector<uint32_t> scratch_evict_res_;
+    std::vector<uint32_t> scratch_evict_views_;
     const DescriptorSlotSource* slot_source_ = nullptr;
     uint64_t epoch_ = 1;
     size_t peak_epoch_entries_ = 0;  // largest size_ in the open epoch

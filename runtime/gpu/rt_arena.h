@@ -217,9 +217,13 @@ private:
 
     bool alloc_slot(uint32_t* arena, uint32_t* slot);
     bool evict_one();
+    bool reclaim_oldest_recycled_scratch();
+    Ensure ensure_page_impl(uint64_t page, bool pin, bool queue_upload);
     bool set_entry(uint64_t page, uint32_t entry);  // false: L2 table limit
     void touch_dir(uint32_t word);
     void trim_recycled_scratch_to_budget(uint32_t reserve_for_new);
+    void release_scratch_va_range(uint64_t first_page, uint32_t page_count);
+    bool alloc_scratch_va_range(uint32_t page_count, uint64_t* out_first_page);
     void unpin_pages(const std::vector<uint64_t>& pages);
 
     uint32_t arenas_, pages_per_arena_;
@@ -242,6 +246,7 @@ private:
     uint32_t scratch_live_pages_ = 0;
     uint32_t scratch_recycled_pages_ = 0;
     std::vector<RecycledScratch> recycled_scratch_;
+    std::vector<std::pair<uint64_t, uint32_t>> free_scratch_va_;
     std::unordered_map<uint32_t, RecycledScratch> active_scratch_;
 
     Stats stats_;
