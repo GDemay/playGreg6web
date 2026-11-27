@@ -199,6 +199,9 @@ public:
     // expanded) and appends their slot numbers to `slots`; every later take() of this pass answers
     // from that scan. False (nothing taken) with the window off.
     bool take_dirty(std::vector<uint64_t>* slots);
+    // Allocation-free query of an existing take_dirty scan (does not take or clear marks).
+    // False before a scan, outside the translated window, or when every slot was marked.
+    bool has_unmarked(uint64_t va, size_t len) const;
 
 private:
     std::vector<uint32_t> pass_of_;  // per slot: the pass that took its mark (0: none yet)

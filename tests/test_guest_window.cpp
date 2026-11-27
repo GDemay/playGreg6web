@@ -594,6 +594,9 @@ void test_write_marks() {
         gw::mark_written(W + 11 * k64K, 1);  // shared slot: keys[0] and keys[1]
         std::vector<uint64_t> dirty;
         CHECK(pass.take_dirty(&dirty) && dirty.size() == 2);
+        CHECK(!pass.has_unmarked(W + 11 * k64K + 5, k64K - 5));
+        CHECK(pass.has_unmarked(W + 10 * k64K + 5, 2 * k64K - 5));
+        CHECK(!pass.has_unmarked(0, k64K) && !pass.has_unmarked(W, 0));
         std::vector<const void*> visit;
         index.collect(dirty, &visit);
         CHECK(visit.size() == 3);
@@ -608,8 +611,10 @@ void test_write_marks() {
         index.collect(dirty, &visit);
         CHECK(visit.size() == 2);
         pass.begin();
+        CHECK(!pass.has_unmarked(W + 10 * k64K, 2 * k64K));  // no scan yet
         dirty.clear();
         CHECK(pass.take_dirty(&dirty) && dirty.empty());
+        CHECK(pass.has_unmarked(W + 10 * k64K, 2 * k64K));
     }
 
     // Verification counters.
