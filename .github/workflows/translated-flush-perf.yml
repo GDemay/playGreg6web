@@ -10,6 +10,8 @@ on:
       profile:
         type: boolean
         default: false
+      case_filter:
+        default: all
 permissions:
   contents: read
 jobs:
@@ -58,7 +60,7 @@ jobs:
           if [ '${{ inputs.profile }}' = 'true' ]; then
             python3 runner/tools/perf_profile_fragmented_flush.py baseline-build/bench_fragmented_buffer_flush patch-build/bench_fragmented_buffer_flush --output results/fragmented-profile.json
           else
-            python3 runner/tools/perf_run_fragmented_flush.py --baseline baseline-build/bench_fragmented_buffer_flush --candidate patch-build/bench_fragmented_buffer_flush --output results/fragmented-flush.json
+            python3 runner/tools/perf_run_fragmented_flush.py --baseline baseline-build/bench_fragmented_buffer_flush --candidate patch-build/bench_fragmented_buffer_flush --output results/fragmented-flush.json --case-filter "${{ inputs.case_filter }}"
           fi
       - uses: actions/upload-artifact@v4
         if: always()
