@@ -2905,7 +2905,12 @@ void test_large_descriptor_range_intersections() {
         std::array<DescriptorHeap*, 3> heaps{};
         std::array<std::vector<ViewDescriptor>, 3> expected;
         for (uint32_t h = 0; h < heaps.size(); ++h) {
-            heaps[h] = make_heap(reg, DescriptorHeapType::CbvSrvUav, slots, false);
+            DescriptorHeapDesc desc;
+            desc.type = DescriptorHeapType::CbvSrvUav;
+            desc.num_descriptors = slots;
+            // Repeat the snapshot oracle for address-based placed heap handles.
+            if (seed == 2) desc.cpu_address = 0x10000000ull + h * 0x10000ull;
+            CHECK(reg.create_heap(desc, &heaps[h]) == Status::Ok);
             fill_srvs(reg, heaps[h], 0, slots, 10000 * h + 1);
             for (uint32_t i = 0; i < slots; ++i) expected[h].push_back(*heaps[h]->view(i));
         }
