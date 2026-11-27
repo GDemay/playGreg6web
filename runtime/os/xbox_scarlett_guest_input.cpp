@@ -1324,7 +1324,17 @@ private:
             }
         }
         std::unique_ptr<uint8_t[]> surface(new uint8_t[chain_bytes]);
-        if (!com::read_guest(dst, surface.get(), chain_bytes) ||
+        // A bijective single-mip 2D layout with exactly the logical byte count has no
+        // padding or other subresources to preserve. Validate readability without copying
+        // bytes that the tiler will overwrite. Keep translated/partial layouts on the old path.
+        bool overwrite_all = false;
+        if (!guest_window::translated(dst) && td.mip_levels == 1 && td.depth == 1 &&
+            slices_ == 1 && td.array_size == 1 && chain_bytes == linear_bytes &&
+            !VirtualMemoryArena::DiagnosticReads::active()) {
+            const com::GuestRangeView readable(dst, chain_bytes);
+            overwrite_all = readable.data() != nullptr;
+        }  // release the view's arena lock before calling read/write_guest
+        if ((!overwrite_all && !com::read_guest(dst, surface.get(), chain_bytes)) ||
             !gfx10::tile_into_surface(td, mip, linear.get(), linear_bytes, surface.get(), chain_bytes) ||
             !com::write_guest(dst, surface.get(), chain_bytes)) {
             return com::E_INVALIDARG_HR;

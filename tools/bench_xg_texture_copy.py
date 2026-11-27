@@ -25,6 +25,8 @@ def main():
     for name, width, height, fmt, padding, layout in [
         ('4K RGBA tiled tight', 3840, 2160, 28, 0, 0x105),
         ('4K BC1 tiled tight', 3840, 2160, 71, 0, 0x105),
+        ('4096 square RGBA exact-footprint', 4096, 4096, 28, 0, 0x105),
+        ('4096 square BC1 exact-footprint', 4096, 4096, 71, 0, 0x105),
         ('4K RGBA tiled padded control', 3840, 2160, 28, 64, 0x105),
         ('4K RGBA console-linear tight', 3840, 2160, 28, 0, 0x100),
         ('small RGBA tiled tight control', 64, 64, 28, 0, 0x105),

@@ -2206,6 +2206,51 @@ void test_xg_tight_copy_failures_and_aliases() {
     CHECK(fx.vcall(comp, 1) == 0);
 }
 
+void test_xg_complete_surface_validation() {
+    Fixture fx;
+    namespace gx = playgta6::gpu::gfx10;
+    const uint64_t create = fx.export_address("xg_xs.dll", "XGCreateTextureComputer");
+    for (const auto format : {28u, 71u}) {
+        const uint32_t width = format == 28 ? 64 : 256;
+        const uint32_t height = width;
+        const auto fg = gx::format_geometry(format);
+        const uint32_t row = width / fg.block_width * fg.bytes_per_block;
+        const uint32_t rows = height / fg.block_height;
+        const gx::TextureLayoutDesc td{format, width, height, 1, 1, 0x105, 0};
+        const size_t chain = gx::surface_bytes(td);
+        const auto linear = pattern_data(size_t{row} * rows);
+        CHECK(chain == linear.size());  // exact-footprint fast path, not a padded layout
+        const uint64_t desc = xg_desc(3, width, height, 1, 1, format);
+        CHECK(com::write_guest(desc + 0x2C, uint32_t{0x105}));
+        const uint64_t out = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
+        const uint64_t comp = load64(out);
+        const uint64_t src = com::guest_alloc(linear.size());
+        CHECK(com::write_guest(src, linear.data(), linear.size()));
+        const uint64_t dst = fx.arena.virtual_alloc(0, chain, os::kMemReserve | os::kMemCommit,
+                                                    os::PageProtect::ReadWrite);
+        CHECK(dst != 0);
+        std::vector<uint8_t> expected(chain, 0xCD);
+        CHECK(gx::tile_into_surface(td, 0, linear.data(), linear.size(), expected.data(), chain));
+        CHECK(com::write_guest(dst, linear.data(), linear.size()));
+        CHECK(as_hr(fx.vcall(comp, 8, {I(dst), I(0), I(0), I(dst), I(row), I(linear.size())})) == 0);
+        CHECK(guest_bytes(dst, chain) == expected);  // source/destination alias is snapshotted
+
+        const std::vector<uint8_t> sentinel(chain, 0xCD);
+        CHECK(com::write_guest(dst, sentinel.data(), chain));
+        CHECK(fx.arena.protect(dst, chain, os::PageProtect::ReadOnly));
+        CHECK(as_hr(fx.vcall(comp, 8, {I(dst), I(0), I(0), I(src), I(row), I(linear.size())})) == com::E_INVALIDARG_HR);
+        CHECK(guest_bytes(dst, chain) == sentinel);
+        CHECK(fx.arena.protect(dst, chain, os::PageProtect::ReadWrite));
+        const uint64_t partial = fx.arena.reserve(0, chain);
+        CHECK(partial != 0 && fx.arena.commit(partial, 4096));
+        CHECK(com::write_guest(partial, sentinel.data(), 4096));
+        CHECK(as_hr(fx.vcall(comp, 8, {I(partial), I(0), I(0), I(src), I(row), I(linear.size())})) == com::E_INVALIDARG_HR);
+        CHECK(guest_bytes(partial, 4096) == std::vector<uint8_t>(4096, 0xCD));
+        CHECK(fx.vcall(comp, 1) == 0);
+    }
+}
+
 // AcpHalCreate: a guest object without an IUnknown prefix. Connect (0), submit (2), disconnect
 // (1), release (5); commands outside a connection fail; slots 3/4 trap.
 void test_acp_hal() {
@@ -3868,6 +3913,7 @@ int main(int argc, char** argv) {
     test_game_input_battery_ffb_and_callbacks();
     test_xg();
     test_xg_tight_copy_failures_and_aliases();
+    test_xg_complete_surface_validation();
     test_acp_hal();
     test_acp_hal_xma_commands();
     test_acp_hal_xma_decode_worker();
