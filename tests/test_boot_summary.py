@@ -279,6 +279,21 @@ class BootSummaryTest(unittest.TestCase):
         self.assertIn("pipeline_dump.dumped", diff)
         self.assertIn("scripted_inputs_sent", diff)
 
+        # Verify lower-is-better classification on reflection_join_failures,
+        # black_loading_s, and first_visible_frame_s in --compare verdicts.
+        r_worse = browser_report()
+        r_worse["reflection_join_failures"] = 5
+        r_worse["black_loading_s"] = 12.5
+        r_worse["first_visible_frame_s"] = 19.0
+        r_base = browser_report()
+        r_base["reflection_join_failures"] = 1
+        r_base["black_loading_s"] = 3.0
+        r_base["first_visible_frame_s"] = 7.1
+        reg_diff = bs.compare(r_base, r_worse)
+        self.assertRegex(reg_diff, r"reflection_join_failures.*REGRESSION")
+        self.assertRegex(reg_diff, r"black_loading_s.*REGRESSION")
+        self.assertRegex(reg_diff, r"first_visible_frame_s.*REGRESSION")
+
 
 if __name__ == "__main__":
     unittest.main()

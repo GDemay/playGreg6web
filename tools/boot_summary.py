@@ -644,9 +644,9 @@ def _fmt(v: float | None) -> str:
 
 HIGHER_BETTER = ("fps_", "presents", "frames_played", "shader_pack_hits", "xapu_decoded_packets", "hit_before_use",
                  "audio_open_ok", "frames_submitted", "non_silent_fraction", "low1_fps", "low01_fps", "prewarmed")
-LOWER_BETTER = ("errors", "misses", "underruns", "hitches", "drops", "failed", "wasted", "elapsed_ms",
+LOWER_BETTER = ("errors", "failures", "misses", "underruns", "hitches", "drops", "failed", "wasted", "elapsed_ms",
                 "late_pct", "missed_vblanks", "binding_fallbacks", "draws_skipped", "no_shader_module", "peak",
-                "draws_dropped_by_bridge")
+                "draws_dropped_by_bridge", "black_loading", "first_visible_frame")
 
 
 def _direction(key: str) -> int:
