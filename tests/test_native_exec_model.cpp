@@ -14,6 +14,7 @@
 #include "gpu/cmd_encoder.h"
 #include "gpu/native_exec/blit_model.h"
 #include "gpu/native_exec/clear_model.h"
+#include "gpu/native_exec/binding_fit_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
@@ -1272,6 +1273,60 @@ void test_error_scope_model() {
     CHECK(log.total() == 203);
 }
 
+void test_binding_fit() {
+    // whole 128 KiB uniform buffer -> cut to 64 KiB; a 1 KiB range stays as is
+    BufferBindingFit f = fit_buffer_binding(false, 131072, 0, 0, 0, 65536);
+    CHECK(f.ok && f.size == 65536 && f.clamped);
+    f = fit_buffer_binding(false, 131072, 256, 1024, 0, 65536);
+    CHECK(f.ok && f.size == 1024 && !f.clamped);
+    // requested past the end -> the remainder; offset past the end -> no fit
+    f = fit_buffer_binding(false, 4096, 3840, 1024, 0, 65536);
+    CHECK(f.ok && f.size == 256);
+    CHECK(!fit_buffer_binding(false, 4096, 4096, 0, 0, 65536).ok);
+    // storage: a multiple of 4
+    f = fit_buffer_binding(true, 1030, 0, 0, 0, 1u << 27);
+    CHECK(f.ok && f.size == 1028 && f.clamped);
+    CHECK(!fit_buffer_binding(true, 2, 0, 0, 0, 1u << 27).ok);
+    // under minBindingSize: grown when the buffer has room, else no fit
+    f = fit_buffer_binding(false, 4096, 0, 64, 256, 65536);
+    CHECK(f.ok && f.size == 256);
+    CHECK(!fit_buffer_binding(false, 128, 0, 0, 256, 65536).ok);
+    // size unknown: unchanged
+    f = fit_buffer_binding(false, 0, 0, 0, 0, 65536);
+    CHECK(f.ok && f.size == 0);
+    // integer formats vs sample types (0 float, 1 unfilterable, 2 depth, 3 sint, 4 uint)
+    CHECK(integer_sample_type_mismatch(0, 14));   // r32uint on float
+    CHECK(integer_sample_type_mismatch(1, 15));   // r32sint on unfilterable-float
+    CHECK(!integer_sample_type_mismatch(4, 14));  // r32uint on uint
+    CHECK(integer_sample_type_mismatch(3, 14));   // r32uint on sint
+    CHECK(integer_sample_type_mismatch(4, 22));   // rgba8unorm on uint
+    CHECK(!integer_sample_type_mismatch(0, 22));  // rgba8unorm on float
+    CHECK(!integer_sample_type_mismatch(1, 16));  // r32float on unfilterable-float
+}
+
+void test_device_error_kinds() {
+    // numbers fold (decimal and 0x hex), newlines collapse; words with digits after a letter keep the letter
+    CHECK(normalize_device_error("The number of storage buffers (26) in the Compute stage exceeds the maximum per-stage limit (16).\n"
+                                 " - While validating binding counts\n") ==
+          "The number of storage buffers (N) in the Compute stage exceeds the maximum per-stage limit (N). - While "
+          "validating binding counts");
+    CHECK(normalize_device_error("offset 0x1F0 texture_2d") == "offset N texture_Nd");
+    DeviceErrorKinds k;
+    k.record(31, "limit (13) exceeded");
+    k.record(31, "limit (29) exceeded");
+    k.record(7, "limit (29) exceeded");
+    k.record(kDeviceErrorWorkerOpcode, "worker thing", 5);
+    CHECK(k.total() == 8);
+    CHECK(k.count(31, "limit (1) exceeded") == 2);
+    CHECK(k.count(7, "limit (1) exceeded") == 1);
+    const std::string j = k.json();
+    CHECK(j.find("{\"count\": 5, \"opcode\": 65535, \"text\": \"worker thing\"}") < j.find("\"opcode\": 31"));
+    for (int i = 0; i < 100; ++i) k.record(9, "kind " + std::string(1, static_cast<char>('A' + i % 26)) + std::string(1, static_cast<char>('a' + i / 26)));
+    CHECK(k.total() == 108);
+    CHECK(j.size() < k.json().size());
+    CHECK(k.json().find("\"other\": 0") == std::string::npos);  // past the row cap the rest is "other"
+}
+
 // Bytes the copies zero per (mip, slice, row) texel row: every pending texel exactly once.
 uint64_t copied_bytes(const std::vector<ZeroCopy>& copies) {
     uint64_t n = 0;
@@ -1411,6 +1466,8 @@ int main() {
     test_fit_failure_classes();
     test_fragment_outputs();
     test_error_scope_model();
+    test_device_error_kinds();
+    test_binding_fit();
     test_clear_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
