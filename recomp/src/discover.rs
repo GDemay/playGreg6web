@@ -447,7 +447,7 @@ fn clip_inferred(
         .and_then(|(_, b)| b.instructions.iter().find(|i| i.ip() == table.load_site))
         .filter(|i| i.memory_index() != Register::None)
         .map(|i| u64::from(i.memory_index_scale()));
-    let Some(stride @ (4 | 8)) = stride else {
+    let Some(stride @ (2 | 4 | 8)) = stride else {
         return table;
     };
     let Some(end) = u64::try_from(table.targets.len())
@@ -1227,7 +1227,10 @@ impl<'i, 'a> Discovery<'i, 'a> {
         // zero-extended byte index) yields to a bound they prove; the first table found wins
         // when none is proven.
         let Some((constants, all)) = self.reaching_prefix(&trace, first_block, preds) else {
-            return direct;
+            return self
+                .match_jump_table_cfg(site, leaf)
+                .filter(|t| !t.inferred || direct.is_none())
+                .or(direct);
         };
         let mut first = direct;
         if !constants.is_empty()
@@ -1247,8 +1250,53 @@ impl<'i, 'a> Discovery<'i, 'a> {
             }
             first.get_or_insert(table);
         }
-        self.match_constant_sets(&trace, first_block, preds, leaf, &all)
-            .or(first)
+        if let Some(table) = self.match_constant_sets(&trace, first_block, preds, leaf, &all) {
+            if !table.inferred {
+                return Some(table);
+            }
+            first.get_or_insert(table);
+        }
+        if first.as_ref().is_none_or(|t| t.inferred)
+            && let Some(table) = self.match_jump_table_cfg(site, leaf)
+        {
+            if !table.inferred {
+                return Some(table);
+            }
+            first.get_or_insert(table);
+        }
+        first
+    }
+
+    /// Dominator-aware multi-predecessor fallback ([`jump_table::resolve_in_subgraph`]) for
+    /// switches whose guard or table base dominates a diamond/merge that the sole-predecessor
+    /// trace and interval reachability cannot propagate (e.g. signed/negative-offset guards,
+    /// stack-spilled bases, `sub` flag guards, `cmov` clamps, or two-level index tables across
+    /// diamonds).
+    fn match_jump_table_cfg(&self, site: u64, leaf: Option<(u64, u64)>) -> Option<JumpTable> {
+        let jmp_block = self.jump_block(site)?;
+        let owner = self
+            .image
+            .function_table
+            .function_at(site)
+            .filter(|e| self.entries.contains(e))
+            .or_else(|| {
+                self.image
+                    .function_table
+                    .is_empty()
+                    .then(|| self.entries.range(..=site).next_back().copied())
+                    .flatten()
+            })?;
+        let mut resumes = self.resume_targets.clone();
+        resumes.extend(self.return_sites.iter().copied());
+        jump_table::resolve_in_subgraph(
+            self.image,
+            &self.blocks,
+            &self.entries,
+            &resumes,
+            owner,
+            jmp_block,
+            leaf,
+        )
     }
 
     /// A dispatch whose table base (or another register the slice reads) holds one of a few

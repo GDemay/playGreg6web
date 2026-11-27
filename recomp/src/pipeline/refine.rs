@@ -388,10 +388,22 @@ pub fn lea_pointers(analysis: &Analysis) -> BTreeSet<u64> {
 /// Values of `DIR64` base relocations stored in non-executable sections that point into
 /// executable code (pointers as stored at the preferred image base).
 pub fn base_reloc_pointers(image: &CodeImage<'_>, guest: &GuestImage<'_>) -> BTreeSet<u64> {
+    base_reloc_code_info(image, guest).0
+}
+
+/// Scans `DIR64` base relocations in non-executable sections pointing into `Region::Code`,
+/// returning `(all_code_targets, readonly_table_run_targets)` where `readonly_table_run_targets`
+/// contains targets that appear in a contiguous run of `>= 2` consecutive 8-byte `DIR64` code
+/// pointers inside a read-only (`!write`) non-executable section.
+fn base_reloc_code_info(
+    image: &CodeImage<'_>,
+    guest: &GuestImage<'_>,
+) -> (BTreeSet<u64>, BTreeSet<u64>) {
     if image.sections().is_empty() || guest.sections.is_empty() || guest.relocations.is_empty() {
-        return BTreeSet::new();
+        return (BTreeSet::new(), BTreeSet::new());
     }
     let mut out = BTreeSet::new();
+    let mut ro_slots: BTreeMap<u64, u64> = BTreeMap::new();
     for reloc in &guest.relocations {
         if reloc.kind != BaseRelocKind::Dir64 {
             continue;
@@ -418,9 +430,20 @@ pub fn base_reloc_pointers(image: &CodeImage<'_>, guest: &GuestImage<'_>) -> BTr
         let value = u64::from_le_bytes(bytes.try_into().expect("8 bytes"));
         if image.region_of(value) == Region::Code {
             out.insert(value);
+            if !section.protection.write {
+                ro_slots.insert(rva, value);
+            }
         }
     }
-    out
+    let mut ro_runs = BTreeSet::new();
+    for (&rva, &target) in &ro_slots {
+        let has_prev = rva.checked_sub(8).is_some_and(|p| ro_slots.contains_key(&p));
+        let has_next = rva.checked_add(8).is_some_and(|n| ro_slots.contains_key(&n));
+        if has_prev || has_next {
+            ro_runs.insert(target);
+        }
+    }
+    (out, ro_runs)
 }
 
 /// Blocks of all functions keyed by start (shared blocks once).
@@ -465,6 +488,25 @@ impl<'a> BlockIndex<'a> {
         }
         inside.then_some(false)
     }
+    /// Find the decoded instruction at `va`, if any block contains an instruction starting at `va`.
+    fn instruction_at(&self, va: u64) -> Option<&iced_x86::Instruction> {
+        for block in self
+            .blocks
+            .range(..=va)
+            .rev()
+            .take(CONTAINING_BLOCK_SCAN)
+            .map(|(_, b)| *b)
+        {
+            if block.contains(va)
+                && let Ok(idx) = block
+                    .instructions
+                    .binary_search_by_key(&va, iced_x86::Instruction::ip)
+            {
+                return block.instructions.get(idx);
+            }
+        }
+        None
+    }
 }
 
 /// Inserts half-open range `[start, end)` into a canonical set of disjoint, non-adjacent
@@ -500,15 +542,35 @@ fn checked_table_end(start: u64, entries: usize, entry_size: u64) -> Option<u64>
     start.checked_add(byte_len)
 }
 
+/// Infer the byte size of one entry of `table` from its `load_site` instruction (`2`, `4`, or `8`),
+/// defaulting to `4` when `load_site` is not present in `blocks`.
+fn jump_table_entry_size(blocks: &BlockIndex<'_>, load_site: u64) -> u64 {
+    blocks
+        .instruction_at(load_site)
+        .map(|instr| instr.memory_size().size() as u64)
+        .filter(|size| matches!(size, 2 | 4 | 8))
+        .unwrap_or(4)
+}
+
 /// Byte ranges of resolved jump tables and their index tables, normalised into disjoint sorted
 /// half-open intervals. Tables whose extent overflows `u64` are ignored safely.
+#[cfg(test)]
 fn jump_table_ranges(analysis: &Analysis) -> BTreeMap<u64, u64> {
+    let blocks = BlockIndex::new(analysis);
+    jump_table_ranges_with_blocks(analysis, &blocks)
+}
+
+fn jump_table_ranges_with_blocks(
+    analysis: &Analysis,
+    blocks: &BlockIndex<'_>,
+) -> BTreeMap<u64, u64> {
     if analysis.jump_tables.is_empty() {
         return BTreeMap::new();
     }
     let mut ranges = BTreeMap::new();
     for table in analysis.jump_tables.values().flat_map(|t| t.tables()) {
-        if let Some(end) = checked_table_end(table.table, table.targets.len(), 4) {
+        let entry_size = jump_table_entry_size(blocks, table.load_site);
+        if let Some(end) = checked_table_end(table.table, table.targets.len(), entry_size) {
             insert_merged_range(&mut ranges, table.table, end);
         }
         if let Some(index) = table.index
@@ -599,18 +661,160 @@ fn inside_accepted_probe(accepted: &BTreeMap<u64, ProbeSpan>, va: u64) -> bool {
     inside
 }
 
+/// Maximum linear sweep length (bytes) when checking whether an unreached `DIR64` candidate inside
+/// a `.pdata` chunk lands on a real instruction boundary.
+const MAX_PDATA_INTERIOR_SWEEP: u64 = 64 * 1024;
+
+/// Minimum number of eligible `DIR64` base-reloc interior targets in the same `.pdata` function
+/// required to recognise a relocated interior dispatch/routine cluster (e.g. a multi-entry assembly
+/// routine table or an unresolved `Absolute64` dispatch table).
+const MIN_PDATA_INTERIOR_CLUSTER: usize = 2;
+
+/// Whether `va` inside `.pdata` chunk `range` sits on a plausible code entry boundary (never
+/// strictly inside a decoded instruction): exact chunk start, existing decoded instruction
+/// boundary, 16-byte aligned, preceded by `int3`/`nop`/`ret`, or landed on by a bounded linear
+/// sweep from `range.start`.
+fn pdata_interior_boundary_ok(
+    image: &CodeImage<'_>,
+    blocks: &BlockIndex<'_>,
+    range: crate::pdata::FunctionRange,
+    va: u64,
+) -> bool {
+    match blocks.locate(va) {
+        Some(false) => return false,
+        Some(true) => return true,
+        None => {}
+    }
+    if va == range.start || va.is_multiple_of(16) {
+        return true;
+    }
+    if va
+        .checked_sub(1)
+        .and_then(|prev| image.bytes_at(prev, 1))
+        .is_some_and(|b| matches!(b, [0xcc | 0x90 | 0xc3]))
+    {
+        return true;
+    }
+    if va < range.start || va - range.start > MAX_PDATA_INTERIOR_SWEEP {
+        return false;
+    }
+    let Ok(bytes) = image.code_bytes(range.start) else {
+        return false;
+    };
+    let span = usize::try_from(va - range.start + 1).unwrap_or(usize::MAX);
+    let slice = &bytes[..bytes.len().min(span.saturating_add(15))];
+    let mut decoder = Decoder::with_ip(64, slice, range.start, DecoderOptions::NONE);
+    let mut instr = iced_x86::Instruction::default();
+    while decoder.can_decode() {
+        decoder.decode_out(&mut instr);
+        if instr.is_invalid() {
+            return false;
+        }
+        let ip = instr.ip();
+        if ip == va {
+            return true;
+        }
+        if ip > va {
+            return false;
+        }
+    }
+    false
+}
+
 /// Classifies every candidate against one discovery result (see [`PointerStatus`]).
+#[cfg_attr(not(test), allow(dead_code))]
 fn classify(
     image: &CodeImage<'_>,
     analysis: &Analysis,
     candidates: &BTreeMap<u64, BTreeSet<PointerSource>>,
     added: &BTreeSet<u64>,
 ) -> Vec<CodePointer> {
+    classify_with_reloc_runs(image, analysis, candidates, added, &BTreeSet::new())
+}
+
+/// [`classify`] with read-only contiguous `DIR64` pointer-table run metadata (`ro_reloc_runs`)
+/// so unreached chained `.pdata` chunk starts and relocated `DIR64` interior clusters (multi-entry
+/// assembly routine tables or unresolved `Absolute64` dispatch tables not already covered by
+/// intra-function switches or EH resume targets) are accepted and lifted instead of trapping
+/// `UnknownTarget` at runtime.
+fn classify_with_reloc_runs(
+    image: &CodeImage<'_>,
+    analysis: &Analysis,
+    candidates: &BTreeMap<u64, BTreeSet<PointerSource>>,
+    added: &BTreeSet<u64>,
+    ro_reloc_runs: &BTreeSet<u64>,
+) -> Vec<CodePointer> {
     if candidates.is_empty() {
         return Vec::new();
     }
     let blocks = BlockIndex::new(analysis);
-    let tables = jump_table_ranges(analysis);
+    let tables = jump_table_ranges_with_blocks(analysis, &blocks);
+
+    // Collect EH/longjmp resume targets and resolved intra-function jump-table targets so neither
+    // is ever split out into a standalone function entry.
+    let mut eh_resume_targets: BTreeSet<u64> = image
+        .eh
+        .resume_targets
+        .iter()
+        .map(|&(_, target)| target)
+        .collect();
+    for f in analysis.functions.values() {
+        eh_resume_targets.extend(f.resume_targets.iter().copied());
+    }
+    let mut resolved_jt_targets: BTreeSet<u64> = BTreeSet::new();
+    for jt in analysis.jump_tables.values() {
+        resolved_jt_targets.extend(jt.all_targets());
+    }
+
+    // Pre-scan `BaseReloc` candidates that fall inside a `.pdata` range (`!(r.start == va &&
+    // r.function == va)`) to identify:
+    //   1. Unreached chained/secondary `.pdata` chunk starts (`r.start == va && r.function != va`),
+    //   2. Relocated interior clusters (`>= MIN_PDATA_INTERIOR_CLUSTER` eligible `BaseReloc`
+    //      targets inside the same `.pdata` primary function, with at least one unreached target
+    //      or backed by a contiguous read-only `DIR64` table run).
+    // Stray single interior pointers inside decoded blocks (e.g. `helper + 5`) stay `PdataInterior`.
+    let mut pdata_cluster_members: BTreeMap<u64, Vec<(u64, bool, bool)>> = BTreeMap::new();
+    let mut promotable_pdata_interior: BTreeSet<u64> = BTreeSet::new();
+    for (&va, sources) in candidates {
+        if analysis.functions.contains_key(&va) || !sources.contains(&PointerSource::BaseReloc) {
+            continue;
+        }
+        let Some(range) = image.function_table.range_at(va) else {
+            continue;
+        };
+        if range.start == va && range.function == va {
+            continue;
+        }
+        if in_ranges(&tables, va)
+            || eh_resume_targets.contains(&va)
+            || resolved_jt_targets.contains(&va)
+            || !pdata_interior_boundary_ok(image, &blocks, *range, va)
+            || probe(image, va).is_err()
+        {
+            continue;
+        }
+        let unreached = blocks.locate(va).is_none();
+        if range.start == va && range.function != va && unreached {
+            promotable_pdata_interior.insert(va);
+        }
+        pdata_cluster_members.entry(range.function).or_default().push((
+            va,
+            unreached,
+            ro_reloc_runs.contains(&va),
+        ));
+    }
+    for members in pdata_cluster_members.values() {
+        if members.len() >= MIN_PDATA_INTERIOR_CLUSTER {
+            let has_unreached = members.iter().any(|&(_, unreached, _)| unreached);
+            let ro_run_count = members.iter().filter(|&&(_, _, in_ro)| in_ro).count();
+            if has_unreached || ro_run_count >= MIN_PDATA_INTERIOR_CLUSTER {
+                for &(va, _, _) in members {
+                    promotable_pdata_interior.insert(va);
+                }
+            }
+        }
+    }
+
     // Probed spans of candidates accepted earlier in this round, keyed by start VA.
     let mut accepted: BTreeMap<u64, ProbeSpan> = BTreeMap::new();
     let mut out = Vec::with_capacity(candidates.len());
@@ -627,7 +831,17 @@ fn classify(
             .range_at(va)
             .is_some_and(|r| !(r.start == va && r.function == va))
         {
-            PointerStatus::PdataInterior
+            if promotable_pdata_interior.contains(&va) && !inside_accepted_probe(&accepted, va) {
+                match probe(image, va) {
+                    Ok(span) => {
+                        accepted.insert(va, span);
+                        PointerStatus::Accepted
+                    }
+                    Err(_) => PointerStatus::PdataInterior,
+                }
+            } else {
+                PointerStatus::PdataInterior
+            }
         } else if in_ranges(&tables, va) {
             PointerStatus::JumpTableData
         } else if blocks.locate(va) == Some(false) || inside_accepted_probe(&accepted, va) {
@@ -714,7 +928,8 @@ fn refined_rounds(
     image.entry_points = known_entries.iter().copied().collect();
     image.no_return = known_no_return.iter().copied().collect();
 
-    let relocated = timings.time(Phase::RefineBaseRelocs, || base_reloc_pointers(image, guest));
+    let (relocated, ro_reloc_runs) =
+        timings.time(Phase::RefineBaseRelocs, || base_reloc_code_info(image, guest));
     let empty_graph =
         known_entries.is_empty() && image.eh.resume_targets.is_empty() && relocated.is_empty();
     if empty_graph || max_rounds == 0 {
@@ -771,7 +986,8 @@ fn refined_rounds(
                 .or_default()
                 .insert(PointerSource::BaseReloc);
         }
-        let pointers = classify(img, &analysis, &candidates, &added);
+        let pointers =
+            classify_with_reloc_runs(img, &analysis, &candidates, &added, &ro_reloc_runs);
         let new_entries: BTreeSet<u64> = pointers
             .iter()
             .filter(|p| {
@@ -1583,5 +1799,259 @@ mod probe_tests {
         assert_eq!(check_a, check_b);
         assert_eq!(check_a.iat_reads, 1);
         assert_eq!(check_a.misaligned, vec![BASE + u64::from(RDATA_RVA) + 0x14]);
+    }
+
+    #[test]
+    fn pdata_interior_base_reloc_cluster_promotes_unreached_entries_and_preserves_invariants() {
+        use crate::pdata::{FunctionRange, FunctionTable};
+
+        // Synthetic `.pdata` function at TEXT..TEXT+0x80 with:
+        // - TEXT+0x00: primary entry (`mov eax, 0; ret`)
+        // - TEXT+0x10..0x40: 4 unreached interior routines (`mov eax, k; ret`), referenced by a
+        //   contiguous read-only `DIR64` table in `.rdata`
+        // - TEXT+0x60: EH resume target (`mov eax, 9; ret`), ALSO referenced by a `DIR64` reloc
+        //   (must NEVER be promoted so EH resume ownership stays intact)
+        // - TEXT+0x80..0x90: chained/secondary `.pdata` chunk (`function = TEXT`), referenced by a
+        //   `DIR64` reloc and unreached from primary entry (must be promoted)
+        let mut code = vec![0xccu8; 0xa0];
+        let emit_stub = |buf: &mut [u8], off: usize, val: u32| {
+            buf[off] = 0xb8;
+            buf[off + 1..off + 5].copy_from_slice(&val.to_le_bytes());
+            buf[off + 5] = 0xc3;
+        };
+        emit_stub(&mut code, 0x00, 0);
+        emit_stub(&mut code, 0x10, 1);
+        emit_stub(&mut code, 0x20, 2);
+        emit_stub(&mut code, 0x30, 3);
+        emit_stub(&mut code, 0x40, 4);
+        emit_stub(&mut code, 0x60, 9);
+        emit_stub(&mut code, 0x80, 10);
+
+        let cluster = [TEXT + 0x10, TEXT + 0x20, TEXT + 0x30, TEXT + 0x40];
+        let eh_target = TEXT + 0x60;
+        let chained_chunk = TEXT + 0x80;
+        let mid_instr = TEXT + 0x01; // inside primary `mov eax, 0`
+
+        let mut rdata = Vec::new();
+        let mut relocs = Vec::new();
+        let all_ptrs = [
+            cluster[0],
+            cluster[1],
+            cluster[2],
+            cluster[3],
+            eh_target,
+            chained_chunk,
+            mid_instr,
+        ];
+        for (i, &va) in all_ptrs.iter().enumerate() {
+            rdata.extend_from_slice(&va.to_le_bytes());
+            relocs.push(BaseRelocation {
+                rva: RDATA_RVA + (i as u32) * 8,
+                kind: BaseRelocKind::Dir64,
+            });
+        }
+
+        let guest = GuestImage {
+            image_base: BASE,
+            size_of_image: 0x4000,
+            section_alignment: 0x1000,
+            entry_point_rva: 0x1000,
+            headers_mapped: false,
+            executable_bytes: ExecutableBytes::Keep,
+            relocs_stripped: false,
+            sections: vec![ImageSection {
+                name: ".rdata".to_string(),
+                rva: RDATA_RVA,
+                virtual_size: rdata.len() as u32,
+                protection: Protection::READ_ONLY,
+                is_headers: false,
+                bytes_omitted: false,
+                characteristics: 0,
+                data: &rdata,
+            }],
+            relocations: relocs,
+        };
+
+        let run = |continued: bool| {
+            let mut image = CodeImage::new(
+                BASE,
+                vec![
+                    CodeSection::new(TEXT, &code, true),
+                    CodeSection::new(BASE + u64::from(RDATA_RVA), &rdata, false),
+                ],
+                vec![TEXT],
+            );
+            image.function_table = FunctionTable::new(vec![
+                FunctionRange {
+                    start: TEXT,
+                    end: TEXT + 0x80,
+                    function: TEXT,
+                },
+                FunctionRange {
+                    start: chained_chunk,
+                    end: TEXT + 0xa0,
+                    function: TEXT,
+                },
+            ]);
+            image.eh.resume_targets.push((TEXT, eh_target));
+            let mut timings = DiscoveryTimings::default();
+            let (analysis, outcome) =
+                discover_refined_rounds(&mut image, &guest, MAX_ROUNDS, continued, &mut timings);
+            (analysis, outcome, image.entry_points)
+        };
+
+        let (analysis_cont, outcome_cont, entries_cont) = run(true);
+        let (analysis_fresh, outcome_fresh, entries_fresh) = run(false);
+        assert_eq!(
+            (&analysis_cont, &outcome_cont, &entries_cont),
+            (&analysis_fresh, &outcome_fresh, &entries_fresh),
+            "continued rounds must match fresh rounds"
+        );
+        assert!(!outcome_cont.round_limit_hit);
+
+        let status = |va: u64| {
+            outcome_cont
+                .pointers
+                .iter()
+                .find(|p| p.va == va)
+                .map(|p| (p.status, p.lifted))
+        };
+        for &va in &cluster {
+            assert_eq!(
+                status(va),
+                Some((PointerStatus::Accepted, true)),
+                "cluster entry {va:#x} must be lifted"
+            );
+            assert!(analysis_cont.functions.contains_key(&va));
+        }
+        assert_eq!(
+            status(chained_chunk),
+            Some((PointerStatus::Accepted, true)),
+            "unreached chained .pdata chunk must be lifted"
+        );
+        assert!(analysis_cont.functions.contains_key(&chained_chunk));
+        assert_eq!(
+            status(eh_target),
+            Some((PointerStatus::PdataInterior, false)),
+            "EH resume target must stay PdataInterior"
+        );
+        assert!(analysis_cont.functions[&TEXT].resume_targets.contains(&eh_target));
+        assert_eq!(
+            status(mid_instr),
+            Some((PointerStatus::PdataInterior, false)),
+            "mid-instruction pointer must stay PdataInterior"
+        );
+    }
+
+    #[test]
+    fn resolved_absolute64_switch_targets_stay_pdata_interior_and_stride_matches_load() {
+        use crate::pdata::{FunctionRange, FunctionTable};
+        use iced_x86::code_asm::*;
+        use iced_x86::{Code, Instruction, MemoryOperand, Register};
+
+        let data_va = BASE + u64::from(RDATA_RVA);
+        let mut a = CodeAssembler::new(64).expect("asm");
+        let (mut c0, mut c1, mut c2, mut def) = (
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+            a.create_label(),
+        );
+        a.cmp(ecx, 3).unwrap();
+        a.ja(def).unwrap();
+        a.add_instruction(
+            Instruction::with2(
+                Code::Lea_r64_m,
+                Register::RDX,
+                MemoryOperand::with_base_displ(Register::RIP, data_va as i64),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        a.jmp(qword_ptr(rdx + rcx * 8)).unwrap();
+        a.set_label(&mut c0).unwrap();
+        a.mov(eax, 10).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut c1).unwrap();
+        a.mov(eax, 11).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut c2).unwrap();
+        a.mov(eax, 12).unwrap();
+        a.ret().unwrap();
+        a.set_label(&mut def).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+        let code = a.assemble(TEXT).expect("assemble");
+
+        let mut dec = Decoder::with_ip(64, &code, TEXT, DecoderOptions::NONE);
+        let mut case_vas = Vec::new();
+        while dec.can_decode() {
+            let instr = dec.decode();
+            if (instr.mnemonic() == Mnemonic::Mov && instr.try_immediate(1).is_ok())
+                || instr.mnemonic() == Mnemonic::Xor
+            {
+                case_vas.push(instr.ip());
+            }
+        }
+        assert_eq!(case_vas.len(), 4);
+
+        let mut rdata = Vec::new();
+        let mut relocs = Vec::new();
+        for (i, &va) in case_vas.iter().enumerate() {
+            rdata.extend_from_slice(&va.to_le_bytes());
+            relocs.push(BaseRelocation {
+                rva: RDATA_RVA + (i as u32) * 8,
+                kind: BaseRelocKind::Dir64,
+            });
+        }
+
+        let mut image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(data_va, &rdata, false),
+            ],
+            vec![TEXT],
+        );
+        image.function_table = FunctionTable::new(vec![FunctionRange {
+            start: TEXT,
+            end: TEXT + code.len() as u64,
+            function: TEXT,
+        }]);
+        for i in 0..4u64 {
+            image.data_relocs.insert(data_va + i * 8);
+        }
+        let guest = GuestImage {
+            image_base: BASE,
+            size_of_image: 0x4000,
+            section_alignment: 0x1000,
+            entry_point_rva: 0x1000,
+            headers_mapped: false,
+            executable_bytes: ExecutableBytes::Keep,
+            relocs_stripped: false,
+            sections: vec![ImageSection {
+                name: ".rdata".to_string(),
+                rva: RDATA_RVA,
+                virtual_size: rdata.len() as u32,
+                protection: Protection::READ_ONLY,
+                is_headers: false,
+                bytes_omitted: false,
+                characteristics: 0,
+                data: &rdata,
+            }],
+            relocations: relocs,
+        };
+
+        let (analysis, outcome) = discover_refined(&mut image, &guest);
+        assert_eq!(analysis.jump_tables.len(), 1);
+        assert_eq!(analysis.functions.len(), 1, "switch cases must stay intra-function");
+        for &va in &case_vas {
+            let cp = outcome.pointers.iter().find(|p| p.va == va).expect("candidate");
+            assert_eq!(cp.status, PointerStatus::PdataInterior);
+            assert!(!cp.lifted);
+        }
+        // Stride-8 `Absolute64` jump table spans 4 * 8 = 32 bytes.
+        let ranges = jump_table_ranges(&analysis);
+        assert_eq!(ranges, BTreeMap::from([(data_va, data_va + 32)]));
     }
 }
