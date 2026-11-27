@@ -6813,6 +6813,8 @@ void test_window_write_marks_flush(bool fragmented = false) {
         }
         fx.vcall(buf2, Slot::Release);
         if (fragmented) {
+            // Restore distinct physical pages after the aliasing/remap test above.
+            CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 2, mapped_pfn) == 1);
             // Unaligned CPU origin and a short last shadow page in a fragmented range.
             const uint64_t short_size = 2 * k64K - 246;
             const uint64_t buf3 = fx.create(scene.device, Slot2::CreatePlacedResourceX,
