@@ -108,13 +108,13 @@
 
   const FALLBACK_SVG =
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 360" role="img" aria-label="playgta6web">' +
-    '<defs><linearGradient id="pg6g" x1="0" y1="0" x2="1" y2="1">' +
-    '<stop offset="0%" stop-color="#0b1220"/><stop offset="55%" stop-color="#132033"/>' +
-    '<stop offset="100%" stop-color="#1a2a3a"/></linearGradient></defs>' +
+    '<defs><radialGradient id="pg6g" cx="50%" cy="46%" r="68%">' +
+    '<stop offset="0%" stop-color="#070709"/><stop offset="58%" stop-color="#020203"/>' +
+    '<stop offset="100%" stop-color="#000000"/></radialGradient></defs>' +
     '<rect width="640" height="360" fill="url(#pg6g)"/>' +
     '<text x="320" y="176" text-anchor="middle" fill="#e8eef7" font-family="Segoe UI, system-ui, sans-serif" ' +
     'font-size="36" font-weight="600" letter-spacing="0.08em">playgta6web</text>' +
-    '<text x="320" y="214" text-anchor="middle" fill="#8fa3bc" font-family="Segoe UI, system-ui, sans-serif" ' +
+    '<text x="320" y="214" text-anchor="middle" fill="#9e9e9e" font-family="Segoe UI, system-ui, sans-serif" ' +
     'font-size="14" letter-spacing="0.18em">LOCAL BOOT</text></svg>';
 
   const SHARED_CSS =
@@ -159,7 +159,7 @@
     'animation:pg6-greg-pulse 4800ms ease-in-out infinite;}' +
     '.' +
     ROOT_CLASS +
-    '__fallback{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0b1220,#1a2a3a);}' +
+    '__fallback{display:flex;align-items:center;justify-content:center;background:#000;}' +
     '.' +
     ROOT_CLASS +
     '__fallback svg{width:100%;height:100%;}' +
@@ -600,7 +600,13 @@
       return 0;
     }
     if (snapshot.progressPct !== undefined && snapshot.progressPct !== null) {
-      return Math.round(clampPct(snapshot.progressPct));
+      const explicitPct =
+        typeof snapshot.progressPct === 'number'
+          ? snapshot.progressPct
+          : Number(snapshot.progressPct);
+      if (Number.isFinite(explicitPct)) {
+        return Math.round(clampPct(explicitPct));
+      }
     }
     const phase = resolveBootPhase(snapshot.stage);
     const phaseRange = phase ? BOOT_PHASE_RANGES[phase] : null;
@@ -1359,8 +1365,22 @@
         }
       }
 
+      if (this._visible && !this._dismissed) {
+        this._attachKeyListener();
+      }
+
+      this._syncImage();
+    }
+
+    _attachKeyListener() {
+      if (this._destroyed || this._keyTarget) {
+        return;
+      }
       const keyTarget = this._resolveKeyTarget();
-      if (keyTarget) {
+      if (!keyTarget) {
+        return;
+      }
+      if (!this._onKeyDown) {
         this._onKeyDown = (event) => {
           if (this._destroyed || !this._visible || this._dismissed) {
             return;
@@ -1384,16 +1404,28 @@
             this.toggleGregMode();
           }
         };
+      }
+      try {
+        keyTarget.addEventListener('keydown', this._onKeyDown);
+        this._keyTarget = keyTarget;
+      } catch {
+        this._onKeyDown = null;
+        this._keyTarget = null;
+      }
+    }
+
+    _detachKeyListener() {
+      if (this._keyTarget && this._onKeyDown) {
         try {
-          keyTarget.addEventListener('keydown', this._onKeyDown);
-          this._keyTarget = keyTarget;
+          if (typeof this._keyTarget.removeEventListener === 'function') {
+            this._keyTarget.removeEventListener('keydown', this._onKeyDown);
+          }
         } catch {
-          this._onKeyDown = null;
-          this._keyTarget = null;
+          // ignore
         }
       }
-
-      this._syncImage();
+      this._keyTarget = null;
+      this._gregKeyBuffer = '';
     }
 
     _syncImage() {
@@ -1478,6 +1510,9 @@
         try {
           if (typeof this._root.setAttribute === 'function') {
             this._root.setAttribute('data-greg-backdrop', gregBackdropActive ? 'true' : 'false');
+          }
+          if (this._root.style) {
+            this._root.style.backgroundColor = gregBackdropActive ? '' : '#000';
           }
         } catch {
           // ignore
@@ -1607,7 +1642,7 @@
       const gregImg = els.gregImg;
       const reducedMotion = this._isReducedMotion();
       const activeGreg = Boolean(this._gregMode) && !this._gregBackdropFailed && !this._gregImageFailed;
-      const hideSpinner = Boolean(this._dismissed);
+      const hideSpinner = Boolean(this._dismissed) && !this._fading;
 
       if (this._root) {
         try {
@@ -1656,7 +1691,7 @@
           spinnerRing.hidden = false;
           if (spinnerRing.style) {
             spinnerRing.style.display = '';
-            spinnerRing.style.animation = reducedMotion ? 'none' : '';
+            spinnerRing.style.animation = reducedMotion || this._fading ? 'none' : '';
           }
         } catch {
           // ignore
@@ -1946,12 +1981,21 @@
       const snap = snapshot && typeof snapshot === 'object' ? snapshot : {};
       this._lastSnapshot = snap;
 
-      const incomingStage =
-        typeof snap.stage === 'string' && snap.stage.length > 0
-          ? snap.stage.trim().toUpperCase()
+      const hasExplicitStage =
+        typeof snap.stage === 'string' && snap.stage.trim().length > 0;
+      const incomingStage = hasExplicitStage
+        ? snap.stage.trim().toUpperCase()
+        : this._stage !== STAGE_NOT_STARTED
+          ? this._stage
           : STAGE_NOT_STARTED;
+      const effectiveHolding =
+        this._holdingForVisibleFrame ||
+        (this._holdUntilVisible &&
+          this._firstVisibleFrameMs === null &&
+          !this._dismissed &&
+          incomingStage === 'FIRST_PRESENT');
       const incomingPhase = resolveBootPhase(incomingStage, {
-        holdingForVisibleFrame: this._holdingForVisibleFrame,
+        holdingForVisibleFrame: effectiveHolding,
       });
       const incomingPhaseIdx = incomingPhase ? phaseIndex(incomingPhase) : -1;
       const isStaleEarlierPhase =
@@ -1972,15 +2016,18 @@
         clampPhase,
         rawProgress,
         this._progressPct,
-        { holdingForVisibleFrame: this._holdingForVisibleFrame }
+        { holdingForVisibleFrame: effectiveHolding }
       );
 
-      const incomingElapsed =
-        typeof snap.elapsedMs === 'number' && Number.isFinite(snap.elapsedMs) ? snap.elapsedMs : 0;
-      if (!isStaleEarlierPhase) {
-        this._elapsedMs = incomingElapsed;
-      } else if (incomingElapsed > this._elapsedMs) {
-        this._elapsedMs = incomingElapsed;
+      const hasExplicitElapsed =
+        typeof snap.elapsedMs === 'number' && Number.isFinite(snap.elapsedMs);
+      const incomingElapsed = hasExplicitElapsed ? snap.elapsedMs : 0;
+      if (hasExplicitElapsed) {
+        if (!isStaleEarlierPhase) {
+          this._elapsedMs = incomingElapsed;
+        } else if (incomingElapsed > this._elapsedMs) {
+          this._elapsedMs = incomingElapsed;
+        }
       }
 
       this._readyForSplash =
@@ -1988,7 +2035,9 @@
         Boolean(snap.readyForSplash) ||
         incomingStage === 'FIRST_PRESENT' ||
         incomingStage === 'FIRST_VISIBLE_FRAME';
-      this._streamPct = streamingPct(snap.streamingProgress);
+      if (!isStaleEarlierPhase) {
+        this._streamPct = streamingPct(snap.streamingProgress);
+      }
 
       const traps = snap.traps !== undefined ? snap.traps : snap.recentTraps;
       this._badgeText = formatTrapBadge(traps, snap.unresolvedImports);
@@ -1996,12 +2045,14 @@
       if (!isStaleEarlierPhase) {
         if (typeof snap.statusText === 'string' && snap.statusText.trim().length > 0) {
           this._statusText = snap.statusText.trim();
-        } else if (!this._holdingForVisibleFrame) {
+        } else if (!this._holdingForVisibleFrame && (hasExplicitStage || this._stage === STAGE_NOT_STARTED)) {
           this._statusText = this._stageLabel;
         }
       }
 
-      this._syncChrome();
+      if (!this._dismissed || this._visible || this._fading) {
+        this._syncChrome();
+      }
 
       if (this._readyForSplash && !this._dismissed) {
         // Caller may still want an explicit onFirstPresent(); do not auto-dismiss here.
@@ -2149,6 +2200,7 @@
 
     _completeDismiss(effectiveFadeMs, startedAtMs, reason) {
       this._stopElapsedTimer();
+      this._detachKeyListener();
       const completedAtMs = this._safeNow();
       let fadeDurationMs = 0;
       if (effectiveFadeMs > 0) {
@@ -2358,15 +2410,18 @@
         this._syncChrome();
         return this.getState();
       }
+      if (this._dismissed && !this._fading) {
+        return this.getState();
+      }
       this._readyForSplash = true;
       this._stage = 'FIRST_PRESENT';
       this._stageLabel = labelForStage(this._stage);
       if (!this._dismissed) {
         this._enterPhase('FIRST_VISIBLE_FRAME');
+        this._progressPct = 100;
+        this._statusText = this._stageLabel;
+        this._syncChrome();
       }
-      this._progressPct = 100;
-      this._statusText = this._stageLabel;
-      this._syncChrome();
 
       const opts = options && typeof options === 'object' ? { ...options } : {};
       if (opts.reason === undefined) {
@@ -2481,8 +2536,10 @@
       this._fadeOutCompleted = false;
       this._pendingDismissReason = resolvedReason;
       this._stopElapsedTimer();
+      this._detachKeyListener();
       this._clearFadeTimer();
       this._clearHoldFallbackTimer();
+      this._fading = effectiveFadeMs > 0;
       this._syncElapsedDisplay(true);
       this._enterPhase('FIRST_VISIBLE_FRAME');
       if (this._progressPct < 100) {
@@ -2576,6 +2633,9 @@
         this._loadingRealPackDraws = 0;
         this._holdFallbackTimedOut = false;
       }
+      if (!reset && this._totalSplashMs !== null) {
+        this._totalSplashMs = null;
+      }
       if (this._root && this._root.style && typeof this._root.style.setProperty === 'function') {
         try {
           const fadeMs = this._isReducedMotion() || this._instantHide ? 0 : this._fadeMs;
@@ -2585,6 +2645,7 @@
         }
       }
       this._applyVisibility(true);
+      this._attachKeyListener();
       this._syncChrome();
       this._startElapsedTimer();
       return this.getState();
@@ -2619,6 +2680,7 @@
       }
       const wasFading = this._fading;
       this._stopElapsedTimer();
+      this._detachKeyListener();
       this._clearFadeTimer();
       this._clearHoldFallbackTimer();
       this._fading = false;
@@ -2818,6 +2880,7 @@
           // ignore
         }
       }
+      this._onImageError = null;
 
       const gregImg = this._els && this._els.gregImg;
       if (gregImg && this._onGregImageError) {

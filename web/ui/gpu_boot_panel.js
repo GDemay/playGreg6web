@@ -58,6 +58,23 @@
 
   const ALLOWED_SWAPCHAIN_FORMAT_SET = new Set(ALLOWED_SWAPCHAIN_FORMATS);
 
+  const ALLOWED_SWAPCHAIN_COLOR_MODES = Object.freeze([
+    'sdr-srgb',
+    'sdr-linear',
+    'sdr-tonemap',
+    'sdr-passthrough',
+    'direct-srgb',
+    'srgb-encode',
+    'hdr-linear',
+    'hdr-tonemap',
+    'hdr-tonemap-aces',
+    'hdr-tonemap-reinhard',
+    'hdr-scrgb',
+    'hdr-pq',
+  ]);
+  const ALLOWED_SWAPCHAIN_COLOR_MODE_SET = new Set(ALLOWED_SWAPCHAIN_COLOR_MODES);
+  const ALLOWED_TONE_MAP_MODE_SET = new Set(['none', 'reinhard', 'aces']);
+
   /** Guest boot milestones in chronological order (mirrors BootTracer BOOT_MILESTONES). */
   const BOOT_STAGE_ORDER = Object.freeze([
     'PGIM_LOAD',
@@ -472,6 +489,161 @@
       return null;
     }
     return ALLOWED_SWAPCHAIN_FORMAT_SET.has(token) ? token : null;
+  }
+
+  function sanitizeToneMapMode(rawMode) {
+    if (typeof rawMode !== 'string') {
+      return null;
+    }
+    const token = rawMode.trim().toLowerCase();
+    return ALLOWED_TONE_MAP_MODE_SET.has(token) ? token : null;
+  }
+
+  /**
+   * Sanitize a swapchain color presentation mode against a strict allowlist
+   * (or derive a canonical mode from toneMapMode / isHdrStream / applySrgbEncode / swapchainFormat).
+   *
+   * @param {unknown} rawMode
+   * @param {{ toneMapMode?: string|null, isHdrStream?: boolean, toneMapActive?: boolean, applySrgbEncode?: boolean|null, swapchainFormat?: string|null }} [ctx]
+   * @returns {string|null}
+   */
+  function sanitizeSwapchainColorMode(rawMode, ctx) {
+    if (typeof rawMode === 'string') {
+      const token = rawMode
+        .trim()
+        .toLowerCase()
+        .replace(/[\s_]+/g, '-');
+      if (token.length > 0 && token.length <= 32 && ALLOWED_SWAPCHAIN_COLOR_MODE_SET.has(token)) {
+        return token;
+      }
+    }
+    if (ctx && typeof ctx === 'object') {
+      const toneMapMode = sanitizeToneMapMode(ctx.toneMapMode);
+      const isHdr = Boolean(ctx.isHdrStream);
+      const toneMapActive = Boolean(ctx.toneMapActive);
+      const applySrgb = typeof ctx.applySrgbEncode === 'boolean' ? ctx.applySrgbEncode : null;
+      const fmt = sanitizeSwapchainFormat(ctx.swapchainFormat);
+      if (toneMapActive) {
+        if (toneMapMode === 'aces') return 'hdr-tonemap-aces';
+        if (toneMapMode === 'reinhard') return 'hdr-tonemap-reinhard';
+        return 'hdr-tonemap';
+      }
+      if (isHdr || fmt === 'rgba16float' || fmt === 'rg11b10ufloat' || fmt === 'rgba32float') {
+        if (toneMapMode === 'aces') return 'hdr-tonemap-aces';
+        if (toneMapMode === 'reinhard') return 'hdr-tonemap-reinhard';
+        return 'hdr-linear';
+      }
+      if (applySrgb === true) {
+        return 'srgb-encode';
+      }
+      if (fmt && fmt.endsWith('-srgb')) {
+        return 'sdr-srgb';
+      }
+      if (fmt && (fmt === 'bgra8unorm' || fmt === 'rgba8unorm' || fmt === 'rgb10a2unorm')) {
+        return 'sdr-passthrough';
+      }
+    }
+    return null;
+  }
+
+  function createDefaultSwapchainColorStats() {
+    return {
+      swapchainColorMode: null,
+      toneMapMode: null,
+      isHdrStream: false,
+      toneMapActive: false,
+      applySrgbEncode: null,
+    };
+  }
+
+  function extractSwapchainColorStats(source, base, compatStats) {
+    let next = base ? { ...base } : createDefaultSwapchainColorStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawSwapchain =
+      safeRead(source, 'swapchainStats') !== undefined
+        ? safeRead(source, 'swapchainStats')
+        : safeRead(source, 'swapchain');
+    if (rawSwapchain === null) {
+      next = createDefaultSwapchainColorStats();
+    }
+    const swapchainObj = rawSwapchain && typeof rawSwapchain === 'object' ? rawSwapchain : null;
+    const rawCompat =
+      safeRead(source, 'compatStats') !== undefined
+        ? safeRead(source, 'compatStats')
+        : safeRead(source, 'gpuCompatStats') !== undefined
+          ? safeRead(source, 'gpuCompatStats')
+          : safeRead(source, 'gpu');
+    const compatObj = rawCompat && typeof rawCompat === 'object' ? rawCompat : null;
+    const rawColor = safeRead(source, 'swapchainColorStats');
+    const colorObj = rawColor && typeof rawColor === 'object' ? rawColor : null;
+    const sources = [source, colorObj, swapchainObj, compatObj];
+
+    const toneMap = pickFirstDefined(sources, ['toneMapMode', 'tone_map_mode']);
+    if (toneMap.found) {
+      next.toneMapMode = sanitizeToneMapMode(toneMap.value);
+    }
+    const hdrStream = pickFirstDefined(sources, ['isHdrStream', 'is_hdr_stream']);
+    if (hdrStream.found) {
+      next.isHdrStream = Boolean(hdrStream.value);
+    }
+    const toneActive = pickFirstDefined(sources, ['toneMapActive', 'tone_map_active']);
+    if (toneActive.found) {
+      next.toneMapActive = Boolean(toneActive.value);
+    }
+    const applySrgb = pickFirstDefined(sources, ['applySrgbEncode', 'apply_srgb_encode']);
+    if (applySrgb.found) {
+      next.applySrgbEncode = typeof applySrgb.value === 'boolean' ? applySrgb.value : null;
+    }
+
+    const explicitColorMode = pickFirstDefined(sources, [
+      'swapchainColorMode',
+      'swapchain_color_mode',
+      'colorMode',
+    ]);
+    const swapchainFormat =
+      (compatStats && compatStats.swapchainFormat) ||
+      sanitizeSwapchainFormat(
+        pickFirstDefined(sources, ['swapchainFormat', 'streamFormat', 'format']).value
+      );
+    if (explicitColorMode.found) {
+      if (explicitColorMode.value === null) {
+        next.swapchainColorMode = null;
+      } else {
+        const sanitized = sanitizeSwapchainColorMode(explicitColorMode.value);
+        next.swapchainColorMode =
+          sanitized !== null
+            ? sanitized
+            : sanitizeSwapchainColorMode(null, {
+                toneMapMode: next.toneMapMode,
+                isHdrStream: next.isHdrStream,
+                toneMapActive: next.toneMapActive,
+                applySrgbEncode: next.applySrgbEncode,
+                swapchainFormat,
+              });
+      }
+    } else if (
+      toneMap.found ||
+      hdrStream.found ||
+      toneActive.found ||
+      applySrgb.found ||
+      swapchainFormat !== null
+    ) {
+      const derived = sanitizeSwapchainColorMode(null, {
+        toneMapMode: next.toneMapMode,
+        isHdrStream: next.isHdrStream,
+        toneMapActive: next.toneMapActive,
+        applySrgbEncode: next.applySrgbEncode,
+        swapchainFormat,
+      });
+      if (derived !== null) {
+        next.swapchainColorMode = derived;
+      }
+    }
+
+    return next;
   }
 
   function createDefaultCompatStats() {
@@ -1490,6 +1662,238 @@
     return `${n} B`;
   }
 
+  function formatMemoryBytes(bytes) {
+    const n = sanitizeBigIntOrNonNegativeInt(bytes, null);
+    if (n === null) return PLACEHOLDER_DASH;
+    if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+    if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+    if (n >= 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${n} B`;
+  }
+
+  function createDefaultGpuMemoryStats() {
+    return {
+      liveBufferBytes: null,
+      liveTextureBytes: null,
+      peakBufferBytes: null,
+      peakTextureBytes: null,
+      stagingPoolBytes: null,
+      totalLiveGpuBytes: null,
+      wasmLinearMemoryBytes: null,
+    };
+  }
+
+  function extractGpuMemoryStats(source, base) {
+    let next = base ? { ...base } : createDefaultGpuMemoryStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawGpuMem =
+      safeRead(source, 'gpuMemoryStats') !== undefined
+        ? safeRead(source, 'gpuMemoryStats')
+        : safeRead(source, 'gpuMemory') !== undefined
+          ? safeRead(source, 'gpuMemory')
+          : safeRead(source, 'gpu_memory');
+    if (rawGpuMem === null) {
+      next = createDefaultGpuMemoryStats();
+    }
+    const gpuMemObj = rawGpuMem && typeof rawGpuMem === 'object' ? rawGpuMem : null;
+    const rawMemory =
+      safeRead(source, 'memoryStats') !== undefined
+        ? safeRead(source, 'memoryStats')
+        : safeRead(source, 'memory') !== undefined
+          ? safeRead(source, 'memory')
+          : safeRead(source, 'memory_stats');
+    const memoryObj = rawMemory && typeof rawMemory === 'object' ? rawMemory : null;
+    const rawGpu = safeRead(source, 'gpu');
+    const gpuObj = rawGpu && typeof rawGpu === 'object' ? rawGpu : null;
+    const rawFrame = safeRead(source, 'frameStats');
+    const frameObj = rawFrame && typeof rawFrame === 'object' ? rawFrame : null;
+    const nestedGpuMemInGpu =
+      gpuObj && typeof safeRead(gpuObj, 'gpuMemory') === 'object'
+        ? safeRead(gpuObj, 'gpuMemory')
+        : null;
+
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: gpuMemObj, explicitNull: true },
+      { obj: memoryObj, explicitNull: false },
+      { obj: nestedGpuMemInGpu, explicitNull: false },
+      { obj: gpuObj, explicitNull: false },
+      { obj: frameObj, explicitNull: false },
+    ];
+
+    const applyByteField = (prop, keys) => {
+      const picked = pickFirstDefinedWithSource(sources, keys);
+      if (picked.found) {
+        if (picked.value === null) {
+          if (picked.explicitNull) {
+            next[prop] = null;
+          }
+        } else {
+          next[prop] = sanitizeBigIntOrNonNegativeInt(picked.value, null);
+        }
+      }
+    };
+
+    applyByteField('liveBufferBytes', ['liveBufferBytes', 'live_buffer_bytes']);
+    applyByteField('liveTextureBytes', ['liveTextureBytes', 'live_texture_bytes']);
+    applyByteField('peakBufferBytes', ['peakBufferBytes', 'peak_buffer_bytes']);
+    applyByteField('peakTextureBytes', ['peakTextureBytes', 'peak_texture_bytes']);
+    applyByteField('stagingPoolBytes', ['stagingPoolBytes', 'staging_pool_bytes']);
+    applyByteField('totalLiveGpuBytes', [
+      'totalLiveGpuBytes',
+      'total_live_gpu_bytes',
+      'vramBytes',
+      'vram_bytes',
+    ]);
+    applyByteField('wasmLinearMemoryBytes', ['wasmLinearMemoryBytes', 'wasm_linear_memory_bytes']);
+
+    if (
+      next.totalLiveGpuBytes === null &&
+      (next.liveBufferBytes !== null || next.liveTextureBytes !== null)
+    ) {
+      next.totalLiveGpuBytes =
+        (next.liveBufferBytes !== null ? next.liveBufferBytes : 0) +
+        (next.liveTextureBytes !== null ? next.liveTextureBytes : 0);
+    }
+
+    return next;
+  }
+
+  function createDefaultShaderStreamingStats() {
+    return {
+      rangedShaderReady: null,
+      rangedShaderFetches: null,
+      rangedShaderErrors: null,
+      asyncShaderPendingCount: null,
+      rangedPackActive: null,
+    };
+  }
+
+  function extractShaderStreamingStats(source, base) {
+    let next = base ? { ...base } : createDefaultShaderStreamingStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawStream =
+      safeRead(source, 'shaderStreamingStats') !== undefined
+        ? safeRead(source, 'shaderStreamingStats')
+        : safeRead(source, 'shaderStreaming') !== undefined
+          ? safeRead(source, 'shaderStreaming')
+          : safeRead(source, 'shaderPackStats') !== undefined
+            ? safeRead(source, 'shaderPackStats')
+            : safeRead(source, 'packStats');
+    if (rawStream === null) {
+      next = createDefaultShaderStreamingStats();
+    }
+    const streamObj = rawStream && typeof rawStream === 'object' ? rawStream : null;
+    const rawGpu = safeRead(source, 'gpu');
+    const gpuObj = rawGpu && typeof rawGpu === 'object' ? rawGpu : null;
+
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: streamObj, explicitNull: true },
+      { obj: gpuObj, explicitNull: false },
+    ];
+
+    const applyIntField = (prop, keys) => {
+      const picked = pickFirstDefinedWithSource(sources, keys);
+      if (picked.found) {
+        if (picked.value === null) {
+          if (picked.explicitNull) {
+            next[prop] = null;
+          }
+        } else {
+          next[prop] = sanitizeBigIntOrNonNegativeInt(picked.value, null);
+        }
+      }
+    };
+
+    applyIntField('rangedShaderReady', ['rangedShaderReady', 'ranged_shader_ready']);
+    applyIntField('rangedShaderFetches', ['rangedShaderFetches', 'ranged_shader_fetches']);
+    applyIntField('rangedShaderErrors', ['rangedShaderErrors', 'ranged_shader_errors']);
+    applyIntField('asyncShaderPendingCount', [
+      'asyncShaderPendingCount',
+      'async_shader_pending_count',
+    ]);
+
+    const active = pickFirstDefinedWithSource(sources, ['rangedPackActive', 'ranged_pack_active']);
+    if (active.found) {
+      if (active.value === null) {
+        if (active.explicitNull) {
+          next.rangedPackActive = null;
+        }
+      } else {
+        next.rangedPackActive = Boolean(active.value);
+      }
+    }
+
+    return next;
+  }
+
+  function formatShaderStreamingText(stats) {
+    if (!stats || typeof stats !== 'object') {
+      return PLACEHOLDER_DASH;
+    }
+    const hasReady = typeof stats.rangedShaderReady === 'number';
+    const hasFetches = typeof stats.rangedShaderFetches === 'number';
+    if (!hasReady && !hasFetches) {
+      return stats.rangedPackActive === true ? 'Active' : PLACEHOLDER_DASH;
+    }
+    const ready = hasReady ? stats.rangedShaderReady : 0;
+    const fetches = hasFetches ? stats.rangedShaderFetches : 0;
+    const pending =
+      typeof stats.asyncShaderPendingCount === 'number' && stats.asyncShaderPendingCount > 0
+        ? ` (${stats.asyncShaderPendingCount} pending)`
+        : '';
+    return `${ready} ready · ${fetches} fetch${fetches === 1 ? '' : 'es'}${pending}`;
+  }
+
+  function triggerBrowserJsonDownload(doc, filename, jsonText) {
+    try {
+      if (
+        !doc ||
+        typeof doc.createElement !== 'function' ||
+        typeof Blob !== 'function' ||
+        typeof URL === 'undefined' ||
+        !URL ||
+        typeof URL.createObjectURL !== 'function'
+      ) {
+        return false;
+      }
+      const anchor = doc.createElement('a');
+      if (!anchor || typeof anchor.click !== 'function') {
+        return false;
+      }
+      const blob = new Blob([jsonText], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      try {
+        anchor.href = url;
+        anchor.download = filename;
+        if (anchor.style) {
+          anchor.style.display = 'none';
+        }
+        if (doc.body && typeof doc.body.appendChild === 'function') {
+          doc.body.appendChild(anchor);
+        }
+        anchor.click();
+        if (anchor.parentNode && typeof anchor.parentNode.removeChild === 'function') {
+          anchor.parentNode.removeChild(anchor);
+        }
+      } finally {
+        if (typeof URL.revokeObjectURL === 'function') {
+          URL.revokeObjectURL(url);
+        }
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   function formatOpfsHitRate(value) {
     const pct = sanitizePercentage(value, false);
     return pct === null ? PLACEHOLDER_DASH : `${pct.toFixed(1)}%`;
@@ -2339,6 +2743,9 @@
     const reflectionStats = extractReflectionStats(source, null);
     const pacingStats = extractPacingStats(source, null);
     const memoryStats = extractMemoryStats(source, null);
+    const gpuMemoryStats = extractGpuMemoryStats(source, null);
+    const shaderStreamingStats = extractShaderStreamingStats(source, null);
+    const swapchainColorStats = extractSwapchainColorStats(source, null, compatStats);
     const mailboxStats = extractMailboxStats(source, null);
     const audioStats = extractAudioStats(source, null);
     const opfsStats = extractOpfsStats(source, null);
@@ -2397,6 +2804,11 @@
         bc3dFallbacks: compatStats.bc3dFallbacks,
         bc3dFallbackUploadsSkipped: compatStats.bc3dFallbackUploadsSkipped,
         swapchainFormat: compatStats.swapchainFormat,
+        swapchainColorMode: swapchainColorStats.swapchainColorMode,
+        toneMapMode: swapchainColorStats.toneMapMode,
+        isHdrStream: swapchainColorStats.isHdrStream,
+        toneMapActive: swapchainColorStats.toneMapActive,
+        applySrgbEncode: swapchainColorStats.applySrgbEncode,
         usesBlitFallback: compatStats.usesBlitFallback,
         blitCount: compatStats.blitCount,
         gpuAdapter: adapterStats.gpuAdapter,
@@ -2436,6 +2848,22 @@
         jsHeapUsedMb: memoryStats.jsHeapUsedMb,
         vramBudgetUtilization: memoryStats.vramBudgetUtilization,
         bindGroupHitRate: memoryStats.bindGroupHitRate,
+      },
+      gpuMemory: {
+        liveBufferBytes: gpuMemoryStats.liveBufferBytes,
+        liveTextureBytes: gpuMemoryStats.liveTextureBytes,
+        peakBufferBytes: gpuMemoryStats.peakBufferBytes,
+        peakTextureBytes: gpuMemoryStats.peakTextureBytes,
+        stagingPoolBytes: gpuMemoryStats.stagingPoolBytes,
+        totalLiveGpuBytes: gpuMemoryStats.totalLiveGpuBytes,
+        wasmLinearMemoryBytes: gpuMemoryStats.wasmLinearMemoryBytes,
+      },
+      shaderStreaming: {
+        rangedShaderReady: shaderStreamingStats.rangedShaderReady,
+        rangedShaderFetches: shaderStreamingStats.rangedShaderFetches,
+        rangedShaderErrors: shaderStreamingStats.rangedShaderErrors,
+        asyncShaderPendingCount: shaderStreamingStats.asyncShaderPendingCount,
+        rangedPackActive: shaderStreamingStats.rangedPackActive,
       },
       mailboxLanes: mailboxStats.mailboxLanes,
       httpfsConcurrency: {
@@ -2625,6 +3053,9 @@
       this._reflectionStats = createDefaultReflectionStats();
       this._pacingStats = createDefaultPacingStats();
       this._memoryStats = createDefaultMemoryStats();
+      this._gpuMemoryStats = createDefaultGpuMemoryStats();
+      this._shaderStreamingStats = createDefaultShaderStreamingStats();
+      this._swapchainColorStats = createDefaultSwapchainColorStats();
       this._mailboxStats = createDefaultMailboxStats();
       this._audioStats = createDefaultAudioStats();
       this._opfsStats = createDefaultOpfsStats();
@@ -2854,12 +3285,19 @@
         `${ROOT_CLASS}__blit-fallback`,
         formatBlitFallbackText(false, 0)
       );
+      const swapchainColorModeMetric = this._buildMetricCard(
+        doc,
+        'Color Mode',
+        `${ROOT_CLASS}__swapchain-color-mode`,
+        PLACEHOLDER_DASH
+      );
       compatGrid.appendChild(bindMismatchesMetric.card);
       compatGrid.appendChild(autoLayoutMetric.card);
       compatGrid.appendChild(bc3dFallbacksMetric.card);
       compatGrid.appendChild(bc3dSkippedMetric.card);
       compatGrid.appendChild(swapchainFormatMetric.card);
       compatGrid.appendChild(blitFallbackMetric.card);
+      compatGrid.appendChild(swapchainColorModeMetric.card);
       compatSection.appendChild(compatGrid);
 
       // --- HTTPFS & cache acceleration telemetry section ---
@@ -3034,6 +3472,12 @@
         `${ROOT_CLASS}__resource-heap-bindings`,
         '0'
       );
+      const shaderStreamingMetric = this._buildMetricCard(
+        doc,
+        'Shader Stream',
+        `${ROOT_CLASS}__shader-streaming`,
+        PLACEHOLDER_DASH
+      );
 
       adapterReflectionGrid.appendChild(gpuAdapterMetric.card);
       adapterReflectionGrid.appendChild(firstVisibleFrameMsMetric.card);
@@ -3042,6 +3486,7 @@
       adapterReflectionGrid.appendChild(reflectedStagesMetric.card);
       adapterReflectionGrid.appendChild(inlineSamplerStagesMetric.card);
       adapterReflectionGrid.appendChild(resourceHeapBindingsMetric.card);
+      adapterReflectionGrid.appendChild(shaderStreamingMetric.card);
       adapterReflectionSection.appendChild(adapterReflectionGrid);
 
       // --- 30 FPS pacing, memory/VRAM & I/O mailbox telemetry section (W292) ---
@@ -3096,12 +3541,33 @@
         `${ROOT_CLASS}__mailbox-lanes`,
         PLACEHOLDER_DASH
       );
+      const gpuVramLiveMetric = this._buildMetricCard(
+        doc,
+        'GPU VRAM Live',
+        `${ROOT_CLASS}__gpu-vram-live`,
+        PLACEHOLDER_DASH
+      );
+      const gpuVramPeakMetric = this._buildMetricCard(
+        doc,
+        'GPU VRAM Peak',
+        `${ROOT_CLASS}__gpu-vram-peak`,
+        PLACEHOLDER_DASH
+      );
+      const wasmLinearMemoryMetric = this._buildMetricCard(
+        doc,
+        'Wasm Memory',
+        `${ROOT_CLASS}__wasm-linear-memory`,
+        PLACEHOLDER_DASH
+      );
       pacingMemoryGrid.appendChild(fps30ComplianceMetric.card);
       pacingMemoryGrid.appendChild(frameJitterMetric.card);
       pacingMemoryGrid.appendChild(jsHeapUsedMetric.card);
       pacingMemoryGrid.appendChild(vramBudgetMetric.card);
       pacingMemoryGrid.appendChild(bindGroupHitRateMetric.card);
       pacingMemoryGrid.appendChild(mailboxLanesMetric.card);
+      pacingMemoryGrid.appendChild(gpuVramLiveMetric.card);
+      pacingMemoryGrid.appendChild(gpuVramPeakMetric.card);
+      pacingMemoryGrid.appendChild(wasmLinearMemoryMetric.card);
       pacingMemorySection.appendChild(pacingMemoryGrid);
 
       // --- Live M4 Audio Ring & OPFS Warm-Boot telemetry section (W376) ---
@@ -3232,6 +3698,7 @@
         bc3dFallbackUploadsSkipped: bc3dSkippedMetric.val,
         swapchainFormat: swapchainFormatMetric.val,
         blitFallback: blitFallbackMetric.val,
+        swapchainColorMode: swapchainColorModeMetric.val,
         pgimFullFetches: pgimFetchesMetric.val,
         slabCacheHits: slabHitsMetric.val,
         slabCacheMisses: slabMissesMetric.val,
@@ -3250,12 +3717,16 @@
         reflectedStages: reflectedStagesMetric.val,
         inlineSamplerStages: inlineSamplerStagesMetric.val,
         resourceHeapBindings: resourceHeapBindingsMetric.val,
+        shaderStreaming: shaderStreamingMetric.val,
         fps30ComplianceRate: fps30ComplianceMetric.val,
         frameJitterMs: frameJitterMetric.val,
         jsHeapUsedMb: jsHeapUsedMetric.val,
         vramBudgetUtilization: vramBudgetMetric.val,
         bindGroupHitRate: bindGroupHitRateMetric.val,
         mailboxLanes: mailboxLanesMetric.val,
+        gpuVramLive: gpuVramLiveMetric.val,
+        gpuVramPeak: gpuVramPeakMetric.val,
+        wasmLinearMemory: wasmLinearMemoryMetric.val,
         audioRing: audioRingMetric.val,
         audioOutputState: audioOutputStateMetric.val,
         audioFramesDrained: audioFramesDrainedMetric.val,
@@ -3304,6 +3775,7 @@
           bc3dFallbackUploadsSkipped: q(`.${ROOT_CLASS}__bc3d-uploads-skipped`),
           swapchainFormat: q(`.${ROOT_CLASS}__swapchain-format`),
           blitFallback: q(`.${ROOT_CLASS}__blit-fallback`),
+          swapchainColorMode: q(`.${ROOT_CLASS}__swapchain-color-mode`),
           pgimFullFetches: q(`.${ROOT_CLASS}__pgim-fetches`),
           slabCacheHits: q(`.${ROOT_CLASS}__slab-hits`),
           slabCacheMisses: q(`.${ROOT_CLASS}__slab-misses`),
@@ -3322,12 +3794,16 @@
           reflectedStages: q(`.${ROOT_CLASS}__reflected-stages`),
           inlineSamplerStages: q(`.${ROOT_CLASS}__inline-sampler-stages`),
           resourceHeapBindings: q(`.${ROOT_CLASS}__resource-heap-bindings`),
+          shaderStreaming: q(`.${ROOT_CLASS}__shader-streaming`),
           fps30ComplianceRate: q(`.${ROOT_CLASS}__fps30-compliance-rate`),
           frameJitterMs: q(`.${ROOT_CLASS}__frame-jitter-ms`),
           jsHeapUsedMb: q(`.${ROOT_CLASS}__js-heap-used-mb`),
           vramBudgetUtilization: q(`.${ROOT_CLASS}__vram-budget-utilization`),
           bindGroupHitRate: q(`.${ROOT_CLASS}__bind-group-hit-rate`),
           mailboxLanes: q(`.${ROOT_CLASS}__mailbox-lanes`),
+          gpuVramLive: q(`.${ROOT_CLASS}__gpu-vram-live`),
+          gpuVramPeak: q(`.${ROOT_CLASS}__gpu-vram-peak`),
+          wasmLinearMemory: q(`.${ROOT_CLASS}__wasm-linear-memory`),
           audioRing: q(`.${ROOT_CLASS}__audio-ring`),
           audioOutputState: q(`.${ROOT_CLASS}__audio-output-state`),
           audioFramesDrained: q(`.${ROOT_CLASS}__audio-frames-drained`),
@@ -3349,7 +3825,10 @@
       };
       this._onExportClick = () => {
         if (!this._destroyed) {
-          this.exportMissingShadersJson();
+          const jsonText = this.exportMissingShadersJson();
+          if (typeof this._onExportMissingShaders !== 'function' && typeof jsonText === 'string') {
+            triggerBrowserJsonDownload(this._document, 'playgta6-missing-shaders.json', jsonText);
+          }
         }
       };
 
@@ -3470,6 +3949,9 @@
       const reflection = this._reflectionStats;
       const pacing = this._pacingStats;
       const memory = this._memoryStats;
+      const gpuMemory = this._gpuMemoryStats;
+      const shaderStreaming = this._shaderStreamingStats;
+      const swapchainColor = this._swapchainColorStats;
       const mailbox = this._mailboxStats;
       const audio = this._audioStats;
       const opfs = this._opfsStats;
@@ -3546,6 +4028,11 @@
             compat.blitCount
           );
         }
+        this._setTextIfChanged(
+          'swapchainColorMode',
+          els.swapchainColorMode,
+          swapchainColor.swapchainColorMode || PLACEHOLDER_DASH
+        );
 
         this._setTextIfChanged('pgimFullFetches', els.pgimFullFetches, io.pgimFullFetches);
         this._setTextIfChanged('slabCacheHits', els.slabCacheHits, io.slabCacheHits);
@@ -3625,6 +4112,11 @@
           els.resourceHeapBindings,
           reflection.resourceHeapBindings
         );
+        this._setTextIfChanged(
+          'shaderStreaming',
+          els.shaderStreaming,
+          formatShaderStreamingText(shaderStreaming)
+        );
 
         // W292: 30 FPS pacing, #1077 memory/VRAM telemetry & #1015 I/O mailbox lanes.
         this._setTextIfChanged(
@@ -3656,6 +4148,25 @@
           'mailboxLanes',
           els.mailboxLanes,
           formatMailboxLanes(mailbox.mailboxLanes, mailbox)
+        );
+        this._setTextIfChanged(
+          'gpuVramLive',
+          els.gpuVramLive,
+          formatMemoryBytes(gpuMemory.totalLiveGpuBytes)
+        );
+        const peakGpuBytes =
+          gpuMemory.peakBufferBytes !== null || gpuMemory.peakTextureBytes !== null
+            ? (gpuMemory.peakBufferBytes || 0) + (gpuMemory.peakTextureBytes || 0)
+            : null;
+        this._setTextIfChanged(
+          'gpuVramPeak',
+          els.gpuVramPeak,
+          formatMemoryBytes(peakGpuBytes)
+        );
+        this._setTextIfChanged(
+          'wasmLinearMemory',
+          els.wasmLinearMemory,
+          formatMemoryBytes(gpuMemory.wasmLinearMemoryBytes)
         );
 
         // W376: Live M4 audio ring & OPFS warm-boot diagnostics cards.
@@ -3814,6 +4325,16 @@
       this._reflectionStats = extractReflectionStats(snapshot, this._reflectionStats);
       this._pacingStats = extractPacingStats(snapshot, this._pacingStats);
       this._memoryStats = extractMemoryStats(snapshot, this._memoryStats);
+      this._gpuMemoryStats = extractGpuMemoryStats(snapshot, this._gpuMemoryStats);
+      this._shaderStreamingStats = extractShaderStreamingStats(
+        snapshot,
+        this._shaderStreamingStats
+      );
+      this._swapchainColorStats = extractSwapchainColorStats(
+        snapshot,
+        this._swapchainColorStats,
+        this._compatStats
+      );
       this._mailboxStats = extractMailboxStats(snapshot, this._mailboxStats);
       this._audioStats = extractAudioStats(snapshot, this._audioStats);
       this._opfsStats = extractOpfsStats(snapshot, this._opfsStats);
@@ -3843,6 +4364,9 @@
       this._reflectionStats = createDefaultReflectionStats();
       this._pacingStats = createDefaultPacingStats();
       this._memoryStats = createDefaultMemoryStats();
+      this._gpuMemoryStats = createDefaultGpuMemoryStats();
+      this._shaderStreamingStats = createDefaultShaderStreamingStats();
+      this._swapchainColorStats = createDefaultSwapchainColorStats();
       this._mailboxStats = createDefaultMailboxStats();
       this._audioStats = createDefaultAudioStats();
       this._opfsStats = createDefaultOpfsStats();
@@ -3873,6 +4397,9 @@
         reflectionStats: this._reflectionStats,
         pacingStats: this._pacingStats,
         memoryStats: this._memoryStats,
+        gpuMemoryStats: this._gpuMemoryStats,
+        shaderStreamingStats: this._shaderStreamingStats,
+        swapchainColorStats: this._swapchainColorStats,
         mailboxStats: this._mailboxStats,
         audioStats: this._audioStats,
         opfsStats: this._opfsStats,
@@ -4000,6 +4527,22 @@
         opfsHitRatePct: this._opfsStats.opfsHitRatePct,
         pacingStats: { ...this._pacingStats },
         memoryStats: { ...this._memoryStats },
+        gpuMemoryStats: { ...this._gpuMemoryStats },
+        shaderStreamingStats: { ...this._shaderStreamingStats },
+        swapchainColorStats: { ...this._swapchainColorStats },
+        swapchainColorMode: this._swapchainColorStats.swapchainColorMode,
+        liveBufferBytes: this._gpuMemoryStats.liveBufferBytes,
+        liveTextureBytes: this._gpuMemoryStats.liveTextureBytes,
+        peakBufferBytes: this._gpuMemoryStats.peakBufferBytes,
+        peakTextureBytes: this._gpuMemoryStats.peakTextureBytes,
+        stagingPoolBytes: this._gpuMemoryStats.stagingPoolBytes,
+        totalLiveGpuBytes: this._gpuMemoryStats.totalLiveGpuBytes,
+        wasmLinearMemoryBytes: this._gpuMemoryStats.wasmLinearMemoryBytes,
+        rangedShaderReady: this._shaderStreamingStats.rangedShaderReady,
+        rangedShaderFetches: this._shaderStreamingStats.rangedShaderFetches,
+        rangedShaderErrors: this._shaderStreamingStats.rangedShaderErrors,
+        asyncShaderPendingCount: this._shaderStreamingStats.asyncShaderPendingCount,
+        rangedPackActive: this._shaderStreamingStats.rangedPackActive,
         mailboxStats: { ...this._mailboxStats },
         audioStats: { ...this._audioStats },
         opfsStats: { ...this._opfsStats },
@@ -4103,8 +4646,10 @@
     PLAYABILITY_STATE,
     STAGE_NAMES,
     ALLOWED_SWAPCHAIN_FORMATS,
+    ALLOWED_SWAPCHAIN_COLOR_MODES,
     ALLOWED_AUDIO_OUTPUT_STATES,
     sanitizeSwapchainFormat,
+    sanitizeSwapchainColorMode,
     sanitizeGpuAdapter,
     sanitizeUnitRatio,
     sanitizePositiveInt,
@@ -4116,6 +4661,7 @@
     formatRatioPct,
     formatFrameJitterMs,
     formatMemoryMb,
+    formatMemoryBytes,
     formatMailboxLanes,
     formatAudioFrameCount,
     formatOpfsHitRate,
