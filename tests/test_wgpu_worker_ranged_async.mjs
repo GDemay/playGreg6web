@@ -1531,7 +1531,7 @@ test('W185 (W167) synthesizes default fallback samplers via pipelineCache when r
 // ---------------------------------------------------------------------------
 
 test('W185 (W168) configures AsyncPipelineCache with prioritizeGraphics and maxConcurrentCompiles and surfaces compile latency telemetry', async () => {
-  assert.equal(DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES, 4);
+  assert.equal(DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES, 2);
 
   let fakeNow = 100;
   const mock = createRichW185MockWebGpu({ asyncPipelines: true });
