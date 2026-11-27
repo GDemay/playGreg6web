@@ -182,6 +182,7 @@ const BOOT_INIT_FORWARD_KEYS = Object.freeze([
   // #1077: opt-in `?opfsL2=0` bypass of the io_worker OPFS L2 hot-file cache.
   'opfsL2Enabled',
 ]);
+const DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES = 64 * 1024 * 1024;
 const GAME_PACKAGE_HTTPFS_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
 const WIN32_DRIVE_PATH_RE = /^(?:\\\\[?.]\\|\/\/[?.]\/)?([A-Za-z]):(.*)$/;
 // W101: render_state_packets.js counters surfaced from wgpu_worker.js `renderStateStats` (W99).
@@ -1735,6 +1736,13 @@ function applySwapchainProbeTelemetryFields(target, sources) {
   if (probeErrorCountField.found) {
     target.swapchainProbeErrorCount = toNonNegativeInt(probeErrorCountField.value, 0);
   }
+  const probeTimeoutCountField = pickTelemetryFiniteNumber(sources, [
+    'swapchainProbeTimeoutCount',
+    'swapchain_probe_timeout_count',
+  ]);
+  if (probeTimeoutCountField.found) {
+    target.swapchainProbeTimeoutCount = toNonNegativeInt(probeTimeoutCountField.value, 0);
+  }
 }
 
 /**
@@ -2017,6 +2025,112 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     telemetry.suppressedBlackFrames = toNonNegativeInt(suppressedBlackField.value, 0);
   }
   applySwapchainProbeTelemetryFields(telemetry, telemetrySources);
+
+  // Wave-5 (#663, #1077): forward Wave-4/Wave-5 hang guards, device-loss recovery, and ranged
+  // shader-pack streaming counters so app_bootstrap/HUD/panel diagnostics never lose them.
+  const rawDeviceStats =
+    (eventData.deviceStats && typeof eventData.deviceStats === 'object' && !Array.isArray(eventData.deviceStats)
+      ? eventData.deviceStats
+      : null) ||
+    (rawStats && rawStats.deviceStats && typeof rawStats.deviceStats === 'object' && !Array.isArray(rawStats.deviceStats)
+      ? rawStats.deviceStats
+      : null);
+  const rawShaderPackStats =
+    (eventData.shaderPackStats && typeof eventData.shaderPackStats === 'object' && !Array.isArray(eventData.shaderPackStats)
+      ? eventData.shaderPackStats
+      : null) ||
+    (rawStats && rawStats.shaderPackStats && typeof rawStats.shaderPackStats === 'object' && !Array.isArray(rawStats.shaderPackStats)
+      ? rawStats.shaderPackStats
+      : null);
+  const extendedSources = [
+    ...telemetrySources,
+    ...(rawDeviceStats ? [rawDeviceStats] : []),
+    ...(rawShaderPackStats ? [rawShaderPackStats] : []),
+  ];
+
+  const coalescedPresentsField = pickTelemetryFiniteNumber(telemetrySources, [
+    'coalescedPresents',
+    'coalesced_presents',
+  ]);
+  if (coalescedPresentsField.found) {
+    telemetry.coalescedPresents = toNonNegativeInt(coalescedPresentsField.value, 0);
+  }
+  const oversizedFallbacksField = pickTelemetryFiniteNumber(extendedSources, [
+    'oversizedWgslFallbacks',
+    'oversized_wgsl_fallbacks',
+  ]);
+  if (oversizedFallbacksField.found) {
+    telemetry.oversizedWgslFallbacks = toNonNegativeInt(oversizedFallbacksField.value, 0);
+  }
+  const deviceLostField = pickTelemetryFiniteNumber(extendedSources, [
+    'deviceLostCount',
+    'device_lost_count',
+  ]);
+  if (deviceLostField.found) {
+    telemetry.deviceLostCount = toNonNegativeInt(deviceLostField.value, 0);
+  }
+  const deviceRecoveredField = pickTelemetryFiniteNumber(extendedSources, [
+    'deviceRecoveredCount',
+    'device_recovered_count',
+  ]);
+  if (deviceRecoveredField.found) {
+    telemetry.deviceRecoveredCount = toNonNegativeInt(deviceRecoveredField.value, 0);
+  }
+  const gpuStallWarnField = pickTelemetryFiniteNumber(telemetrySources, [
+    'gpuStallWarnCount',
+    'gpu_stall_warn_count',
+  ]);
+  if (gpuStallWarnField.found) {
+    telemetry.gpuStallWarnCount = toNonNegativeInt(gpuStallWarnField.value, 0);
+  }
+  if (rawDeviceStats) {
+    telemetry.deviceStats = {
+      deviceLostCount: toNonNegativeInt(rawDeviceStats.deviceLostCount, 0),
+      deviceRecoveredCount: toNonNegativeInt(rawDeviceStats.deviceRecoveredCount, 0),
+      lastDeviceLostReason:
+        typeof rawDeviceStats.lastDeviceLostReason === 'string' &&
+        rawDeviceStats.lastDeviceLostReason.length > 0
+          ? rawDeviceStats.lastDeviceLostReason
+          : null,
+      deviceRecovering: Boolean(rawDeviceStats.deviceRecovering),
+      replayedResourceCount: toNonNegativeInt(rawDeviceStats.replayedResourceCount, 0),
+      replayedBufferWriteCount: toNonNegativeInt(rawDeviceStats.replayedBufferWriteCount, 0),
+    };
+  }
+  const rangedPackActiveField = pickTelemetryBoolean(extendedSources, [
+    'rangedPackActive',
+    'ranged_pack_active',
+  ]);
+  if (rangedPackActiveField.found) {
+    telemetry.rangedPackActive = rangedPackActiveField.value;
+  }
+  if (rawShaderPackStats) {
+    const cleanPackStats = {
+      mode:
+        typeof rawShaderPackStats.mode === 'string' && rawShaderPackStats.mode.length > 0
+          ? rawShaderPackStats.mode
+          : 'buffer',
+      packCount: toNonNegativeInt(rawShaderPackStats.packCount, 0),
+      shaderCount: toNonNegativeInt(rawShaderPackStats.shaderCount, 0),
+      rangeFetches: toNonNegativeInt(rawShaderPackStats.rangeFetches, 0),
+      cachedWgslBytes: toNonNegativeInt(rawShaderPackStats.cachedWgslBytes, 0),
+      rangedPackActive: Boolean(rawShaderPackStats.rangedPackActive),
+      rangedPackThresholdBytes: toNonNegativeInt(
+        rawShaderPackStats.rangedPackThresholdBytes,
+        DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+      ),
+      asyncShaderPendingCount: toNonNegativeInt(rawShaderPackStats.asyncShaderPendingCount, 0),
+      rangedShaderFetches: toNonNegativeInt(rawShaderPackStats.rangedShaderFetches, 0),
+      rangedShaderReady: toNonNegativeInt(rawShaderPackStats.rangedShaderReady, 0),
+      rangedShaderErrors: toNonNegativeInt(rawShaderPackStats.rangedShaderErrors, 0),
+      oversizedWgslFallbacks: toNonNegativeInt(rawShaderPackStats.oversizedWgslFallbacks, 0),
+    };
+    telemetry.shaderPackStats = cleanPackStats;
+    if (telemetry.rangedPackActive === undefined) {
+      telemetry.rangedPackActive = cleanPackStats.rangedPackActive;
+    }
+  }
+
   const rawGpuAdapter =
     eventData.gpuAdapter !== undefined
       ? eventData.gpuAdapter
@@ -2059,12 +2173,16 @@ function collectBootBridgeInitFields(src) {
 
 function createWorkerBootInitPayloads(msg = {}) {
   const bootFields = collectBootBridgeInitFields(msg);
-  // W345: disable per-batch resource replay shadow-copying in live Wasm64 browser
-  // sessions unless explicitly opted in, while keeping standalone WgpuCommandProcessor
-  // unit tests backward-compatible.
+  // Wave-5 (#663, #1077): Enable lightweight resource creation-packet replay by default so
+  // W100/W104 device-lost recovery restores buffers/textures/layouts/pipelines/bindGroups,
+  // while keeping W345's 64 MiB WriteBuffer shadow-copy memcpy disabled by default in live runs.
   const enableResourceReplay =
     msg && typeof msg === 'object' && typeof msg.enableResourceReplay === 'boolean'
       ? msg.enableResourceReplay
+      : true;
+  const enableShadowBufferReplay =
+    msg && typeof msg === 'object' && typeof msg.enableShadowBufferReplay === 'boolean'
+      ? msg.enableShadowBufferReplay
       : false;
   const gpuExtra = {};
   if (
@@ -2088,6 +2206,59 @@ function createWorkerBootInitPayloads(msg = {}) {
   if (msg && typeof msg === 'object' && typeof msg.requireNonBlackFrame === 'boolean') {
     gpuExtra.requireNonBlackFrame = msg.requireNonBlackFrame;
   }
+  if (
+    msg &&
+    typeof msg === 'object' &&
+    typeof msg.swapchainProbeTimeoutMs === 'number' &&
+    Number.isFinite(msg.swapchainProbeTimeoutMs) &&
+    msg.swapchainProbeTimeoutMs >= 0
+  ) {
+    gpuExtra.swapchainProbeTimeoutMs = Math.floor(msg.swapchainProbeTimeoutMs);
+  }
+  if (
+    msg &&
+    typeof msg === 'object' &&
+    typeof msg.gpuStallWarnMs === 'number' &&
+    Number.isFinite(msg.gpuStallWarnMs) &&
+    msg.gpuStallWarnMs >= 0
+  ) {
+    gpuExtra.gpuStallWarnMs = msg.gpuStallWarnMs;
+  }
+
+  // Wave-5 (#663, #1077): Forward explicit streamShaders / streamThresholdBytes and auto-enable
+  // ranged shader streaming (64 MiB threshold) whenever shaderPackUrl is present unless explicitly
+  // disabled (`streamShaders: false` or `streamThresholdBytes: 0`).
+  const hasShaderPackUrl =
+    typeof bootFields.shaderPackUrl === 'string' && bootFields.shaderPackUrl.trim().length > 0;
+  const explicitStreamDisabled =
+    msg && typeof msg === 'object' && (msg.streamShaders === false || msg.streamThresholdBytes === 0);
+  const explicitThresholdBytes =
+    msg &&
+    typeof msg === 'object' &&
+    typeof msg.streamThresholdBytes === 'number' &&
+    Number.isInteger(msg.streamThresholdBytes) &&
+    msg.streamThresholdBytes > 0
+      ? msg.streamThresholdBytes
+      : null;
+  if (explicitStreamDisabled) {
+    if (msg.streamShaders === false) {
+      gpuExtra.streamShaders = false;
+    }
+    if (msg.streamThresholdBytes === 0) {
+      gpuExtra.streamThresholdBytes = 0;
+    }
+  } else if (
+    (msg && typeof msg === 'object' && msg.streamShaders === true) ||
+    explicitThresholdBytes !== null ||
+    hasShaderPackUrl
+  ) {
+    gpuExtra.streamShaders = true;
+    gpuExtra.streamThresholdBytes =
+      explicitThresholdBytes !== null
+        ? explicitThresholdBytes
+        : DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES;
+  }
+
   return {
     ioInit: Object.assign({ init: true, dataBase: msg.dataBase }, bootFields),
     gpuInit: Object.assign(
@@ -2097,6 +2268,7 @@ function createWorkerBootInitPayloads(msg = {}) {
         width: msg.width,
         height: msg.height,
         enableResourceReplay,
+        enableShadowBufferReplay,
       },
       gpuExtra,
       bootFields,

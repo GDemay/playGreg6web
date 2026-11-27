@@ -852,6 +852,14 @@ export function parseBootUrlOptions(search) {
   });
 }
 
+function isStreamShadersExplicitlyDisabledInSearch(search) {
+  const params = toUrlSearchParams(search);
+  if (!params) {
+    return false;
+  }
+  return parseBooleanQueryFlag(getQueryParamInsensitive(params, 'streamShaders')) === false;
+}
+
 function sanitizeDumpEndpoint(raw) {
   if (typeof raw !== 'string') {
     return null;
@@ -1992,7 +2000,9 @@ export function bootstrapPlayGta6App(options = {}) {
     holdUntilVisible: resolvedHoldUntilVisible,
   });
   let activeStreamConfig = baseStreamConfig;
-  const baseStreamExplicitDisabled = options.streamShaders === false;
+  const urlStreamExplicitDisabled = isStreamShadersExplicitlyDisabledInSearch(rawUrlSearch);
+  const baseStreamExplicitDisabled =
+    options.streamShaders === false || (options.streamShaders !== true && urlStreamExplicitDisabled);
   let activeStreamExplicitDisabled = baseStreamExplicitDisabled;
   let activeDumpConfig = baseDumpConfig;
   let configuredInputScript = baseInputScript;
@@ -2015,8 +2025,19 @@ export function bootstrapPlayGta6App(options = {}) {
     swapchainProbeInFlight: false,
     swapchainProbeSupported: null,
     swapchainProbeErrorCount: 0,
+    swapchainProbeTimeoutCount: 0,
     lastSampledMaxLuma: 0,
     suppressedBlackFrames: 0,
+    coalescedPresents: 0,
+    oversizedWgslFallbacks: 0,
+    deviceLostCount: 0,
+    deviceRecoveredCount: 0,
+    gpuStallWarnCount: 0,
+    rangedPackActive: null,
+    rangedShaderReady: 0,
+    rangedShaderFetches: 0,
+    rangedShaderErrors: 0,
+    asyncShaderPendingCount: 0,
     gpuMemory: null,
   };
 
@@ -2387,6 +2408,12 @@ export function bootstrapPlayGta6App(options = {}) {
     ) {
       fields.streamShaders = true;
       fields.streamThresholdBytes = activeStreamConfig.streamThresholdBytes;
+    } else if (
+      activeStreamExplicitDisabled &&
+      urlStreamExplicitDisabled &&
+      options.streamShaders !== false
+    ) {
+      fields.streamShaders = false;
     }
     if (activeDumpConfig && activeDumpConfig.dumpPipelines === true) {
       fields.dumpPipelines = true;
@@ -3996,8 +4023,19 @@ export function bootstrapPlayGta6App(options = {}) {
       swapchainProbeInFlight: gpuTelemetry.swapchainProbeInFlight,
       swapchainProbeSupported: gpuTelemetry.swapchainProbeSupported,
       swapchainProbeErrorCount: gpuTelemetry.swapchainProbeErrorCount,
+      swapchainProbeTimeoutCount: gpuTelemetry.swapchainProbeTimeoutCount,
       lastSampledMaxLuma: gpuTelemetry.lastSampledMaxLuma,
       suppressedBlackFrames: gpuTelemetry.suppressedBlackFrames,
+      coalescedPresents: gpuTelemetry.coalescedPresents,
+      oversizedWgslFallbacks: gpuTelemetry.oversizedWgslFallbacks,
+      deviceLostCount: gpuTelemetry.deviceLostCount,
+      deviceRecoveredCount: gpuTelemetry.deviceRecoveredCount,
+      gpuStallWarnCount: gpuTelemetry.gpuStallWarnCount,
+      rangedPackActive: gpuTelemetry.rangedPackActive,
+      rangedShaderReady: gpuTelemetry.rangedShaderReady,
+      rangedShaderFetches: gpuTelemetry.rangedShaderFetches,
+      rangedShaderErrors: gpuTelemetry.rangedShaderErrors,
+      asyncShaderPendingCount: gpuTelemetry.asyncShaderPendingCount,
     };
     if (gpuTelemetry.gpuAdapter !== null) {
       payload.gpuAdapter = gpuTelemetry.gpuAdapter;
@@ -4595,6 +4633,11 @@ export function bootstrapPlayGta6App(options = {}) {
       data.frameStats,
       data.swapchainStats,
       data.swapchain,
+      data.deviceStats,
+      data.stats && data.stats.deviceStats,
+      data.shaderPackStats,
+      data.stats && data.stats.shaderPackStats,
+      data.shaderStreaming,
     ]);
     let matchedW83Field = false;
 
@@ -4759,6 +4802,105 @@ export function bootstrapPlayGta6App(options = {}) {
     ]);
     if (suppressedBlackField.found && suppressedBlackField.value !== null) {
       gpuTelemetry.suppressedBlackFrames = toSafeNonNegativeInt(suppressedBlackField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const probeTimeoutCountField = pickFirstDefinedField(sources, [
+      'swapchainProbeTimeoutCount',
+      'swapchain_probe_timeout_count',
+    ]);
+    if (probeTimeoutCountField.found && probeTimeoutCountField.value !== null) {
+      gpuTelemetry.swapchainProbeTimeoutCount = toSafeNonNegativeInt(probeTimeoutCountField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const coalescedPresentsField = pickFirstDefinedField(sources, [
+      'coalescedPresents',
+      'coalesced_presents',
+    ]);
+    if (coalescedPresentsField.found && coalescedPresentsField.value !== null) {
+      gpuTelemetry.coalescedPresents = toSafeNonNegativeInt(coalescedPresentsField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const oversizedWgslField = pickFirstDefinedField(sources, [
+      'oversizedWgslFallbacks',
+      'oversized_wgsl_fallbacks',
+    ]);
+    if (oversizedWgslField.found && oversizedWgslField.value !== null) {
+      gpuTelemetry.oversizedWgslFallbacks = toSafeNonNegativeInt(oversizedWgslField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const deviceLostField = pickFirstDefinedField(sources, [
+      'deviceLostCount',
+      'device_lost_count',
+    ]);
+    if (deviceLostField.found && deviceLostField.value !== null) {
+      gpuTelemetry.deviceLostCount = toSafeNonNegativeInt(deviceLostField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const deviceRecoveredField = pickFirstDefinedField(sources, [
+      'deviceRecoveredCount',
+      'device_recovered_count',
+    ]);
+    if (deviceRecoveredField.found && deviceRecoveredField.value !== null) {
+      gpuTelemetry.deviceRecoveredCount = toSafeNonNegativeInt(deviceRecoveredField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const gpuStallWarnField = pickFirstDefinedField(sources, [
+      'gpuStallWarnCount',
+      'gpu_stall_warn_count',
+    ]);
+    if (gpuStallWarnField.found && gpuStallWarnField.value !== null) {
+      gpuTelemetry.gpuStallWarnCount = toSafeNonNegativeInt(gpuStallWarnField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const rangedPackActiveField = pickFirstDefinedField(sources, [
+      'rangedPackActive',
+      'ranged_pack_active',
+    ]);
+    if (rangedPackActiveField.found && typeof rangedPackActiveField.value === 'boolean') {
+      gpuTelemetry.rangedPackActive = rangedPackActiveField.value;
+      matchedW83Field = true;
+    }
+
+    const rangedShaderReadyField = pickFirstDefinedField(sources, [
+      'rangedShaderReady',
+      'ranged_shader_ready',
+    ]);
+    if (rangedShaderReadyField.found && rangedShaderReadyField.value !== null) {
+      gpuTelemetry.rangedShaderReady = toSafeNonNegativeInt(rangedShaderReadyField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const rangedShaderFetchesField = pickFirstDefinedField(sources, [
+      'rangedShaderFetches',
+      'ranged_shader_fetches',
+    ]);
+    if (rangedShaderFetchesField.found && rangedShaderFetchesField.value !== null) {
+      gpuTelemetry.rangedShaderFetches = toSafeNonNegativeInt(rangedShaderFetchesField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const rangedShaderErrorsField = pickFirstDefinedField(sources, [
+      'rangedShaderErrors',
+      'ranged_shader_errors',
+    ]);
+    if (rangedShaderErrorsField.found && rangedShaderErrorsField.value !== null) {
+      gpuTelemetry.rangedShaderErrors = toSafeNonNegativeInt(rangedShaderErrorsField.value, 0);
+      matchedW83Field = true;
+    }
+
+    const asyncShaderPendingField = pickFirstDefinedField(sources, [
+      'asyncShaderPendingCount',
+      'async_shader_pending_count',
+    ]);
+    if (asyncShaderPendingField.found && asyncShaderPendingField.value !== null) {
+      gpuTelemetry.asyncShaderPendingCount = toSafeNonNegativeInt(asyncShaderPendingField.value, 0);
       matchedW83Field = true;
     }
 
@@ -5258,6 +5400,18 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (data.missingShaders !== undefined) {
       patch.missingShaders = data.missingShaders;
+    }
+    if (data.shaderPackStats !== undefined) {
+      patch.shaderPackStats = data.shaderPackStats;
+    }
+    if (data.shaderStreaming !== undefined) {
+      patch.shaderStreaming = data.shaderStreaming;
+    }
+    if (typeof data.rangedPackActive === 'boolean') {
+      patch.rangedPackActive = data.rangedPackActive;
+    }
+    if (data.deviceStats !== undefined) {
+      patch.deviceStats = data.deviceStats;
     }
     const hadDrawOrBindFields = applyGpuStatsFields(data);
     const perfRes = ingestPerfAndIoTelemetry(data, { notifyHud: true, updatePanel: false });
@@ -9139,11 +9293,19 @@ export function bootstrapPlayGta6App(options = {}) {
           ? gpuTelemetry.swapchainProbeSupported
           : null,
       swapchainProbeErrorCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeErrorCount, 0),
+      swapchainProbeTimeoutCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeTimeoutCount, 0),
       lastSampledMaxLuma: Math.max(
         0,
         Math.min(255, toSafeNonNegativeInt(gpuTelemetry.lastSampledMaxLuma, 0))
       ),
       suppressedBlackFrames: toSafeNonNegativeInt(gpuTelemetry.suppressedBlackFrames, 0),
+      coalescedPresents: toSafeNonNegativeInt(gpuTelemetry.coalescedPresents, 0),
+      oversizedWgslFallbacks: toSafeNonNegativeInt(gpuTelemetry.oversizedWgslFallbacks, 0),
+      deviceLostCount: toSafeNonNegativeInt(gpuTelemetry.deviceLostCount, 0),
+      deviceRecoveredCount: toSafeNonNegativeInt(gpuTelemetry.deviceRecoveredCount, 0),
+      gpuStallWarnCount: toSafeNonNegativeInt(gpuTelemetry.gpuStallWarnCount, 0),
+      rangedPackActive:
+        typeof gpuTelemetry.rangedPackActive === 'boolean' ? gpuTelemetry.rangedPackActive : null,
       gpuMemory: gpuTelemetry.gpuMemory ? Object.freeze({ ...gpuTelemetry.gpuMemory }) : null,
       bootToStartScreenMs,
       bootToIntroVideoMs,
@@ -9211,11 +9373,19 @@ export function bootstrapPlayGta6App(options = {}) {
           ? gpuTelemetry.swapchainProbeSupported
           : null,
       swapchainProbeErrorCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeErrorCount, 0),
+      swapchainProbeTimeoutCount: toSafeNonNegativeInt(gpuTelemetry.swapchainProbeTimeoutCount, 0),
       lastSampledMaxLuma: Math.max(
         0,
         Math.min(255, toSafeNonNegativeInt(gpuTelemetry.lastSampledMaxLuma, 0))
       ),
       suppressedBlackFrames: toSafeNonNegativeInt(gpuTelemetry.suppressedBlackFrames, 0),
+      coalescedPresents: toSafeNonNegativeInt(gpuTelemetry.coalescedPresents, 0),
+      oversizedWgslFallbacks: toSafeNonNegativeInt(gpuTelemetry.oversizedWgslFallbacks, 0),
+      deviceLostCount: toSafeNonNegativeInt(gpuTelemetry.deviceLostCount, 0),
+      deviceRecoveredCount: toSafeNonNegativeInt(gpuTelemetry.deviceRecoveredCount, 0),
+      gpuStallWarnCount: toSafeNonNegativeInt(gpuTelemetry.gpuStallWarnCount, 0),
+      rangedPackActive:
+        typeof gpuTelemetry.rangedPackActive === 'boolean' ? gpuTelemetry.rangedPackActive : null,
       gpuMemory: gpuTelemetry.gpuMemory ? Object.freeze({ ...gpuTelemetry.gpuMemory }) : null,
     });
 
@@ -9270,8 +9440,15 @@ export function bootstrapPlayGta6App(options = {}) {
       swapchainProbeInFlight: gpu.swapchainProbeInFlight,
       swapchainProbeSupported: gpu.swapchainProbeSupported,
       swapchainProbeErrorCount: gpu.swapchainProbeErrorCount,
+      swapchainProbeTimeoutCount: gpu.swapchainProbeTimeoutCount,
       lastSampledMaxLuma: gpu.lastSampledMaxLuma,
       suppressedBlackFrames: gpu.suppressedBlackFrames,
+      coalescedPresents: gpu.coalescedPresents,
+      oversizedWgslFallbacks: gpu.oversizedWgslFallbacks,
+      deviceLostCount: gpu.deviceLostCount,
+      deviceRecoveredCount: gpu.deviceRecoveredCount,
+      gpuStallWarnCount: gpu.gpuStallWarnCount,
+      rangedPackActive: gpu.rangedPackActive,
       gpuMemory: gpu.gpuMemory,
       bootToStartScreenMs,
       bootToIntroVideoMs,
