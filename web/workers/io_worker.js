@@ -123,6 +123,7 @@
   const DEFAULT_IMMUTABLE_CHUNK_SIZE = 64 * 1024; // 64 KiB aligned chunks
   const DEFAULT_IMMUTABLE_MAX_BYTES = 128 * 1024 * 1024; // 128 MiB RAM cap
   const DEFAULT_WHOLE_FILE_MAX_BYTES = 256 * 1024 * 1024; // 256 MiB safe cap for eager .pgim / manifest buffering
+  const DEFAULT_WHOLE_FILE_TOTAL_MAX_BYTES = 256 * 1024 * 1024; // 256 MiB aggregate cap across all active whole-file buffers
   const DEFAULT_SLAB_SIZE = 2 * 1024 * 1024; // 2 MiB aligned read-ahead slabs
   const DEFAULT_SLAB_MAX_BYTES = 192 * 1024 * 1024; // 192 MiB bounded LRU cap (96 x 2 MiB slabs; holds ~115 MB shaders.rpf working set without thrashing)
   const MAX_SLAB_SIZE = 16 * 1024 * 1024; // 16 MiB upper safety cap per slab
@@ -134,16 +135,21 @@
   const MAX_CONCURRENT_SLAB_FETCHES = 16;
   const DEFAULT_SEQUENTIAL_THRESHOLD_READS = 3;
   const MAX_STREAM_TRACKER_ENTRIES = 64;
+  const SLRU_MIN_SLABS = 4; // Enable 2-segment scan-resistant SLRU when budget fits >= 4 slabs
   const DEFAULT_NEGATIVE_CACHE_TTL_MS = 30 * 1000; // 30s bounded TTL for missing optional files
   const DEFAULT_NEGATIVE_CACHE_MAX_ENTRIES = 512;
   const DEFAULT_METADATA_MAX_ENTRIES = 4096;
+  const MAX_FILE_FINGERPRINTS = 4096;
   const MAX_COALESCED_FETCH_BYTES = 4 * 1024 * 1024; // 4 MiB cap per single HTTP 206 fetch
   const DEFAULT_BATCH_COALESCE_MAX_GAP_BYTES = 64 * 1024; // 64 KiB max gap merged between same-asset batch ranges
   const DEFAULT_BATCH_COALESCE_MAX_BYTES = 2 * 1024 * 1024; // 2 MiB default cap per coalesced batch span
   const DEFAULT_HOT_OPFS_RPF_ALLOWLIST = Object.freeze(['shaders.rpf', 'core_bvh4.rpf']);
   const DEFAULT_OPFS_L2_MAX_PENDING_WRITES = 64;
+  const DEFAULT_OPFS_L2_MAX_PENDING_WRITE_BYTES = 32 * 1024 * 1024; // 32 MiB byte cap on queued OPFS L2 write-through payloads
   const DEFAULT_OPFS_L2_MAX_WRITE_CONCURRENCY = 4;
   const DEFAULT_OPFS_L2_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB bounded OPFS L2 cap
+  const MAX_OPFS_L2_TRACKED_ENTRIES = 16384;
+  const OPFS_L2_CHUNK_READ_CONCURRENCY = 4;
 
   const SLAB_TUNING_PROFILES = Object.freeze({
     default: Object.freeze({
@@ -1378,6 +1384,11 @@
       slabPrefetchesScheduled: 0,
       slabPrefetchesCompleted: 0,
       slabPrefetchErrors: 0,
+      slabPrefetchWasted: 0,
+      slabPrefetchCancelled: 0,
+      slabProtectedEntries: 0,
+      slabProbationEntries: 0,
+      slabProtectedPromotions: 0,
       prefetchHits: 0,
       prefetchAheadSlabs,
       maxConcurrentSlabFetches,
@@ -1397,7 +1408,12 @@
       opfsL2Misses: 0,
       opfsL2Writes: 0,
       opfsL2WriteErrors: 0,
+      opfsL2WriteDrops: 0,
+      opfsL2ProactiveEvictions: 0,
       opfsL2Invalidations: 0,
+      opfsL2QueuedBytes: 0,
+      memoryReclaims: 0,
+      bytesReclaimed: 0,
       bytesCached: 0,
       maxBytes:
         Number.isFinite(options.maxBytes) && options.maxBytes >= 0
@@ -1473,6 +1489,11 @@
         Number.isInteger(options.maxPendingOpfsL2Writes) && options.maxPendingOpfsL2Writes > 0
           ? options.maxPendingOpfsL2Writes
           : DEFAULT_OPFS_L2_MAX_PENDING_WRITES;
+      this.maxPendingOpfsL2WriteBytes =
+        Number.isFinite(options.maxPendingOpfsL2WriteBytes) &&
+        options.maxPendingOpfsL2WriteBytes > 0
+          ? Math.floor(options.maxPendingOpfsL2WriteBytes)
+          : DEFAULT_OPFS_L2_MAX_PENDING_WRITE_BYTES;
       this.maxOpfsL2WriteConcurrency =
         Number.isInteger(options.maxOpfsL2WriteConcurrency) && options.maxOpfsL2WriteConcurrency > 0
           ? options.maxOpfsL2WriteConcurrency
@@ -1483,26 +1504,37 @@
           : DEFAULT_OPFS_L2_MAX_BYTES;
 
       this._chunks = new Map(); // key (`${url}::${chunkIndex}`) -> owned Uint8Array (LRU order)
-      this._slabs = new Map(); // key (`${url}::slab::${slabIndex}`) -> owned Uint8Array (LRU order)
+      this._slabs = new Map(); // key (`${url}::slab::${slabIndex}`) -> owned Uint8Array (master map)
+      this._probationSlabs = new Map(); // SLRU probation segment (~25%)
+      this._protectedSlabs = new Map(); // SLRU protected segment (~75%)
+      this._probationSlabBytes = 0;
+      this._protectedSlabBytes = 0;
+      this._slabLastSwitch = new Map(); // slabKey -> slabSwitchCount at last access (reuse-distance guard)
+      this._lastAccessedSlabKey = null;
+      this._slabSwitchCount = 0;
       this._fileMeta = new Map(); // normalized url -> { size: number | null, etag: string | null, fileFingerprint: string | null } (LRU order)
       this._fileFingerprints = new Map(); // normalizedPath -> { fp: string, explicit: boolean, size: number | null, etag: string | null }
       this._negativeCache = new Map(); // normalized url -> { errno, status, expiresAt } (LRU order)
       this._inFlightChunks = new Map(); // chunkKey -> Promise<Uint8Array>
       this._inFlightSlabs = new Map(); // slabKey -> Promise<Uint8Array>
-      this._inFlightSlabMeta = new Map(); // slabKey -> { isPrefetch, prefetchHitCounted, waiter }
+      this._inFlightSlabMeta = new Map(); // slabKey -> { isPrefetch, prefetchHitCounted, waiter, url }
       this._prefetchedSlabKeys = new Set(); // slabKey set for unconsumed prefetched slabs in RAM LRU
+      this._urlPrefetchBackoff = new Map(); // url -> { consecutiveWastes, suppressReads }
       this._opfsL2HitBuffers = new WeakSet(); // WeakSet<Uint8Array> tagging OPFS L2 hit buffers for bytesServedFromCache
       this._inFlightOpen = new Map(); // url -> Promise<{ ok, size, errno, status }>
-      this._streamTrackers = new Map(); // url -> { lastOffset, lastEndOffset, lastSlabIndex, sequentialCount }
+      this._streamTrackers = new Map(); // url -> { lastOffset, lastEndOffset, lastSlabIndex, frontierEndOffset, frontierSlabIndex, sequentialCount }
       this._activeSlabFetches = 0;
-      this._slabWaitQueue = []; // { resolve, priority } (demand=0 before prefetch=1)
+      this._activeDemandSlabFetches = 0;
+      this._slabWaitQueue = []; // { resolve, priority, url, key, cancelled } (demand=0 before prefetch=1)
       this._pendingPrefetches = new Set();
       this._opfsL2WriteQueue = new Map(); // writeKey -> { normalizedPath, offset, unitLength, bytes, fileFingerprint }
+      this._opfsL2QueuedBytes = 0;
       this._activeOpfsL2Writes = new Set(); // Set<Promise>
       this._inFlightOpfsL2WriteKeys = new Set(); // Set<writeKey> preventing concurrent SyncAccessHandle lock collisions
       this._inFlightOpfsL2WritePayloads = new Map(); // writeKey -> Uint8Array (serves hot RAM-evicted reads before disk flush)
       this._opfsL2WriteWaiters = [];
       this._opfsL2Entries = new Map(); // fileName -> { normalizedPath, offset, unitLength, byteLength }
+      this._opfsL2TotalBytes = 0;
       this._opfsL2ValidatedFingerprints = new Map(); // normalizedPath.toLowerCase() -> last validated fp
       this._opfsDirKnownFiles = null; // lazily-populated Set<string> of filenames in current opfsDir
       this._opfsDirPathFingerprints = new Map(); // pathToken -> Set<fp> discovered in current opfsDir
@@ -1524,6 +1556,9 @@
         slabPrefetchesScheduled: 0,
         slabPrefetchesCompleted: 0,
         slabPrefetchErrors: 0,
+        slabPrefetchWasted: 0,
+        slabPrefetchCancelled: 0,
+        slabProtectedPromotions: 0,
         prefetchHits: 0,
         peakConcurrentSlabFetches: 0,
         metaHits: 0,
@@ -1538,7 +1573,11 @@
         opfsL2Misses: 0,
         opfsL2Writes: 0,
         opfsL2WriteErrors: 0,
+        opfsL2WriteDrops: 0,
+        opfsL2ProactiveEvictions: 0,
         opfsL2Invalidations: 0,
+        memoryReclaims: 0,
+        bytesReclaimed: 0,
       };
 
       if (options.fileFingerprints instanceof Map) {
@@ -1564,6 +1603,66 @@
       return this.slabSize > 0 && this.slabMaxBytes >= this.slabSize;
     }
 
+    _isSlruEnabled() {
+      const minSlabs = Math.max(SLRU_MIN_SLABS, (this.prefetchAheadSlabs || 0) + 2);
+      return this.slabSize > 0 && Math.floor(this.slabMaxBytes / this.slabSize) >= minSlabs;
+    }
+
+    _protectedSlabBudgetBytes() {
+      const probationReserve = Math.max(1, (this.prefetchAheadSlabs || 0) + 1) * this.slabSize;
+      const maxProtected = Math.max(this.slabSize, this.slabMaxBytes - probationReserve);
+      return Math.min(maxProtected, Math.max(this.slabSize, Math.floor(this.slabMaxBytes * 0.75)));
+    }
+
+    _clearOpfsL2WriteQueue() {
+      this._opfsL2WriteQueue.clear();
+      this._opfsL2QueuedBytes = 0;
+    }
+
+    _trackOpfsL2Entry(fileName, meta) {
+      const prev = this._opfsL2Entries.get(fileName);
+      if (prev) {
+        const prevLen = Number.isFinite(prev.byteLength) && prev.byteLength > 0 ? prev.byteLength : 0;
+        this._opfsL2TotalBytes = Math.max(0, this._opfsL2TotalBytes - prevLen);
+        this._opfsL2Entries.delete(fileName);
+      } else {
+        while (this._opfsL2Entries.size >= MAX_OPFS_L2_TRACKED_ENTRIES) {
+          const oldestKey = this._opfsL2Entries.keys().next().value;
+          if (oldestKey === undefined) break;
+          const oldestMeta = this._opfsL2Entries.get(oldestKey);
+          this._opfsL2Entries.delete(oldestKey);
+          if (oldestMeta && Number.isFinite(oldestMeta.byteLength) && oldestMeta.byteLength > 0) {
+            this._opfsL2TotalBytes = Math.max(0, this._opfsL2TotalBytes - oldestMeta.byteLength);
+          }
+        }
+      }
+      this._opfsL2Entries.set(fileName, meta);
+      const nextLen = meta && Number.isFinite(meta.byteLength) && meta.byteLength > 0 ? meta.byteLength : 0;
+      this._opfsL2TotalBytes += nextLen;
+    }
+
+    _untrackOpfsL2Entry(fileName) {
+      const prev = this._opfsL2Entries.get(fileName);
+      if (!prev) return false;
+      this._opfsL2Entries.delete(fileName);
+      const prevLen = Number.isFinite(prev.byteLength) && prev.byteLength > 0 ? prev.byteLength : 0;
+      this._opfsL2TotalBytes = Math.max(0, this._opfsL2TotalBytes - prevLen);
+      return true;
+    }
+
+    _setFileFingerprintBounded(pathKey, record) {
+      if (this._fileFingerprints.has(pathKey)) {
+        this._fileFingerprints.delete(pathKey);
+      } else {
+        while (this._fileFingerprints.size >= MAX_FILE_FINGERPRINTS) {
+          const oldest = this._fileFingerprints.keys().next().value;
+          if (oldest === undefined) break;
+          this._fileFingerprints.delete(oldest);
+        }
+      }
+      this._fileFingerprints.set(pathKey, record);
+    }
+
     _resetOpfsDirIndex() {
       this._opfsDirKnownFiles = null;
       this._opfsDirPathFingerprints.clear();
@@ -1571,6 +1670,7 @@
       this._opfsDirIndexedStore = null;
       this._inFlightFingerprintProbes.clear();
       this._opfsL2CheckedFingerprints.clear();
+      this._opfsL2TotalBytes = 0;
     }
 
     _recordOpfsDirFileName(fileName) {
@@ -1631,8 +1731,9 @@
     setOpfsL2(store) {
       const next = store || null;
       if (next !== this.opfsL2) {
-        this._opfsL2WriteQueue.clear();
+        this._clearOpfsL2WriteQueue();
         this._opfsL2Entries.clear();
+        this._opfsL2TotalBytes = 0;
         this._opfsL2ValidatedFingerprints.clear();
         this._resetOpfsDirIndex();
       }
@@ -1642,7 +1743,7 @@
     setOpfsCache(opfsCache) {
       const next = opfsCache || null;
       if (next !== this.opfsCache) {
-        this._opfsL2WriteQueue.clear();
+        this._clearOpfsL2WriteQueue();
         this._opfsL2ValidatedFingerprints.clear();
         this._resetOpfsDirIndex();
       }
@@ -1652,8 +1753,9 @@
     setOpfsDir(opfsDir) {
       const next = opfsDir || null;
       if (next !== this.opfsDir) {
-        this._opfsL2WriteQueue.clear();
+        this._clearOpfsL2WriteQueue();
         this._opfsL2Entries.clear();
+        this._opfsL2TotalBytes = 0;
         this._opfsL2ValidatedFingerprints.clear();
         this._resetOpfsDirIndex();
       }
@@ -1707,11 +1809,9 @@
 
     _evictUrlFromMemory(url) {
       const prefix = `${url}::`;
-      for (const [key, bytes] of Array.from(this._slabs.entries())) {
+      for (const key of Array.from(this._slabs.keys())) {
         if (key.startsWith(prefix)) {
-          this._slabs.delete(key);
-          this._prefetchedSlabKeys.delete(key);
-          this._slabBytesCached = Math.max(0, this._slabBytesCached - bytes.byteLength);
+          this._deleteSlabInternal(key, false);
         }
       }
       for (const [key, bytes] of Array.from(this._chunks.entries())) {
@@ -1724,7 +1824,7 @@
 
     _evictNormalizedPathFromMemory(normalizedPath) {
       const targetLower = typeof normalizedPath === 'string' ? normalizedPath.toLowerCase() : '';
-      for (const [key, bytes] of Array.from(this._slabs.entries())) {
+      for (const key of Array.from(this._slabs.keys())) {
         const sep = key.indexOf('::');
         const keyUrl = sep >= 0 ? key.slice(0, sep) : key;
         const keyNorm = normalizeOpfsL2Path(keyUrl);
@@ -1733,9 +1833,7 @@
           keyLower === targetLower ||
           (keyLower && basenameOfPath(keyLower) === targetLower)
         ) {
-          this._slabs.delete(key);
-          this._prefetchedSlabKeys.delete(key);
-          this._slabBytesCached = Math.max(0, this._slabBytesCached - bytes.byteLength);
+          this._deleteSlabInternal(key, false);
         }
       }
       for (const [key, bytes] of Array.from(this._chunks.entries())) {
@@ -1758,6 +1856,9 @@
           (taskLower && basenameOfPath(taskLower) === targetLower)
         ) {
           this._opfsL2WriteQueue.delete(wKey);
+          if (task && task.bytes instanceof Uint8Array) {
+            this._opfsL2QueuedBytes = Math.max(0, this._opfsL2QueuedBytes - task.bytes.byteLength);
+          }
         }
       }
     }
@@ -1791,7 +1892,7 @@
       if (nextFp === null) {
         this._fileFingerprints.delete(pathKey);
       } else {
-        this._fileFingerprints.set(pathKey, {
+        this._setFileFingerprintBounded(pathKey, {
           fp: nextFp,
           explicit: true,
           size: metaSize,
@@ -1964,7 +2065,7 @@
       this._negativeCache.delete(url);
 
       if (pathKey && nextFp !== null) {
-        this._fileFingerprints.set(pathKey, {
+        this._setFileFingerprintBounded(pathKey, {
           fp: nextFp,
           explicit: hadExplicitFp && !explicitFpMismatch,
           size: nextSize,
@@ -2075,6 +2176,21 @@
           for (const fileName of this._opfsL2Entries.keys()) {
             indexName(fileName);
           }
+          // Seed tracked OPFS L2 byte accounting from parsed `r_<off>_<unitLength>_...` filenames
+          // without touching `handle.getFile()` on warm boot.
+          let indexedBytes = 0;
+          for (const fileName of known) {
+            const existing = this._opfsL2Entries.get(fileName);
+            if (existing && Number.isFinite(existing.byteLength) && existing.byteLength > 0) {
+              indexedBytes += existing.byteLength;
+            } else {
+              const parsed = parseOpfsL2RangeFileMeta(fileName);
+              if (parsed && Number.isFinite(parsed.unitLength) && parsed.unitLength > 0) {
+                indexedBytes += parsed.unitLength;
+              }
+            }
+          }
+          this._opfsL2TotalBytes = indexedBytes;
           this._opfsDirKnownFiles = known;
           this._opfsDirPathFingerprints = pathFps;
           this._opfsDirIndexPromise = null;
@@ -2181,7 +2297,7 @@
           }
           for (const staleName of staleNames) {
             this._removeOpfsDirFileName(staleName);
-            this._opfsL2Entries.delete(staleName);
+            this._untrackOpfsL2Entry(staleName);
           }
           let invalidated = 0;
           for (const staleName of staleNames) {
@@ -2208,7 +2324,7 @@
 
       let invalidated = 0;
       for (const staleName of staleNames) {
-        this._opfsL2Entries.delete(staleName);
+        this._untrackOpfsL2Entry(staleName);
         const deleted = await this._deleteOpfsDirEntry(store, staleName);
         if (deleted) {
           invalidated += 1;
@@ -2227,7 +2343,7 @@
       for (let i = 0; i < snapshot.length && freedBytes < targetBytes; i += 1) {
         const [fileName, meta] = snapshot[i];
         if (evicted.has(fileName)) continue;
-        this._opfsL2Entries.delete(fileName);
+        this._untrackOpfsL2Entry(fileName);
         evicted.add(fileName);
         await this._deleteOpfsDirEntry(store, fileName);
         freedBytes += meta && Number.isFinite(meta.byteLength) && meta.byteLength > 0
@@ -2246,9 +2362,17 @@
           const name = dirNames[i];
           if (evicted.has(name) || !/^r_\d+_\d+_.*\.bin$/.test(name)) continue;
           evicted.add(name);
-          this._opfsL2Entries.delete(name);
+          const wasTracked = this._untrackOpfsL2Entry(name);
           await this._deleteOpfsDirEntry(store, name);
-          freedBytes += this.slabSize || this.chunkSize;
+          const parsed = parseOpfsL2RangeFileMeta(name);
+          const estBytes =
+            parsed && Number.isFinite(parsed.unitLength) && parsed.unitLength > 0
+              ? parsed.unitLength
+              : this.slabSize || this.chunkSize;
+          if (!wasTracked) {
+            this._opfsL2TotalBytes = Math.max(0, this._opfsL2TotalBytes - estBytes);
+          }
+          freedBytes += estBytes;
         }
       }
       return freedBytes;
@@ -2438,13 +2562,55 @@
           if (!res || !res.ok) {
             return null;
           }
-          const etag = getResponseHeader(res.headers, 'ETag');
+          let etag = getResponseHeader(res.headers, 'ETag');
           const clRaw = getResponseHeader(res.headers, 'Content-Length');
           let headSize = null;
           if (typeof clRaw === 'string' && /^\d+$/.test(clRaw.trim())) {
             const parsed = Number(clRaw.trim());
             if (Number.isSafeInteger(parsed) && parsed >= 0) {
               headSize = parsed;
+            }
+          }
+          // If HEAD returned Content-Length without an ETag while OPFS already holds
+          // `<size>_<etagHash16>` entries for this path, do NOT emit a size-only fingerprint
+          // that would self-invalidate warm OPFS slabs; probe `GET Range: bytes=0-0` to retrieve ETag.
+          if (etag === null && headSize !== null && normPath) {
+            const cachedFps = this._opfsDirPathFingerprints.get(opfsL2PathToken(normPath));
+            let hasTaggedForSize = false;
+            if (cachedFps) {
+              const sizePrefix = `${headSize}_`;
+              for (const existingFp of cachedFps) {
+                if (typeof existingFp === 'string' && existingFp.startsWith(sizePrefix)) {
+                  hasTaggedForSize = true;
+                  break;
+                }
+              }
+            }
+            if (hasTaggedForSize) {
+              try {
+                const probeRes = await this.fetchImpl(url, {
+                  headers: { Range: 'bytes=0-0' },
+                });
+                if (probeRes && probeRes.body && typeof probeRes.body.cancel === 'function') {
+                  try {
+                    await probeRes.body.cancel();
+                  } catch {
+                    // Ignore body cancel errors on Range probe.
+                  }
+                }
+                if (probeRes && (probeRes.ok || probeRes.status === 206)) {
+                  const rangeEtag = getResponseHeader(probeRes.headers, 'ETag');
+                  if (typeof rangeEtag === 'string' && rangeEtag.trim().length > 0) {
+                    etag = rangeEtag.trim();
+                  }
+                }
+              } catch {
+                // Fall back to returning null so the first real Range GET supplies ETag without
+                // prematurely invalidating warm OPFS files.
+              }
+              if (etag === null) {
+                return null;
+              }
             }
           }
           if (etag === null && headSize === null) {
@@ -2576,7 +2742,7 @@
               if (isNotFoundError(err)) {
                 if (knownFiles !== null) {
                   this._removeOpfsDirFileName(fileName);
-                  this._opfsL2Entries.delete(fileName);
+                  this._untrackOpfsL2Entry(fileName);
                   if (this._opfsL2CheckedFingerprints.get(pathKey) !== fp) {
                     const inv = await this._invalidateStaleOpfsDirPath(
                       backend.store,
@@ -2604,24 +2770,31 @@
               }
               throw err;
             }
-            if (typeof handle.getFile === 'function') {
+            // Prefer FileSystemSyncAccessHandle in DedicatedWorker contexts before getFile()
+            // to avoid Blob/File allocation and IPC overhead on warm 2 MiB slab reads.
+            if (typeof handle.createSyncAccessHandle === 'function') {
+              try {
+                const syncHandle = await handle.createSyncAccessHandle();
+                try {
+                  const sz = typeof syncHandle.getSize === 'function' ? syncHandle.getSize() : 0;
+                  if (sz > 0) {
+                    const out = new Uint8Array(sz);
+                    const readLen = syncHandle.read(out, { at: 0 });
+                    rawBytes = readLen === sz ? out : out.slice(0, Math.max(0, readLen));
+                  }
+                } finally {
+                  if (typeof syncHandle.close === 'function') {
+                    syncHandle.close();
+                  }
+                }
+              } catch {
+                // Fall back to handle.getFile() when SyncAccessHandle is locked or unsupported.
+              }
+            }
+            if (rawBytes === null && typeof handle.getFile === 'function') {
               const file = await handle.getFile();
               const buf = await file.arrayBuffer();
               rawBytes = new Uint8Array(buf);
-            } else if (typeof handle.createSyncAccessHandle === 'function') {
-              const syncHandle = await handle.createSyncAccessHandle();
-              try {
-                const sz = typeof syncHandle.getSize === 'function' ? syncHandle.getSize() : 0;
-                if (sz > 0) {
-                  const out = new Uint8Array(sz);
-                  const readLen = syncHandle.read(out, { at: 0 });
-                  rawBytes = readLen === sz ? out : out.slice(0, Math.max(0, readLen));
-                }
-              } finally {
-                if (typeof syncHandle.close === 'function') {
-                  syncHandle.close();
-                }
-              }
             }
             if (knownFiles !== null) {
               this._recordOpfsDirFileName(fileName);
@@ -2631,7 +2804,7 @@
               this._opfsL2Entries.delete(fileName);
               this._opfsL2Entries.set(fileName, meta);
             } else if (rawBytes instanceof Uint8Array) {
-              this._opfsL2Entries.set(fileName, {
+              this._trackOpfsL2Entry(fileName, {
                 normalizedPath: normPath,
                 offset,
                 unitLength,
@@ -2754,23 +2927,36 @@
 
         if (backend.kind === 'opfsDir') {
           const fileName = opfsL2RangeFileName(normalizedPath, offset, unitLength, fileFingerprint);
+          const enforceProactiveDiskBudget = async () => {
+            if (this.opfsL2MaxBytes > 0 && this._opfsL2TotalBytes > this.opfsL2MaxBytes) {
+              const excess = this._opfsL2TotalBytes - this.opfsL2MaxBytes;
+              const freed = await this._evictOpfsDirForQuotaSerialized(
+                backend.store,
+                fileName,
+                excess,
+              );
+              if (freed > 0) {
+                this._stats.opfsL2ProactiveEvictions += 1;
+              }
+            }
+          };
           try {
             const wrote = await this._writeOpfsDirOnce(backend.store, fileName, bytes);
             if (wrote) {
-              this._opfsL2Entries.delete(fileName);
-              this._opfsL2Entries.set(fileName, {
+              this._trackOpfsL2Entry(fileName, {
                 normalizedPath,
                 offset,
                 unitLength,
                 byteLength: bytes.byteLength,
               });
               this._stats.opfsL2Writes += 1;
+              await enforceProactiveDiskBudget();
               return true;
             }
             this._stats.opfsL2WriteErrors += 1;
             return false;
           } catch (err) {
-            this._opfsL2Entries.delete(fileName);
+            this._untrackOpfsL2Entry(fileName);
             await this._deleteOpfsDirEntry(backend.store, fileName);
             if (!isQuotaExceededError(err)) {
               this._stats.opfsL2WriteErrors += 1;
@@ -2784,20 +2970,20 @@
             try {
               const retryWrote = await this._writeOpfsDirOnce(backend.store, fileName, bytes);
               if (retryWrote) {
-                this._opfsL2Entries.delete(fileName);
-                this._opfsL2Entries.set(fileName, {
+                this._trackOpfsL2Entry(fileName, {
                   normalizedPath,
                   offset,
                   unitLength,
                   byteLength: bytes.byteLength,
                 });
                 this._stats.opfsL2Writes += 1;
+                await enforceProactiveDiskBudget();
                 return true;
               }
               this._stats.opfsL2WriteErrors += 1;
               return false;
             } catch {
-              this._opfsL2Entries.delete(fileName);
+              this._untrackOpfsL2Entry(fileName);
               await this._deleteOpfsDirEntry(backend.store, fileName);
               this._stats.opfsL2WriteErrors += 1;
               return false;
@@ -2811,7 +2997,13 @@
       return false;
     }
 
-    _pumpOpfsL2WriteQueue() {
+    _pumpOpfsL2WriteQueue(options = {}) {
+      const force = Boolean(options && options.force);
+      // Read-priority gating: defer background OPFS L2 write-through while demand slab fetches
+      // are active so disk flushes do not compete with hot HTTP/OPFS demand reads.
+      if (!force && this._activeDemandSlabFetches > 0) {
+        return;
+      }
       while (
         this._activeOpfsL2Writes.size < this.maxOpfsL2WriteConcurrency &&
         this._opfsL2WriteQueue.size > 0
@@ -2820,6 +3012,9 @@
         if (!nextEntry) break;
         const [writeKey, task] = nextEntry;
         this._opfsL2WriteQueue.delete(writeKey);
+        if (task && task.bytes instanceof Uint8Array) {
+          this._opfsL2QueuedBytes = Math.max(0, this._opfsL2QueuedBytes - task.bytes.byteLength);
+        }
         if (this._inFlightOpfsL2WriteKeys.has(writeKey)) {
           continue;
         }
@@ -2841,7 +3036,7 @@
           this._inFlightOpfsL2WriteKeys.delete(writeKey);
           this._inFlightOpfsL2WritePayloads.delete(writeKey);
           this._activeOpfsL2Writes.delete(writePromise);
-          this._pumpOpfsL2WriteQueue();
+          this._pumpOpfsL2WriteQueue({ force });
           if (this._activeOpfsL2Writes.size === 0 && this._opfsL2WriteQueue.size === 0) {
             const waiters = this._opfsL2WriteWaiters.splice(0, this._opfsL2WriteWaiters.length);
             for (let i = 0; i < waiters.length; i += 1) {
@@ -2885,13 +3080,40 @@
           return false;
         }
       }
-      if (this._opfsL2WriteQueue.has(writeKey)) {
+      if (
+        this.maxPendingOpfsL2WriteBytes > 0 &&
+        bytes.byteLength > this.maxPendingOpfsL2WriteBytes
+      ) {
+        this._stats.opfsL2WriteDrops += 1;
+        return false;
+      }
+      const existingTask = this._opfsL2WriteQueue.get(writeKey);
+      if (existingTask) {
         this._opfsL2WriteQueue.delete(writeKey);
+        if (existingTask.bytes instanceof Uint8Array) {
+          this._opfsL2QueuedBytes = Math.max(
+            0,
+            this._opfsL2QueuedBytes - existingTask.bytes.byteLength,
+          );
+        }
       } else {
-        while (this._opfsL2WriteQueue.size >= this.maxPendingOpfsL2Writes) {
-          const oldestKey = this._opfsL2WriteQueue.keys().next().value;
-          if (oldestKey === undefined) break;
+        while (
+          this._opfsL2WriteQueue.size >= this.maxPendingOpfsL2Writes ||
+          (this.maxPendingOpfsL2WriteBytes > 0 &&
+            this._opfsL2QueuedBytes + bytes.byteLength > this.maxPendingOpfsL2WriteBytes &&
+            this._opfsL2WriteQueue.size > 0)
+        ) {
+          const oldestEntry = this._opfsL2WriteQueue.entries().next().value;
+          if (!oldestEntry) break;
+          const [oldestKey, oldestTask] = oldestEntry;
           this._opfsL2WriteQueue.delete(oldestKey);
+          if (oldestTask && oldestTask.bytes instanceof Uint8Array) {
+            this._opfsL2QueuedBytes = Math.max(
+              0,
+              this._opfsL2QueuedBytes - oldestTask.bytes.byteLength,
+            );
+          }
+          this._stats.opfsL2WriteDrops += 1;
         }
       }
       // `bytes` is an immutable owned Uint8Array stored in RAM LRU; avoid a redundant 2 MiB slice copy.
@@ -2902,13 +3124,14 @@
         bytes,
         fileFingerprint: fp,
       });
+      this._opfsL2QueuedBytes += bytes.byteLength;
       this._pumpOpfsL2WriteQueue();
       return true;
     }
 
     async flushOpfsL2Writes() {
       while (this._activeOpfsL2Writes.size > 0 || this._opfsL2WriteQueue.size > 0) {
-        this._pumpOpfsL2WriteQueue();
+        this._pumpOpfsL2WriteQueue({ force: true });
         await new Promise((resolve) => {
           if (this._activeOpfsL2Writes.size === 0 && this._opfsL2WriteQueue.size === 0) {
             resolve();
@@ -3006,6 +3229,79 @@
       this._bytesCached += owned.byteLength;
     }
 
+    _recordPrefetchWaste(slabKey) {
+      const sep = slabKey.indexOf('::slab::');
+      if (sep <= 0) return;
+      const url = slabKey.slice(0, sep);
+      const rec = this._urlPrefetchBackoff.get(url) || { consecutiveWastes: 0, suppressReads: 0 };
+      rec.consecutiveWastes = Math.min(rec.consecutiveWastes + 1, 16);
+      // After 2 consecutive wasted prefetches on the same URL, back off speculative prefetch briefly.
+      if (rec.consecutiveWastes >= 2) {
+        rec.suppressReads = Math.min(64, 1 << Math.min(rec.consecutiveWastes, 6));
+      }
+      this._urlPrefetchBackoff.delete(url);
+      if (this._urlPrefetchBackoff.size >= MAX_STREAM_TRACKER_ENTRIES) {
+        const oldest = this._urlPrefetchBackoff.keys().next().value;
+        if (oldest !== undefined) {
+          this._urlPrefetchBackoff.delete(oldest);
+        }
+      }
+      this._urlPrefetchBackoff.set(url, rec);
+    }
+
+    _recordPrefetchConsumed(slabKey) {
+      const sep = slabKey.indexOf('::slab::');
+      if (sep <= 0) return;
+      const url = slabKey.slice(0, sep);
+      if (this._urlPrefetchBackoff.has(url)) {
+        this._urlPrefetchBackoff.delete(url);
+      }
+    }
+
+    _deleteSlabInternal(key, countEviction = false) {
+      const bytes = this._slabs.get(key);
+      if (!bytes) {
+        return 0;
+      }
+      const len = bytes.byteLength;
+      this._slabs.delete(key);
+      this._slabBytesCached = Math.max(0, this._slabBytesCached - len);
+      if (this._probationSlabs.delete(key)) {
+        this._probationSlabBytes = Math.max(0, this._probationSlabBytes - len);
+      }
+      if (this._protectedSlabs.delete(key)) {
+        this._protectedSlabBytes = Math.max(0, this._protectedSlabBytes - len);
+      }
+      this._slabLastSwitch.delete(key);
+      if (this._prefetchedSlabKeys.delete(key) && countEviction) {
+        this._stats.slabPrefetchWasted += 1;
+        this._recordPrefetchWaste(key);
+      }
+      if (countEviction) {
+        this._stats.slabEvictions += 1;
+      }
+      return len;
+    }
+
+    _evictOneSlab() {
+      let victimKey;
+      if (this._isSlruEnabled()) {
+        if (this._probationSlabs.size > 0) {
+          victimKey = this._probationSlabs.keys().next().value;
+        } else if (this._protectedSlabs.size > 0) {
+          victimKey = this._protectedSlabs.keys().next().value;
+        } else {
+          victimKey = this._slabs.keys().next().value;
+        }
+      } else {
+        victimKey = this._slabs.keys().next().value;
+      }
+      if (victimKey === undefined) {
+        return 0;
+      }
+      return this._deleteSlabInternal(victimKey, true);
+    }
+
     _touchSlab(key) {
       if (!this._slabs.has(key)) {
         return null;
@@ -3013,22 +3309,83 @@
       const bytes = this._slabs.get(key);
       this._slabs.delete(key);
       this._slabs.set(key, bytes);
+
+      const switched = key !== this._lastAccessedSlabKey;
+      if (switched) {
+        this._slabSwitchCount += 1;
+        this._lastAccessedSlabKey = key;
+      }
+
+      if (!this._isSlruEnabled()) {
+        this._slabLastSwitch.set(key, this._slabSwitchCount);
+        return bytes;
+      }
+
+      if (this._protectedSlabs.has(key)) {
+        this._protectedSlabs.delete(key);
+        this._protectedSlabs.set(key, bytes);
+        this._slabLastSwitch.set(key, this._slabSwitchCount);
+        return bytes;
+      }
+
+      if (this._probationSlabs.has(key)) {
+        const prevSwitch = this._slabLastSwitch.get(key);
+        const isFirstDemandConsume = this._prefetchedSlabKeys.has(key) || prevSwitch === undefined;
+        // Require a genuine second demand use with reuse distance >= 2 slab switches before
+        // promoting Probation -> Protected. Unconsumed prefetched slabs (first demand hit) and
+        // consecutive 64 KiB reads inside the same 2 MiB slab never promote, preventing
+        // sequential level/video scans from polluting Protected hot shader slabs.
+        if (!isFirstDemandConsume && switched && this._slabSwitchCount - prevSwitch >= 2) {
+          this._probationSlabs.delete(key);
+          this._probationSlabBytes = Math.max(0, this._probationSlabBytes - bytes.byteLength);
+          this._protectedSlabs.set(key, bytes);
+          this._protectedSlabBytes += bytes.byteLength;
+          this._slabLastSwitch.set(key, this._slabSwitchCount);
+          this._stats.slabProtectedPromotions += 1;
+
+          const protectedBudget = this._protectedSlabBudgetBytes();
+          while (this._protectedSlabBytes > protectedBudget && this._protectedSlabs.size > 1) {
+            const demotedKey = this._protectedSlabs.keys().next().value;
+            if (demotedKey === undefined) break;
+            const demotedBytes = this._protectedSlabs.get(demotedKey);
+            this._protectedSlabs.delete(demotedKey);
+            this._protectedSlabBytes = Math.max(
+              0,
+              this._protectedSlabBytes - demotedBytes.byteLength,
+            );
+            this._probationSlabs.set(demotedKey, demotedBytes);
+            this._probationSlabBytes += demotedBytes.byteLength;
+            this._slabLastSwitch.set(demotedKey, this._slabSwitchCount);
+          }
+        } else {
+          this._probationSlabs.delete(key);
+          this._probationSlabs.set(key, bytes);
+          if (switched || isFirstDemandConsume) {
+            this._slabLastSwitch.set(key, this._slabSwitchCount);
+          }
+        }
+      } else {
+        // Entry was inserted before SLRU became active; place in Probation.
+        this._probationSlabs.set(key, bytes);
+        this._probationSlabBytes += bytes.byteLength;
+        this._slabLastSwitch.set(key, this._slabSwitchCount);
+      }
+
       return bytes;
     }
 
-    _putSlab(key, bytes) {
+    _putSlab(key, bytes, options = {}) {
       if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
         return;
       }
+      const isPrefetch = Boolean(options && options.isPrefetch);
       const owned =
         bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
           ? bytes
           : bytes.slice();
 
       if (this._slabs.has(key)) {
-        const existing = this._slabs.get(key);
-        this._slabBytesCached -= existing.byteLength;
-        this._slabs.delete(key);
+        this._deleteSlabInternal(key, false);
       }
 
       if (this.slabMaxBytes <= 0 || owned.byteLength > this.slabMaxBytes) {
@@ -3039,16 +3396,121 @@
         this._slabBytesCached + owned.byteLength > this.slabMaxBytes &&
         this._slabs.size > 0
       ) {
-        const oldestKey = this._slabs.keys().next().value;
-        const oldestBytes = this._slabs.get(oldestKey);
-        this._slabs.delete(oldestKey);
-        this._prefetchedSlabKeys.delete(oldestKey);
-        this._slabBytesCached -= oldestBytes.byteLength;
-        this._stats.slabEvictions += 1;
+        const freed = this._evictOneSlab();
+        if (freed <= 0) break;
+      }
+
+      if (!isPrefetch && key !== this._lastAccessedSlabKey) {
+        this._slabSwitchCount += 1;
+        this._lastAccessedSlabKey = key;
       }
 
       this._slabs.set(key, owned);
       this._slabBytesCached += owned.byteLength;
+      if (this._isSlruEnabled()) {
+        this._probationSlabs.set(key, owned);
+        this._probationSlabBytes += owned.byteLength;
+      }
+      // Only demand-inserted slabs record an initial demand switch epoch; prefetched slabs wait
+      // until their first demand read before becoming eligible for Protected promotion.
+      if (isPrefetch) {
+        this._slabLastSwitch.delete(key);
+      } else {
+        this._slabLastSwitch.set(key, this._slabSwitchCount);
+      }
+    }
+
+    trimToBytes(targetSlabBytes, options = {}) {
+      const target =
+        Number.isFinite(targetSlabBytes) && targetSlabBytes >= 0
+          ? Math.floor(targetSlabBytes)
+          : 0;
+      const dropQueuedOpfsWrites = Boolean(options && options.dropQueuedOpfsWrites);
+      const trimChunks = options && options.trimChunks !== false;
+      let bytesFreed = 0;
+      let slabsEvicted = 0;
+      let chunksEvicted = 0;
+      let queuedWritesDropped = 0;
+
+      // 1. Evict unconsumed prefetched slabs first (zero cost to active working set).
+      if (this._slabBytesCached > target && this._prefetchedSlabKeys.size > 0) {
+        for (const key of Array.from(this._prefetchedSlabKeys)) {
+          if (this._slabBytesCached <= target) break;
+          if (!this._slabs.has(key)) {
+            this._prefetchedSlabKeys.delete(key);
+            continue;
+          }
+          const freed = this._deleteSlabInternal(key, true);
+          if (freed > 0) {
+            bytesFreed += freed;
+            slabsEvicted += 1;
+          }
+        }
+      }
+
+      // 2. Evict Probation slabs before Protected slabs (or oldest LRU when SLRU is inactive).
+      while (this._slabBytesCached > target && this._slabs.size > 0) {
+        const freed = this._evictOneSlab();
+        if (freed <= 0) break;
+        bytesFreed += freed;
+        slabsEvicted += 1;
+      }
+
+      // 3. Optionally trim legacy chunk cache when present.
+      if (trimChunks && this._chunks.size > 0) {
+        const chunkTarget = target === 0 ? 0 : Math.min(this._bytesCached, target);
+        while (this._bytesCached > chunkTarget && this._chunks.size > 0) {
+          const oldestKey = this._chunks.keys().next().value;
+          const oldestBytes = this._chunks.get(oldestKey);
+          this._chunks.delete(oldestKey);
+          const len = oldestBytes ? oldestBytes.byteLength : 0;
+          this._bytesCached = Math.max(0, this._bytesCached - len);
+          this._stats.evictions += 1;
+          bytesFreed += len;
+          chunksEvicted += 1;
+        }
+      }
+
+      // 4. Optionally drop queued (not yet active) OPFS L2 write payloads under severe pressure.
+      if (dropQueuedOpfsWrites && this._opfsL2WriteQueue.size > 0) {
+        queuedWritesDropped = this._opfsL2WriteQueue.size;
+        bytesFreed += this._opfsL2QueuedBytes;
+        this._stats.opfsL2WriteDrops += queuedWritesDropped;
+        this._clearOpfsL2WriteQueue();
+      }
+
+      if (bytesFreed > 0 || slabsEvicted > 0 || chunksEvicted > 0 || queuedWritesDropped > 0) {
+        this._stats.memoryReclaims += 1;
+        this._stats.bytesReclaimed += bytesFreed;
+      }
+
+      return {
+        bytesFreed,
+        slabsEvicted,
+        chunksEvicted,
+        queuedWritesDropped,
+        slabBytesCached: this._slabBytesCached,
+        bytesCached: this._bytesCached,
+        slabSize: this.slabSize,
+      };
+    }
+
+    reclaimMemory(options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      const fraction =
+        Number.isFinite(opts.fraction) && opts.fraction >= 0 && opts.fraction <= 1
+          ? opts.fraction
+          : 0.5;
+      const targetSlabBytes =
+        Number.isFinite(opts.targetSlabBytes) && opts.targetSlabBytes >= 0
+          ? Math.floor(opts.targetSlabBytes)
+          : Number.isFinite(opts.targetBytes) && opts.targetBytes >= 0
+            ? Math.floor(opts.targetBytes)
+            : Math.floor(this._slabBytesCached * (1 - fraction));
+      return this.trimToBytes(targetSlabBytes, {
+        dropQueuedOpfsWrites: Boolean(opts.dropQueuedOpfsWrites || targetSlabBytes === 0),
+        trimChunks: opts.trimChunks !== false,
+      });
     }
 
     _makeHttpError(status, url, rangeLabel) {
@@ -3172,26 +3634,37 @@
         try {
           let pending = deferreds;
           if (this._hasOpfsL2ForUrl(url)) {
-            const afterL2 = [];
-            for (let i = 0; i < deferreds.length; i += 1) {
-              const item = deferreds[i];
-              const knownNow = this.getFileSize(url);
-              const cStart = item.idx * this.chunkSize;
-              if (knownNow !== null && cStart >= knownNow) {
-                item.resolve(new Uint8Array(0));
-                continue;
-              }
-              const l2Bytes = await this._tryReadOpfsL2(url, cStart, this.chunkSize, knownNow);
-              if (l2Bytes !== null) {
-                if (l2Bytes.byteLength > 0) {
-                  this._putChunk(item.key, l2Bytes);
+            const afterL2 = new Array(deferreds.length).fill(null);
+            let nextIdx = 0;
+            const workerCount = Math.min(OPFS_L2_CHUNK_READ_CONCURRENCY, deferreds.length);
+            const runL2Worker = async () => {
+              while (nextIdx < deferreds.length) {
+                const pos = nextIdx;
+                nextIdx += 1;
+                const item = deferreds[pos];
+                const knownNow = this.getFileSize(url);
+                const cStart = item.idx * this.chunkSize;
+                if (knownNow !== null && cStart >= knownNow) {
+                  item.resolve(new Uint8Array(0));
+                  continue;
                 }
-                item.resolve(l2Bytes);
-              } else {
-                afterL2.push(item);
+                const l2Bytes = await this._tryReadOpfsL2(url, cStart, this.chunkSize, knownNow);
+                if (l2Bytes !== null) {
+                  if (l2Bytes.byteLength > 0) {
+                    this._putChunk(item.key, l2Bytes);
+                  }
+                  item.resolve(l2Bytes);
+                } else {
+                  afterL2[pos] = item;
+                }
               }
+            };
+            const l2Workers = [];
+            for (let w = 0; w < workerCount; w += 1) {
+              l2Workers.push(runL2Worker());
             }
-            pending = afterL2;
+            await Promise.all(l2Workers);
+            pending = afterL2.filter(Boolean);
             if (pending.length === 0) {
               return;
             }
@@ -3447,10 +3920,16 @@
         if (this._activeSlabFetches > this._stats.peakConcurrentSlabFetches) {
           this._stats.peakConcurrentSlabFetches = this._activeSlabFetches;
         }
-        return Promise.resolve();
+        return Promise.resolve(true);
       }
       return new Promise((resolve) => {
-        const waiter = { resolve, priority: isPrefetch ? 1 : 0 };
+        const waiter = {
+          resolve,
+          priority: isPrefetch ? 1 : 0,
+          url: meta ? meta.url : null,
+          key: meta ? meta.key : null,
+          cancelled: false,
+        };
         if (meta) {
           meta.waiter = waiter;
         }
@@ -3470,8 +3949,36 @@
       });
     }
 
+    _countQueuedPrefetchWaiters() {
+      let count = 0;
+      for (let i = 0; i < this._slabWaitQueue.length; i += 1) {
+        if (this._slabWaitQueue[i].priority > 0) {
+          count += 1;
+        }
+      }
+      return count;
+    }
+
+    _cancelQueuedPrefetchesForUrl(url) {
+      if (!url || this._slabWaitQueue.length === 0) {
+        return 0;
+      }
+      let cancelled = 0;
+      for (let i = this._slabWaitQueue.length - 1; i >= 0; i -= 1) {
+        const w = this._slabWaitQueue[i];
+        if (w.priority > 0 && w.url === url) {
+          this._slabWaitQueue.splice(i, 1);
+          w.cancelled = true;
+          cancelled += 1;
+          this._stats.slabPrefetchCancelled += 1;
+          w.resolve(false);
+        }
+      }
+      return cancelled;
+    }
+
     _promoteSlabWaiter(waiter) {
-      if (!waiter || waiter.priority === 0) {
+      if (!waiter || waiter.priority === 0 || waiter.cancelled) {
         return;
       }
       const idx = this._slabWaitQueue.indexOf(waiter);
@@ -3494,7 +4001,7 @@
       const limit = Math.max(1, this.maxConcurrentSlabFetches || DEFAULT_MAX_CONCURRENT_SLAB_FETCHES);
       if (this._slabWaitQueue.length > 0 && this._activeSlabFetches <= limit) {
         const next = this._slabWaitQueue.shift();
-        next.resolve();
+        next.resolve(true);
         return;
       }
       if (this._activeSlabFetches > 0) {
@@ -3506,7 +4013,7 @@
           this._stats.peakConcurrentSlabFetches = this._activeSlabFetches;
         }
         const next = this._slabWaitQueue.shift();
-        next.resolve();
+        next.resolve(true);
       }
     }
 
@@ -3522,8 +4029,10 @@
             if (!existingMeta.prefetchHitCounted) {
               existingMeta.prefetchHitCounted = true;
               this._stats.prefetchHits += 1;
+              this._recordPrefetchConsumed(key);
             }
             if (existingMeta.waiter) {
+              existingMeta.promoted = true;
               this._promoteSlabWaiter(existingMeta.waiter);
             }
           }
@@ -3531,7 +4040,7 @@
         return existing;
       }
 
-      const meta = { isPrefetch, prefetchHitCounted: false, waiter: null };
+      const meta = { isPrefetch, prefetchHitCounted: false, promoted: false, waiter: null, url, key };
 
       const promise = (async () => {
         const slabStart = slabIndex * this.slabSize;
@@ -3543,7 +4052,7 @@
         if (this._hasOpfsL2ForUrl(url)) {
           const l2Hit = await this._tryReadOpfsL2(url, slabStart, this.slabSize, knownSizeBefore);
           if (l2Hit !== null) {
-            this._putSlab(key, l2Hit);
+            this._putSlab(key, l2Hit, { isPrefetch: meta.isPrefetch && !meta.prefetchHitCounted });
             if (meta.isPrefetch && !meta.prefetchHitCounted && this._slabs.has(key)) {
               this._prefetchedSlabKeys.add(key);
             }
@@ -3551,8 +4060,16 @@
           }
         }
 
-        await this._acquireSlabSlot(isPrefetch, meta);
+        const acquired = await this._acquireSlabSlot(isPrefetch, meta);
         meta.waiter = null;
+        if (!acquired) {
+          // Prefetch waiter was cancelled before obtaining a network slot (e.g. distant random seek).
+          return new Uint8Array(0);
+        }
+        const countedDemand = !meta.isPrefetch || meta.promoted;
+        if (countedDemand) {
+          this._activeDemandSlabFetches += 1;
+        }
         try {
           const knownSize = this.getFileSize(url);
           if (knownSize !== null && slabStart >= knownSize) {
@@ -3597,7 +4114,9 @@
                   ? first.bytes
                   : first.bytes.slice(relStart, relStart + takeLen);
               if (slabBytes.byteLength > 0) {
-                this._putSlab(key, slabBytes);
+                this._putSlab(key, slabBytes, {
+                  isPrefetch: meta.isPrefetch && !meta.prefetchHitCounted,
+                });
                 if (meta.isPrefetch && !meta.prefetchHitCounted && this._slabs.has(key)) {
                   this._prefetchedSlabKeys.add(key);
                 }
@@ -3647,7 +4166,9 @@
               pos += parts[i].byteLength;
             }
             if (combined.byteLength > 0) {
-              this._putSlab(key, combined);
+              this._putSlab(key, combined, {
+                isPrefetch: meta.isPrefetch && !meta.prefetchHitCounted,
+              });
               if (meta.isPrefetch && !meta.prefetchHitCounted && this._slabs.has(key)) {
                 this._prefetchedSlabKeys.add(key);
               }
@@ -3659,7 +4180,13 @@
           return new Uint8Array(0);
         } finally {
           meta.waiter = null;
+          if (countedDemand) {
+            this._activeDemandSlabFetches = Math.max(0, this._activeDemandSlabFetches - 1);
+          }
           this._releaseSlabSlot();
+          if (this._activeDemandSlabFetches === 0 && this._opfsL2WriteQueue.size > 0) {
+            this._pumpOpfsL2WriteQueue();
+          }
         }
       })();
 
@@ -3682,17 +4209,33 @@
         return 0;
       }
       const endOffset = offset + length;
+      const maxBackwardJitter = Math.min(8 * 64 * 1024, this.slabSize);
+      const maxForwardGap = Math.min(256 * 1024, this.slabSize);
       let tracker = this._streamTrackers.get(url);
       if (tracker) {
         this._streamTrackers.delete(url);
-        const isSequential =
-          offset >= tracker.lastOffset &&
-          offset <= tracker.lastEndOffset + this.slabSize &&
-          (endOffset > tracker.lastEndOffset || lastSlab > tracker.lastSlabIndex);
-        if (isSequential) {
-          tracker.sequentialCount = Math.min(tracker.sequentialCount + 1, 1024);
+        const frontierEnd = tracker.frontierEndOffset;
+        const withinFrontierWindow =
+          offset >= Math.max(0, frontierEnd - maxBackwardJitter) &&
+          offset <= frontierEnd + maxForwardGap;
+        const advancesFrontier = endOffset > frontierEnd || lastSlab > tracker.frontierSlabIndex;
+        if (withinFrontierWindow) {
+          if (advancesFrontier || (offset !== tracker.lastOffset && offset >= frontierEnd - maxBackwardJitter)) {
+            tracker.sequentialCount = Math.min(tracker.sequentialCount + 1, 1024);
+          }
+          if (endOffset > tracker.frontierEndOffset) {
+            tracker.frontierEndOffset = endOffset;
+          }
+          if (lastSlab > tracker.frontierSlabIndex) {
+            tracker.frontierSlabIndex = lastSlab;
+          }
         } else {
+          // Distant random seek: reset sequential streak and cancel still-queued prefetch waiters
+          // for this URL so they do not consume network slots or evict hot slabs.
           tracker.sequentialCount = 1;
+          tracker.frontierEndOffset = endOffset;
+          tracker.frontierSlabIndex = lastSlab;
+          this._cancelQueuedPrefetchesForUrl(url);
         }
         tracker.lastOffset = offset;
         tracker.lastEndOffset = endOffset;
@@ -3708,13 +4251,21 @@
           lastOffset: offset,
           lastEndOffset: endOffset,
           lastSlabIndex: lastSlab,
+          frontierEndOffset: endOffset,
+          frontierSlabIndex: lastSlab,
           sequentialCount: 1,
         };
       }
       this._streamTrackers.set(url, tracker);
 
       if (tracker.sequentialCount >= this.sequentialThresholdReads) {
-        return this._scheduleSlabPrefetch(url, lastSlab + 1, this.prefetchAheadSlabs);
+        const backoff = this._urlPrefetchBackoff.get(url);
+        if (backoff && backoff.suppressReads > 0) {
+          backoff.suppressReads -= 1;
+          return 0;
+        }
+        const targetNextSlab = Math.max(lastSlab, tracker.frontierSlabIndex) + 1;
+        return this._scheduleSlabPrefetch(url, targetNextSlab, this.prefetchAheadSlabs);
       }
       return 0;
     }
@@ -3740,10 +4291,14 @@
         return 0;
       }
 
+      const maxQueuedPrefetches = Math.max(4, this.maxConcurrentSlabFetches * 2);
       const knownSize = this.getFileSize(url);
       let scheduled = 0;
 
       for (let i = 0; i < boundedCount; i += 1) {
+        if (this._countQueuedPrefetchWaiters() >= maxQueuedPrefetches) {
+          break;
+        }
         const slabIdx = startSlabIndex + i;
         const slabStart = slabIdx * this.slabSize;
         if (knownSize !== null && slabStart >= knownSize) {
@@ -3872,18 +4427,26 @@
 
       if (prevSlabSize !== this.slabSize || !this._isSlabModeEnabled()) {
         this._slabs.clear();
+        this._probationSlabs.clear();
+        this._protectedSlabs.clear();
+        this._probationSlabBytes = 0;
+        this._protectedSlabBytes = 0;
+        this._slabLastSwitch.clear();
+        this._lastAccessedSlabKey = null;
         this._prefetchedSlabKeys.clear();
         this._slabBytesCached = 0;
         this._streamTrackers.clear();
+        this._urlPrefetchBackoff.clear();
       } else {
         while (this._slabBytesCached > this.slabMaxBytes && this._slabs.size > 0) {
-          const oldestKey = this._slabs.keys().next().value;
-          const oldestBytes = this._slabs.get(oldestKey);
-          this._slabs.delete(oldestKey);
-          this._prefetchedSlabKeys.delete(oldestKey);
-          this._slabBytesCached -= oldestBytes.byteLength;
-          this._stats.slabEvictions += 1;
+          const freed = this._evictOneSlab();
+          if (freed <= 0) break;
         }
+      }
+      // Clear dormant legacy chunk pool when slab mode is active to prevent dual-pool RAM bloat.
+      if (this._isSlabModeEnabled() && this._chunks.size > 0) {
+        this._chunks.clear();
+        this._bytesCached = 0;
       }
 
       return {
@@ -3904,6 +4467,7 @@
           this._stats.slabHits += 1;
           if (this._prefetchedSlabKeys.delete(key)) {
             this._stats.prefetchHits += 1;
+            this._recordPrefetchConsumed(key);
           }
           if (cacheFlagsOut) {
             cacheFlagsOut[slotIdx] = true;
@@ -4049,6 +4613,7 @@
           this._stats.slabHits += 1;
           if (this._prefetchedSlabKeys.delete(key)) {
             this._stats.prefetchHits += 1;
+            this._recordPrefetchConsumed(key);
           }
           const slabStart = firstSlab * this.slabSize;
           const sliceStart = offset - slabStart;
@@ -4076,6 +4641,7 @@
           this._stats.slabHits += 1;
           if (this._prefetchedSlabKeys.delete(key)) {
             this._stats.prefetchHits += 1;
+            this._recordPrefetchConsumed(key);
           }
           if (!slab || slab.byteLength === 0) {
             break;
@@ -4278,6 +4844,7 @@
           this._stats.slabHits += 1;
           if (this._prefetchedSlabKeys.delete(key)) {
             this._stats.prefetchHits += 1;
+            this._recordPrefetchConsumed(key);
           }
           const slabStart = firstSlab * this.slabSize;
           const sliceStart = offset - slabStart;
@@ -4514,15 +5081,24 @@
     clear() {
       this._chunks.clear();
       this._slabs.clear();
+      this._probationSlabs.clear();
+      this._protectedSlabs.clear();
+      this._probationSlabBytes = 0;
+      this._protectedSlabBytes = 0;
+      this._slabLastSwitch.clear();
+      this._lastAccessedSlabKey = null;
       this._prefetchedSlabKeys.clear();
+      this._urlPrefetchBackoff.clear();
       this._fileMeta.clear();
       this._fileFingerprints.clear();
       this._negativeCache.clear();
       this._streamTrackers.clear();
-      this._opfsL2WriteQueue.clear();
-      this._inFlightOpfsL2WriteKeys.clear();
+      this._clearOpfsL2WriteQueue();
+      // Preserve _inFlightOpfsL2WriteKeys so active SyncAccessHandle writes cannot be collided
+      // with if a concurrent write for the same key arrives immediately after clear().
       this._inFlightOpfsL2WritePayloads.clear();
       this._opfsL2Entries.clear();
+      this._opfsL2TotalBytes = 0;
       this._opfsL2ValidatedFingerprints.clear();
       this._resetOpfsDirIndex();
       this._bytesCached = 0;
@@ -4549,6 +5125,11 @@
         slabPrefetchesScheduled: this._stats.slabPrefetchesScheduled,
         slabPrefetchesCompleted: this._stats.slabPrefetchesCompleted,
         slabPrefetchErrors: this._stats.slabPrefetchErrors,
+        slabPrefetchWasted: this._stats.slabPrefetchWasted,
+        slabPrefetchCancelled: this._stats.slabPrefetchCancelled,
+        slabProtectedEntries: this._protectedSlabs.size,
+        slabProbationEntries: this._probationSlabs.size,
+        slabProtectedPromotions: this._stats.slabProtectedPromotions,
         prefetchHits: this._stats.prefetchHits,
         prefetchAheadSlabs: this.prefetchAheadSlabs,
         maxConcurrentSlabFetches: this.maxConcurrentSlabFetches,
@@ -4568,7 +5149,12 @@
         opfsL2Misses: this._stats.opfsL2Misses,
         opfsL2Writes: this._stats.opfsL2Writes,
         opfsL2WriteErrors: this._stats.opfsL2WriteErrors,
+        opfsL2WriteDrops: this._stats.opfsL2WriteDrops,
+        opfsL2ProactiveEvictions: this._stats.opfsL2ProactiveEvictions,
         opfsL2Invalidations: this._stats.opfsL2Invalidations,
+        opfsL2QueuedBytes: this._opfsL2QueuedBytes,
+        memoryReclaims: this._stats.memoryReclaims,
+        bytesReclaimed: this._stats.bytesReclaimed,
         bytesCached: this._bytesCached,
         maxBytes: this.maxBytes,
         chunkSize: this.chunkSize,
@@ -5098,6 +5684,7 @@
         opfsL2RequireEtag: options.opfsL2RequireEtag,
         fileFingerprints: options.fileFingerprints,
         maxPendingOpfsL2Writes: options.maxPendingOpfsL2Writes,
+        maxPendingOpfsL2WriteBytes: options.maxPendingOpfsL2WriteBytes,
         maxOpfsL2WriteConcurrency: options.maxOpfsL2WriteConcurrency,
         opfsL2MaxBytes: options.opfsL2MaxBytes,
         now: typeof options.now === 'function' ? options.now : undefined,
@@ -5111,6 +5698,11 @@
         Number.isFinite(rawWholeFileMax) && rawWholeFileMax >= 0
           ? Math.floor(rawWholeFileMax)
           : DEFAULT_WHOLE_FILE_MAX_BYTES;
+      const rawWholeFileTotalMax = options.wholeFileTotalMaxBytes;
+      this._wholeFileTotalMaxBytes =
+        Number.isFinite(rawWholeFileTotalMax) && rawWholeFileTotalMax >= 0
+          ? Math.floor(rawWholeFileTotalMax)
+          : Math.max(this._wholeFileMaxBytes, DEFAULT_WHOLE_FILE_TOTAL_MAX_BYTES);
       this._schedulerOptions = {
         maxConcurrency: options.maxConcurrency,
         maxRetries: options.maxRetries,
@@ -5288,6 +5880,7 @@
           opfsL2RequireEtag: this._immutableCacheOptions.opfsL2RequireEtag,
           fileFingerprints: this._immutableCacheOptions.fileFingerprints,
           maxPendingOpfsL2Writes: this._immutableCacheOptions.maxPendingOpfsL2Writes,
+          maxPendingOpfsL2WriteBytes: this._immutableCacheOptions.maxPendingOpfsL2WriteBytes,
           maxOpfsL2WriteConcurrency: this._immutableCacheOptions.maxOpfsL2WriteConcurrency,
           opfsL2MaxBytes: this._immutableCacheOptions.opfsL2MaxBytes,
           now: this._immutableCacheOptions.now,
@@ -5304,6 +5897,33 @@
       if (this.rangeCache && typeof this.rangeCache.flushOpfsWrites === 'function') {
         await this.rangeCache.flushOpfsWrites();
       }
+    }
+
+    reclaimMemory(options = {}) {
+      const opts = options && typeof options === 'object' ? options : {};
+      let bytesFreed = 0;
+      let immutableResult = null;
+      let rangeResult = null;
+
+      if (this.immutableCache && typeof this.immutableCache.reclaimMemory === 'function') {
+        immutableResult = this.immutableCache.reclaimMemory(opts);
+        bytesFreed += immutableResult.bytesFreed || 0;
+      }
+      if (this.rangeCache && typeof this.rangeCache.reclaimMemory === 'function') {
+        rangeResult = this.rangeCache.reclaimMemory(opts);
+        bytesFreed += rangeResult.bytesFreed || 0;
+      }
+
+      return {
+        ok: true,
+        bytesFreed,
+        immutableCache: immutableResult,
+        rangeCache: rangeResult,
+      };
+    }
+
+    trimCache(options = {}) {
+      return this.reclaimMemory(options);
     }
 
     tuneSlabCache(profileOrOptions = 'video4k') {
@@ -5347,6 +5967,16 @@
       return Boolean(this._getFetchImpl());
     }
 
+    _getActiveWholeFileBytes() {
+      let total = 0;
+      for (const rec of this._activeWholeFiles.values()) {
+        if (rec && rec.bytes) {
+          total += rec.bytes.byteLength;
+        }
+      }
+      return total;
+    }
+
     _retainWholeFile(url, bytes, size) {
       let rec = this._activeWholeFiles.get(url);
       if (!rec) {
@@ -5372,11 +6002,6 @@
     }
 
     async _fetchWholeFile(url, cleanPath, knownSize) {
-      const cap = this._wholeFileMaxBytes;
-      if (!this._wholeFileBufferEnabled || cap <= 0) {
-        return { ok: true, buffered: false, size: knownSize };
-      }
-
       const existing = this._activeWholeFiles.get(url);
       if (existing) {
         return {
@@ -5386,6 +6011,16 @@
           size: existing.size,
           reused: true,
         };
+      }
+
+      const activeTotal = this._getActiveWholeFileBytes();
+      const remainingTotal = Math.max(0, this._wholeFileTotalMaxBytes - activeTotal);
+      const cap = Math.min(this._wholeFileMaxBytes, remainingTotal);
+      if (!this._wholeFileBufferEnabled || cap <= 0) {
+        if (this._wholeFileBufferEnabled && this._wholeFileMaxBytes > 0 && remainingTotal <= 0) {
+          this._wholeFileStats.fallbacks += 1;
+        }
+        return { ok: true, buffered: false, size: knownSize, probed: false };
       }
 
       const immCache =
@@ -7596,6 +8231,14 @@
       if (Number.isFinite(nextWholeMax) && nextWholeMax >= 0) {
         this._wholeFileMaxBytes = Math.floor(nextWholeMax);
       }
+      if (Number.isFinite(opts.wholeFileTotalMaxBytes) && opts.wholeFileTotalMaxBytes >= 0) {
+        this._wholeFileTotalMaxBytes = Math.floor(opts.wholeFileTotalMaxBytes);
+      } else if (Number.isFinite(nextWholeMax) && nextWholeMax >= 0) {
+        this._wholeFileTotalMaxBytes = Math.max(
+          this._wholeFileTotalMaxBytes,
+          this._wholeFileMaxBytes,
+        );
+      }
       if (typeof opts.fetchImpl === 'function') {
         this.fetchImpl = opts.fetchImpl;
       }
@@ -7701,6 +8344,10 @@
         opts.maxPendingOpfsL2Writes !== undefined
           ? opts.maxPendingOpfsL2Writes
           : this._immutableCacheOptions.maxPendingOpfsL2Writes;
+      const resolvedMaxPendingOpfsL2WriteBytes =
+        opts.maxPendingOpfsL2WriteBytes !== undefined
+          ? opts.maxPendingOpfsL2WriteBytes
+          : this._immutableCacheOptions.maxPendingOpfsL2WriteBytes;
       const resolvedMaxOpfsL2WriteConcurrency =
         opts.maxOpfsL2WriteConcurrency !== undefined
           ? opts.maxOpfsL2WriteConcurrency
@@ -7719,6 +8366,7 @@
       this._immutableCacheOptions.opfsL2RequireEtag = resolvedOpfsL2RequireEtag;
       this._immutableCacheOptions.fileFingerprints = resolvedFileFingerprints;
       this._immutableCacheOptions.maxPendingOpfsL2Writes = resolvedMaxPendingOpfsL2Writes;
+      this._immutableCacheOptions.maxPendingOpfsL2WriteBytes = resolvedMaxPendingOpfsL2WriteBytes;
       this._immutableCacheOptions.maxOpfsL2WriteConcurrency = resolvedMaxOpfsL2WriteConcurrency;
       this._immutableCacheOptions.opfsL2MaxBytes = resolvedOpfsL2MaxBytes;
 
@@ -7760,6 +8408,7 @@
           opfsL2RequireEtag: resolvedOpfsL2RequireEtag,
           fileFingerprints: resolvedFileFingerprints,
           maxPendingOpfsL2Writes: resolvedMaxPendingOpfsL2Writes,
+          maxPendingOpfsL2WriteBytes: resolvedMaxPendingOpfsL2WriteBytes,
           maxOpfsL2WriteConcurrency: resolvedMaxOpfsL2WriteConcurrency,
           opfsL2MaxBytes: resolvedOpfsL2MaxBytes,
           now:
@@ -8068,6 +8717,23 @@
           if (this.postMessage) {
             this.postMessage({ id: m.id, ok: closed, closed });
           }
+        } else if (
+          m.reclaimMemory ||
+          m.trimCache ||
+          m.type === 'memory-pressure' ||
+          m.type === 'trim-transient-memory' ||
+          m.type === 'memory-reclaim'
+        ) {
+          const reclaimOpts =
+            m.reclaimMemory && typeof m.reclaimMemory === 'object'
+              ? m.reclaimMemory
+              : m.trimCache && typeof m.trimCache === 'object'
+                ? m.trimCache
+                : m;
+          const result = this.reclaimMemory(reclaimOpts);
+          if (this.postMessage) {
+            this.postMessage(Object.assign({ id: m.id }, result));
+          }
         } else if (m.tuneSlabCache) {
           const target =
             typeof m.tuneSlabCache === 'string'
@@ -8177,6 +8843,7 @@
     DEFAULT_IMMUTABLE_CHUNK_SIZE,
     DEFAULT_IMMUTABLE_MAX_BYTES,
     DEFAULT_WHOLE_FILE_MAX_BYTES,
+    DEFAULT_WHOLE_FILE_TOTAL_MAX_BYTES,
     DEFAULT_SLAB_SIZE,
     DEFAULT_SLAB_MAX_BYTES,
     MAX_SLAB_SIZE,
@@ -8192,6 +8859,7 @@
     DEFAULT_BATCH_COALESCE_MAX_BYTES,
     DEFAULT_HOT_OPFS_RPF_ALLOWLIST,
     DEFAULT_OPFS_L2_MAX_PENDING_WRITES,
+    DEFAULT_OPFS_L2_MAX_PENDING_WRITE_BYTES,
     DEFAULT_OPFS_L2_MAX_WRITE_CONCURRENCY,
     DEFAULT_OPFS_L2_MAX_BYTES,
     ImmutableHttpfsCache,

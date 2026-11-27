@@ -1509,6 +1509,397 @@ class TestServeLocalRangeFastpath(unittest.TestCase):
                 self.assertIn("GET", hdr405.get("Allow", ""))
                 self.assertEqual(body405, b"")
 
+    def test_resolved_path_cache_skips_repeat_realpath_invalidates_on_mutate_and_blocks_traversal(self) -> None:
+        orig_realpath = os.path.realpath
+        realpath_calls = 0
+
+        def _counting_realpath(path, *, strict=False):
+            nonlocal realpath_calls
+            realpath_calls += 1
+            return orig_realpath(path, strict=strict)
+
+        path_cache = self.httpd.resolved_path_cache
+        self.assertIsNotNone(path_cache)
+        assert path_cache is not None
+
+        with mock.patch.object(serve_local.os.path, "realpath", side_effect=_counting_realpath):
+            # 1st request populates resolved_path_cache (1 realpath call).
+            st1, hdr1, body1 = self._request(
+                "GET", "/data/splash.wgsl.pack", {"Range": "bytes=0-1023"}
+            )
+            self.assertEqual(st1, 206)
+            self.assertEqual(body1, self.large_payload[:1024])
+            self.assertEqual(realpath_calls, 1)
+
+            # Subsequent Range requests hit resolved_path_cache with 0 realpath calls.
+            for lo in (1024, 4096, 65536, 131072):
+                st_n, _, body_n = self._request(
+                    "GET", "/data/splash.wgsl.pack", {"Range": f"bytes={lo}-{lo + 1023}"}
+                )
+                self.assertEqual(st_n, 206)
+                self.assertEqual(body_n, self.large_payload[lo : lo + 1024])
+            self.assertEqual(realpath_calls, 1)
+
+        # Traversal attempts must never enter or hit resolved_path_cache.
+        size_before_trav = len(path_cache)
+        for bad_url in ("/data/../web/index.html", "/data/%2e%2e/web/index.html", "/data/a%00b.rpf"):
+            st_bad, hdr_bad, _ = self._request("GET", bad_url)
+            self.assertEqual(st_bad, 404)
+            self._assert_coop_coep(hdr_bad)
+        self.assertEqual(len(path_cache), size_before_trav)
+
+        # Updating, truncating, and deleting a cached path must reflect immediately.
+        dyn = self.data_root / "dyn.rpf"
+        dyn.write_bytes(b"VERSION-ONE-0123456789")
+        st_v1, hdr_v1, body_v1 = self._request("GET", "/data/dyn.rpf", {"Range": "bytes=0-10"})
+        self.assertEqual(st_v1, 206)
+        self.assertEqual(body_v1, b"VERSION-ONE")
+
+        dyn.write_bytes(b"V2-SHORT")
+        st_v2, hdr_v2, body_v2 = self._request("GET", "/data/dyn.rpf", {"Range": "bytes=0-7"})
+        self.assertEqual(st_v2, 206)
+        self.assertEqual(body_v2, b"V2-SHORT")
+        self.assertNotEqual(hdr_v2.get("ETag"), hdr_v1.get("ETag"))
+
+        dyn.unlink()
+        st_gone, _, body_gone = self._request("GET", "/data/dyn.rpf")
+        self.assertEqual(st_gone, 404)
+        self.assertEqual(body_gone, b"")
+
+    def test_cached_fd_zero_alloc_readinto_and_single_write_header_body_coalescing(self) -> None:
+        write_sizes: list[int] = []
+        orig_serve_file = serve_local.PlayGta6Handler._serve_file
+
+        def _spy_serve_file(handler_self, url_path: str, send_body: bool) -> None:
+            orig_write = handler_self.wfile.write
+
+            def _counting_write(data):
+                write_sizes.append(len(data))
+                return orig_write(data)
+
+            handler_self.wfile.write = _counting_write
+            try:
+                orig_serve_file(handler_self, url_path, send_body)
+            finally:
+                handler_self.wfile.write = orig_write
+
+        with mock.patch.object(serve_local.PlayGta6Handler, "_serve_file", _spy_serve_file):
+            conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+            try:
+                # 64 KiB Range request must coalesce headers + payload into a single socket write.
+                conn.request("GET", "/data/splash.wgsl.pack", headers={"Range": "bytes=0-65535"})
+                resp1 = conn.getresponse()
+                body1 = resp1.read()
+                self.assertEqual(resp1.status, 206)
+                self.assertFalse(resp1.will_close)
+                self.assertEqual(body1, self.large_payload[:65536])
+                self.assertEqual(len(write_sizes), 1, f"Expected 1 coalesced write, got {write_sizes}")
+                self.assertGreater(write_sizes[0], 65536)
+
+                # Follow-up request on the same keep-alive connection stays cleanly framed.
+                write_sizes.clear()
+                conn.request(
+                    "GET", "/data/splash.wgsl.pack", headers={"Range": "bytes=65536-131071"}
+                )
+                resp2 = conn.getresponse()
+                body2 = resp2.read()
+                self.assertEqual(resp2.status, 206)
+                self.assertFalse(resp2.will_close)
+                self.assertEqual(body2, self.large_payload[65536:131072])
+                self.assertEqual(len(write_sizes), 1)
+            finally:
+                conn.close()
+
+        # Verify mid-stream truncation on cached readinto_at invalidates entry and closes connection.
+        trunc_file = self.data_root / "trunc_test.rpf"
+        trunc_file.write_bytes(b"ABCDEFGH")
+        trunc_cache = serve_local.ReadOnlyFileHandleCache(max_entries=4)
+        try:
+            entry = trunc_cache.acquire(trunc_file, trunc_file.stat())
+            self.assertIsNotNone(entry)
+            assert entry is not None
+
+            sent = bytearray()
+
+            class _FakeSockWfile:
+                _sock = object()
+
+                def write(self, data) -> int:
+                    sent.extend(data)
+                    return len(data)
+
+            handler = object.__new__(serve_local.PlayGta6Handler)
+            handler.wfile = _FakeSockWfile()
+            handler.close_connection = False
+            handler._headers_sent = False
+            handler._range_stream_chunk_bytes = 16
+            handler._stream_chunk_bytes = None
+            handler._stream_cached_file_range(
+                entry,
+                0,
+                32,  # longer than the 8-byte file -> triggers mid-stream EOF
+                trunc_cache,
+                chunk_bytes=16,
+                pending_headers=b"HTTP/1.1 206 Partial Content\r\n\r\n",
+            )
+            trunc_cache.release(entry)
+            self.assertTrue(handler.close_connection)
+            self.assertEqual(bytes(sent), b"HTTP/1.1 206 Partial Content\r\n\r\nABCDEFGH")
+            self.assertEqual(trunc_cache.stats()["entries"], 0)
+            self.assertEqual(trunc_cache.stats()["open_handles"], 0)
+        finally:
+            trunc_cache.close_all()
+
+    def test_expanded_cacheable_suffixes_cold_miss_donation_and_global_fd_cap(self) -> None:
+        # 1. Expanded suffixes enter ReadOnlyFileHandleCache; .html/.js still do not.
+        for name in (
+            "movie.bk2",
+            "intro.bik",
+            "bank.awc",
+            "font.ttpf",
+            "world.rpf9",
+            "splash.reflect.json",
+        ):
+            self.assertTrue(serve_local.is_cacheable_file_path(Path(name)), msg=name)
+        for name in ("index.html", "loader.js", "style.css", "data-manifest.json"):
+            self.assertFalse(serve_local.is_cacheable_file_path(Path(name)), msg=name)
+
+        reflect_file = self.data_root / "splash.reflect.json"
+        reflect_file.write_bytes(b'{"version":1,"shaders":[]}')
+        st1, hdr1, body1 = self._request(
+            "GET", "/data/splash.reflect.json", {"Range": "bytes=0-11"}
+        )
+        self.assertEqual(st1, 206)
+        self.assertEqual(body1, b'{"version":1')
+        cache = self.httpd.file_handle_cache
+        assert cache is not None
+        self.assertGreaterEqual(cache.stats()["entries"], 1)
+
+        reflect_file.write_bytes(b'{"version":2,"shaders":[1,2,3]}')
+        st2, hdr2, body2 = self._request(
+            "GET", "/data/splash.reflect.json", {"Range": "bytes=0-11"}
+        )
+        self.assertEqual(st2, 206)
+        self.assertEqual(body2, b'{"version":2')
+        self.assertNotEqual(hdr2.get("ETag"), hdr1.get("ETag"))
+
+        # 2. Cold-miss FD donation on non-pread avoids opening & discarding redundant FDs.
+        cold_file = self.data_root / "cold_herd.rpf"
+        cold_payload = _make_deterministic_bytes(128 * 1024)
+        cold_file.write_bytes(cold_payload)
+        cold_st = cold_file.stat()
+
+        with mock.patch.object(serve_local, "_HAS_PREAD", False):
+            herd_cache = serve_local.ReadOnlyFileHandleCache(
+                max_entries=4,
+                max_concurrent_fds_per_file=4,
+                max_total_open_fds=16,
+            )
+            open_calls = 0
+            open_lock = threading.Lock()
+            orig_open_fd = serve_local._open_readonly_fd
+            open_barrier = threading.Barrier(4, timeout=5.0)
+            use_barrier = threading.Barrier(4, timeout=5.0)
+
+            def _counting_open(path: Path) -> int:
+                nonlocal open_calls
+                with open_lock:
+                    open_calls += 1
+                    idx = open_calls
+                fd = orig_open_fd(path)
+                if idx <= 4:
+                    open_barrier.wait()
+                return fd
+
+            try:
+                with mock.patch.object(serve_local, "_open_readonly_fd", side_effect=_counting_open):
+                    def worker(i: int) -> bytes:
+                        entry = herd_cache.acquire(cold_file, cold_st)
+                        self.assertIsNotNone(entry)
+                        assert entry is not None
+                        try:
+                            with entry.borrow_fd() as reader:
+                                use_barrier.wait()
+                                return reader.read_at(i * 4096, 4096)
+                        finally:
+                            herd_cache.release(entry)
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                        results = list(pool.map(worker, range(4)))
+
+                for i, chunk in enumerate(results):
+                    self.assertEqual(chunk, cold_payload[i * 4096 : (i + 1) * 4096])
+                self.assertEqual(
+                    open_calls,
+                    4,
+                    f"Cold-miss donation should reuse all 4 opened FDs instead of reopening (got {open_calls})",
+                )
+                self.assertEqual(herd_cache.stats()["open_handles"], 4)
+            finally:
+                herd_cache.close_all()
+            self.assertEqual(herd_cache.stats()["open_handles"], 0)
+
+            # 3. Global max_total_open_fds trims idle pooled FDs across files without exceeding budget.
+            budget_cache = serve_local.ReadOnlyFileHandleCache(
+                max_entries=4,
+                max_concurrent_fds_per_file=4,
+                max_total_open_fds=6,
+            )
+            files = []
+            for idx in range(4):
+                p = self.data_root / f"budget_{idx}.rpf"
+                p.write_bytes(_make_deterministic_bytes(64 * 1024))
+                files.append((p, p.stat()))
+            try:
+                for p, st_f in files:
+                    b = threading.Barrier(4, timeout=5.0)
+
+                    def read_f(slot: int, path_obj=p, st_obj=st_f, bar=b) -> int:
+                        entry = budget_cache.acquire(path_obj, st_obj)
+                        assert entry is not None
+                        try:
+                            with entry.borrow_fd() as reader:
+                                bar.wait()
+                                return len(reader.read_at(slot * 1024, 1024))
+                        finally:
+                            budget_cache.release(entry)
+
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                        lens = list(pool.map(read_f, range(4)))
+                    self.assertEqual(lens, [1024] * 4)
+                    self.assertLessEqual(budget_cache.stats()["open_handles"], 6)
+            finally:
+                budget_cache.close_all()
+            self.assertEqual(budget_cache.stats()["open_handles"], 0)
+            self.assertEqual(budget_cache.stats()["pooled_handles"], 0)
+
+    def test_oversubscription_12_lanes_and_rfc_range_dump_disconnect_toctou_edge_cases(self) -> None:
+        # 1. 12 concurrent keep-alive lanes oversubscribing an 8-FD pool on one .wgsl.pack.
+        httpd = serve_local.create_server(
+            "127.0.0.1",
+            0,
+            self.web_root,
+            self.data_root,
+            dump_root=self.dump_root,
+            max_dump_file_bytes=256,
+            max_concurrent_fds_per_file=8,
+            quiet=True,
+        )
+        port = httpd.server_address[1]
+        cache = httpd.file_handle_cache
+        assert cache is not None
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            lanes = 12
+            barrier = threading.Barrier(lanes, timeout=10.0)
+
+            def oversub_lane(lane_idx: int) -> None:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+                try:
+                    barrier.wait()
+                    for step in range(8):
+                        start = ((lane_idx * 65536) + (step * 16384)) % (self.large_size - 65536)
+                        end = start + 65535
+                        conn.request(
+                            "GET", "/data/splash.wgsl.pack", headers={"Range": f"bytes={start}-{end}"}
+                        )
+                        resp = conn.getresponse()
+                        body = resp.read()
+                        self.assertEqual(resp.status, 206)
+                        self.assertFalse(resp.will_close)
+                        self.assertEqual(
+                            hashlib.sha256(body).hexdigest(),
+                            hashlib.sha256(self.large_payload[start : end + 1]).hexdigest(),
+                        )
+                finally:
+                    conn.close()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=lanes) as pool:
+                list(pool.map(oversub_lane, range(lanes)))
+
+            # 2. RFC 9110 Range edge cases: unknown unit & multi-range -> 200 OK; 0-byte file -> 416.
+            small = self.data_root / "small.rpf"
+            small_data = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            small.write_bytes(small_data)
+            empty_file = self.data_root / "empty.rpf"
+            empty_file.write_bytes(b"")
+
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            try:
+                for range_hdr in ("items=0-10", "bytes=0-15, 32-47"):
+                    conn.request("GET", "/data/small.rpf", headers={"Range": range_hdr})
+                    resp = conn.getresponse()
+                    body = resp.read()
+                    hdrs = dict(resp.getheaders())
+                    self.assertEqual(resp.status, 200, msg=range_hdr)
+                    self.assertFalse(resp.will_close)
+                    self._assert_coop_coep(hdrs)
+                    self.assertEqual(body, small_data)
+
+                conn.request("GET", "/data/empty.rpf", headers={"Range": "bytes=0-0"})
+                resp_empty = conn.getresponse()
+                body_empty = resp_empty.read()
+                hdr_empty = dict(resp_empty.getheaders())
+                self.assertEqual(resp_empty.status, 416)
+                self.assertEqual(hdr_empty.get("Content-Range"), "bytes */0")
+                self.assertEqual(body_empty, b"")
+            finally:
+                conn.close()
+
+            # 3. Early POST /__pg6_dump/ error responses drain small bodies cleanly on loopback.
+            for dump_path, body_bytes, expected_status in (
+                ("/__pg6_dump/../escape.bin", b"X" * 4096, 400),
+                ("/__pg6_dump/too_big.bin", b"Y" * 4096, 413),
+            ):
+                st_d, hdr_d, raw_d = self._request(
+                    "POST", dump_path, port=port, body=body_bytes
+                )
+                self.assertEqual(st_d, expected_status)
+                self._assert_coop_coep(hdr_d)
+                self.assertFalse(json.loads(raw_d.decode("utf-8"))["ok"])
+
+            # 4. TOCTOU fallback revalidation when cache.acquire() returns None after file mutates.
+            toctou_file = self.data_root / "toctou.rpf"
+            toctou_file.write_bytes(b"OLD-DATA-01234567")
+            new_bytes = b"NEW-REPLACED-PAYLOAD-9876543210!"
+
+            orig_acquire = cache.acquire
+
+            def _mutate_and_miss(path: Path, st_obj: os.stat_result, *, realpath=None):
+                if path.name == "toctou.rpf":
+                    toctou_file.write_bytes(new_bytes)
+                    return None
+                return orig_acquire(path, st_obj, realpath=realpath)
+
+            with mock.patch.object(cache, "acquire", side_effect=_mutate_and_miss):
+                st_t, hdr_t, body_t = self._request(
+                    "GET", "/data/toctou.rpf", {"Range": "bytes=0-15"}, port=port
+                )
+            self.assertEqual(st_t, 206)
+            self.assertEqual(body_t, new_bytes[:16])
+            self.assertEqual(hdr_t.get("Content-Range"), f"bytes 0-15/{len(new_bytes)}")
+            self.assertEqual(hdr_t.get("ETag"), serve_local.compute_etag(toctou_file.stat()))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=2)
+
+        self.assertEqual(cache.stats()["open_handles"], 0)
+        self.assertEqual(cache.stats()["pooled_handles"], 0)
+
+        # 5. Extended Winsock/POSIX disconnect codes are classified quietly.
+        ws_err = OSError("socket shutdown")
+        ws_err.winerror = 10058  # WSAESHUTDOWN
+        self.assertTrue(serve_local._is_client_disconnect_error(ws_err))
+        if hasattr(errno, "ENOTCONN"):
+            self.assertTrue(
+                serve_local._is_client_disconnect_error(OSError(errno.ENOTCONN, "not connected"))
+            )
+        self.assertFalse(
+            serve_local._is_client_disconnect_error(OSError(errno.EACCES, "permission denied"))
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

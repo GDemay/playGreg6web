@@ -1796,3 +1796,224 @@ test('W312: resetStats clears all telemetry counters cleanly while preserving li
   assert.equal(warmFetch.calls.length, 0);
   assert.equal(warmCache.getStats().opfsHits, 1);
 });
+
+test('SLRU scan-resistance, trimToBytes/reclaimMemory, clear(), subarray buffer ownership & OPFS write byte cap', async () => {
+  const KiB = 1024;
+  const chunkSize = 64 * KiB;
+  const hotFile = makePatternBytes(4 * chunkSize, 0x1a);
+  const scanFile = makePatternBytes(20 * chunkSize, 0x2b);
+  const mock = createMockRangeFetch(
+    new Map([
+      ['game/shaders.rpf', hotFile],
+      ['game/levels.rpf', scanFile],
+    ]),
+  );
+
+  // Budget fits 8 chunks (>= SLRU_MIN_CHUNKS), so 2-segment SLRU activates.
+  const cache = new RangeCache({
+    chunkSize,
+    maxBytes: 8 * chunkSize,
+    enableReadAhead: false,
+    fetchImpl: mock.fetchImpl,
+  });
+
+  // Warm 4 hot chunks and revisit them across switches to promote to Protected.
+  for (let pass = 0; pass < 2; pass += 1) {
+    for (let c = 0; c < 4; c += 1) {
+      const out = await cache.read('game/shaders.rpf', c * chunkSize, 1024);
+      assert.deepEqual(out, hotFile.subarray(c * chunkSize, c * chunkSize + 1024));
+    }
+  }
+  assert.equal(cache._protectedChunks.size, 4);
+
+  // Scan 20 chunks of levels.rpf (2.5x total budget).
+  for (let c = 0; c < 20; c += 1) {
+    const out = await cache.read('game/levels.rpf', c * chunkSize, chunkSize);
+    assert.deepEqual(out, scanFile.subarray(c * chunkSize, (c + 1) * chunkSize));
+    assert.ok(cache.getStats().bytesCached <= 8 * chunkSize);
+  }
+
+  // Hot shaders.rpf chunks must survive in Protected with 0 refetches!
+  const callsBefore = mock.calls.length;
+  for (let c = 0; c < 4; c += 1) {
+    const out = await cache.read('game/shaders.rpf', c * chunkSize + 16, 1024);
+    assert.deepEqual(out, hotFile.subarray(c * chunkSize + 16, c * chunkSize + 1040));
+  }
+  assert.equal(mock.calls.length, callsBefore, 'Protected chunks must survive sequential scan');
+
+  // Verify _putMemory normalizes subarray backing-buffer ownership so oversized buffers are not pinned.
+  const oversized = new Uint8Array(512 * KiB);
+  oversized.fill(0x99);
+  cache._putMemory('synthetic::subarray', oversized.subarray(128, 128 + 4096));
+  const storedSub = cache._memCache.get('synthetic::subarray');
+  assert.equal(storedSub.byteLength, 4096);
+  assert.equal(storedSub.buffer.byteLength, 4096, 'Stored subarray must own a tightly-sized ArrayBuffer');
+
+  // trimToBytes / reclaimMemory evicts Probation before Protected and respects targetBytes.
+  const reclaimed = cache.reclaimMemory({ targetBytes: 4 * chunkSize });
+  assert.ok(reclaimed.bytesFreed > 0);
+  assert.ok(cache.getStats().bytesCached <= 4 * chunkSize);
+  assert.equal(cache._protectedChunks.size, 4, 'Probation entries must be reclaimed before Protected');
+
+  // Byte-bounded OPFS write queue + clear() clearing queued writes.
+  let releaseWrite;
+  const blockedOpfs = {
+    async getFileHandle() {
+      return {
+        async createWritable() {
+          return {
+            async write() {
+              await new Promise((r) => {
+                releaseWrite = r;
+              });
+            },
+            async close() {},
+          };
+        },
+      };
+    },
+  };
+  const qCache = new RangeCache({
+    chunkSize,
+    maxBytes: 8 * chunkSize,
+    enableReadAhead: false,
+    maxPendingOpfsWriteBytes: 2 * chunkSize,
+    maxOpfsWriteConcurrency: 1,
+    opfsDir: blockedOpfs,
+    fetchImpl: mock.fetchImpl,
+  });
+  for (let c = 0; c < 5; c += 1) {
+    await qCache.read('game/levels.rpf', c * chunkSize, chunkSize);
+  }
+  assert.ok(qCache._opfsQueuedBytes <= 2 * chunkSize);
+  assert.ok(qCache._opfsWriteQueue.size <= 2);
+  qCache.clear();
+  assert.equal(qCache._opfsWriteQueue.size, 0);
+  assert.equal(qCache._opfsQueuedBytes, 0);
+  assert.equal(qCache._probationChunks.size, 0);
+  assert.equal(qCache._protectedChunks.size, 0);
+  if (releaseWrite) releaseWrite();
+});
+
+test('RangeCache deduplicates concurrent OPFS lookups, prefers SyncAccessHandle on read, and avoids double-counting readRanges hits', async () => {
+  const KiB = 1024;
+  const chunkSize = 64 * KiB;
+  const fileBytes = makePatternBytes(4 * chunkSize, 0x4c);
+  const fp = buildFileFingerprint(fileBytes.byteLength, '"sync-fp"');
+
+  let opfsOpenCount = 0;
+  let syncReads = 0;
+  let getFileReads = 0;
+  const rawFiles = new Map();
+
+  // Seed chunk 0 in OPFS mock supporting both createSyncAccessHandle and getFile.
+  const opfsDir = {
+    async getFileHandle(name, opts = {}) {
+      if (!rawFiles.has(name)) {
+        if (!opts.create) {
+          const e = new Error('NotFoundError');
+          e.name = 'NotFoundError';
+          throw e;
+        }
+        rawFiles.set(name, new Uint8Array(0));
+      }
+      opfsOpenCount += 1;
+      await new Promise((r) => setTimeout(r, 5));
+      return {
+        async createSyncAccessHandle() {
+          let buf = rawFiles.get(name).slice();
+          return {
+            getSize() {
+              return buf.byteLength;
+            },
+            truncate(n) {
+              buf = buf.slice(0, n);
+            },
+            write(view) {
+              buf = new Uint8Array(view).slice();
+              return buf.byteLength;
+            },
+            read(view, { at = 0 } = {}) {
+              syncReads += 1;
+              const n = Math.min(view.byteLength, Math.max(0, buf.byteLength - at));
+              view.set(buf.subarray(at, at + n), 0);
+              return n;
+            },
+            flush() {
+              rawFiles.set(name, buf.slice());
+            },
+            close() {},
+          };
+        },
+        async getFile() {
+          getFileReads += 1;
+          const d = rawFiles.get(name);
+          return { size: d.byteLength, async arrayBuffer() { return d.slice().buffer; } };
+        },
+      };
+    },
+    async removeEntry(name) {
+      rawFiles.delete(name);
+    },
+  };
+
+  // Seed chunk 0 directly.
+  const seedMock = createMockRangeFetch(new Map([['game/core.rpf', fileBytes]]));
+  const seeder = new RangeCache({
+    chunkSize,
+    maxBytes: 8 * chunkSize,
+    enableReadAhead: false,
+    opfsDir,
+    fetchImpl: seedMock.fetchImpl,
+    fileFingerprints: { 'game/core.rpf': fp },
+  });
+  await seeder.read('game/core.rpf', 0, chunkSize);
+  await seeder.flushOpfsWrites();
+
+  // Warm reader: 4 concurrent readers for chunk 0 should coalesce into 1 OPFS lookup via SyncAccessHandle!
+  opfsOpenCount = 0;
+  syncReads = 0;
+  getFileReads = 0;
+  const warmMock = createMockRangeFetch(new Map([['game/core.rpf', fileBytes]]));
+  const warm = new RangeCache({
+    chunkSize,
+    maxBytes: 8 * chunkSize,
+    enableReadAhead: true,
+    fetchImpl: warmMock.fetchImpl,
+    opfsDir,
+    fileFingerprints: { 'game/core.rpf': fp },
+  });
+
+  const [r1, r2, r3, r4] = await Promise.all([
+    warm.read('game/core.rpf', 0, 1024),
+    warm.read('game/core.rpf', 2048, 1024),
+    warm.read('game/core.rpf', 4096, 1024),
+    warm.read('game/core.rpf', 8192, 1024),
+  ]);
+  assert.deepEqual(r1, fileBytes.subarray(0, 1024));
+  assert.deepEqual(r4, fileBytes.subarray(8192, 9216));
+  assert.equal(warmMock.calls.length, 0);
+  assert.equal(opfsOpenCount, 1, 'Concurrent OPFS lookups for the same chunk must coalesce to 1 open');
+  assert.equal(syncReads, 1, 'SyncAccessHandle fast path should be used before getFile()');
+  assert.equal(getFileReads, 0);
+
+  // readRanges() on 2 disjoint ranges in already-warm chunk 0 must NOT double-count hits or trigger sequential readahead!
+  const hitsBefore = warm.getStats().hits;
+  const seqBefore = warm.getStats().sequentialHits;
+  const batchOut = await warm.readRanges([
+    { path: 'game/core.rpf', offset: 0, length: 512 },
+    { path: 'game/core.rpf', offset: 1024, length: 512 },
+  ]);
+  assert.deepEqual(batchOut[0], fileBytes.subarray(0, 512));
+  assert.deepEqual(batchOut[1], fileBytes.subarray(1024, 1536));
+  assert.equal(
+    warm.getStats().hits - hitsBefore,
+    1,
+    'readRanges() Phase 2 must not double-count hits for a chunk already loaded in Phase 1',
+  );
+  assert.equal(
+    warm.getStats().sequentialHits,
+    seqBefore,
+    'readRanges() must not feed batch scatter ranges into sequential readahead tracker',
+  );
+});
