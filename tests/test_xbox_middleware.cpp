@@ -391,6 +391,33 @@ void test_bink2() {
         CHECK(opens == shim_opens_before + 1);
         CHECK(refused == shim_refused_before + 1);
     }
+    {
+        // A4(c): the stream create is logged with path, flags and result.
+        bool found = false;
+        for (size_t i = 0;; ++i) {
+            char path[300];
+            uint32_t f = 0;
+            int opened = 1;
+            if (pg6_bink_open_log(i, path, sizeof(path), &f, &opened) == 0) {
+                break;
+            }
+            if (std::strcmp(path, "movies/intro.bk2") == 0 && f == 0x10u && opened == 0) {
+                found = true;
+            }
+        }
+        CHECK(found);
+        // A4(a): a null export lookup is counted and its name kept once.
+        const uint64_t before = pg6_bink_lookup_null_count();
+        pg6_bink_note_lookup_null("BinkNoSuchExport");
+        pg6_bink_note_lookup_null("BinkNoSuchExport");
+        CHECK(pg6_bink_lookup_null_count() == before + 2);
+        int hits = 0;
+        char nm[160];
+        for (size_t i = 0; pg6_bink_lookup_null_name(i, nm, sizeof(nm)) != 0; ++i) {
+            hits += std::strcmp(nm, "BinkNoSuchExport") == 0 ? 1 : 0;
+        }
+        CHECK(hits == 1);
+    }
     static const uint8_t junk[64] = {'K', 'B', '1', 'j'};
     CHECK(pg6_mw_bink_open_with_options(reinterpret_cast<const char*>(junk), nullptr, 0x04000000u) == nullptr);
     Pg6BinkFrameBuffers fb{};

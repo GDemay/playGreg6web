@@ -174,6 +174,18 @@ uint32_t pg6_xbox_middleware_register_all(void);
 // ones refused with no movie). Non-zero means the shim, not the lifted DLL, took the call.
 void pg6_bink_shim_stats(uint64_t* open_calls, uint64_t* refused_opens);
 
+// A4(a): an export lookup (GetProcAddress, or the boot binding scan) for a Bink* name that returned
+// null. Counted per call; the first distinct names are kept and the first few are logged.
+void pg6_bink_note_lookup_null(const char* name);
+uint64_t pg6_bink_lookup_null_count(void);
+// Copies the i-th distinct null-lookup name (insertion order) into buf; returns 0 when there is none.
+size_t pg6_bink_lookup_null_name(size_t i, char* buf, size_t cap);
+
+// A4(c): the first BinkOpenWithOptions calls the shim saw (rate limited: 16 are kept, 8 are logged).
+// Fills path (a file name, or "<memory image>" for BINKFROMMEMORY), flags and whether a movie was
+// opened. Returns 0 when i is past the kept entries.
+size_t pg6_bink_open_log(size_t i, char* path, size_t path_cap, uint32_t* flags, int* opened);
+
 // ---------------------------------------------------------------------------
 // 1. libHttpClient.GDK.dll (38 symbols)
 // ---------------------------------------------------------------------------

@@ -1322,6 +1322,7 @@ void setup_bink_counters(BootState& b) {
             const os::win32::ExportLookup lookup =
                 handle != 0 ? os::win32::LookupExport(handle, e.name) : os::win32::ExportLookup{};
             if (handle == 0 || lookup.address == 0) {
+                pg6_bink_note_lookup_null(e.name.c_str());
                 continue;  // not in the registry at all: neither lifted nor shim
             }
             (lookup.guest ? b.bink_exports_lifted : b.bink_exports_shim) += 1;
@@ -2364,7 +2365,27 @@ std::string bink_json() {
                     std::to_string(b.bink_exports_lifted) + ", \"exports_shim\": " +
                     std::to_string(b.bink_exports_shim) + ", \"imports_to_shim\": " +
                     std::to_string(imports_to_shim) + ", \"shim_open_calls\": " + std::to_string(shim_opens) +
-                    ", \"shim_refused_opens\": " + std::to_string(shim_refused) + ", \"exports\": [";
+                    ", \"shim_refused_opens\": " + std::to_string(shim_refused) +
+                    ", \"lookup_null\": " + std::to_string(pg6_bink_lookup_null_count()) + ", \"lookup_null_names\": [";
+    for (size_t i = 0;; ++i) {
+        char nm[160];
+        if (pg6_bink_lookup_null_name(i, nm, sizeof(nm)) == 0) {
+            break;
+        }
+        o += (i == 0 ? "" : ", ") + json_string(nm);
+    }
+    o += "], \"open_log\": [";
+    for (size_t i = 0;; ++i) {
+        char path[300];
+        uint32_t flags = 0;
+        int opened = 0;
+        if (pg6_bink_open_log(i, path, sizeof(path), &flags, &opened) == 0) {
+            break;
+        }
+        o += (i == 0 ? "" : ", ") + std::string("{\"path\": ") + json_string(path) + ", \"flags\": " +
+             std::to_string(flags) + ", \"opened\": " + (opened != 0 ? "true" : "false") + "}";
+    }
+    o += "], \"exports\": [";
     uint64_t total = 0;
     for (size_t i = 0; i < b.bink.size(); ++i) {
         const uint64_t calls = b.bink.calls(i);
