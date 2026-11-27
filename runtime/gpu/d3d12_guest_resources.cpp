@@ -3855,6 +3855,13 @@ uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkP
     }
     const uint64_t size = shadow_size_;
     const bool verify_marks = os::guest_window::write_marks_verified();
+    // Held for the whole compare / upload-copy below so a concurrent decommit cannot fault it.
+    const com::GuestRangeView view(cpu_va_, static_cast<size_t>(size));
+    const uint8_t* live = view.data();
+    std::vector<uint8_t> copy;
+    std::unique_ptr<uint8_t[]> sparse_copy;
+    // Keep the bulk staging allocation alive past the small candidate bitmap, as before:
+    // their destruction order affects allocator reuse on subsequent dense flushes.
     std::vector<bool> candidate;
     bool window_candidates = false;
     bool window_prepared = false;
@@ -3876,11 +3883,6 @@ uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkP
         }
         window_marked_ = marked;
     };
-    // Held for the whole compare / upload-copy below so a concurrent decommit cannot fault it.
-    const com::GuestRangeView view(cpu_va_, static_cast<size_t>(size));
-    const uint8_t* live = view.data();
-    std::vector<uint8_t> copy;
-    std::unique_ptr<uint8_t[]> sparse_copy;
     if (live == nullptr && os::guest_window::translated(cpu_va_)) {
         prepare_window();
         if (window_candidates && !verify_marks &&
