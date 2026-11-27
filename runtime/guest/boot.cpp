@@ -3066,6 +3066,7 @@ std::string build_report() {
         o += "  \"frame_breakdown\": " + b.frame_breakdown.to_json() + ",\n";
     }
     o += "  \"guest_sleep\": " + os::host_sleep::guest_sleep_stats_json() + ",\n";
+    o += "  \"guest_timed_wait\": " + os::host_sleep::guest_timed_wait_stats_json() + ",\n";
     // R40: per-present samples without a GPU capture (the last gpu::PresentSampleRing::kDefaultCapacity).
     {
         std::lock_guard<std::mutex> lock(b.mutex);

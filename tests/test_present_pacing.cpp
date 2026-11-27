@@ -549,6 +549,27 @@ void test_guest_sleep_stats() {
     hs::reset_guest_sleep_stats();
 }
 
+// Guest timed-wait stats: timed-out vs signalled split, overshoot histogram, zero/infinite timeouts skipped.
+void test_guest_timed_wait_stats() {
+    namespace hs = playgta6::os::host_sleep;
+    using us = std::chrono::microseconds;
+    hs::reset_guest_timed_wait_stats();
+    hs::record_guest_timed_wait(10, us(10200), true);  // +0.2 ms -> lt0.5
+    hs::record_guest_timed_wait(10, us(25600), true);  // +15.6 ms -> lt16
+    hs::record_guest_timed_wait(50, us(3000), false);  // signalled early
+    hs::GuestTimedWait skip0(0), skipinf(0xFFFFFFFFu);
+    skip0.done(true);
+    skipinf.done(false);
+    const std::string j = hs::guest_timed_wait_stats_json();
+    CHECK(j.find("\"timed_out\": {\"count\": 2") != std::string::npos);
+    CHECK(j.find("\"signalled\": {\"count\": 1, \"mean_requested_ms\": 50.000, \"mean_actual_ms\": 3.000") !=
+          std::string::npos);
+    CHECK(j.find("\"lt0.5\": 1") != std::string::npos);
+    CHECK(j.find("\"lt16\": 1") != std::string::npos);
+    CHECK(j.find("\"max_overshoot_ms\": 15.600") != std::string::npos);
+    hs::reset_guest_timed_wait_stats();
+}
+
 int main() {
     std::printf("test_present_pacing\n");
     test_vblank_clock();
@@ -569,6 +590,7 @@ int main() {
     test_host_sleep_is_precise();
     test_timer_resolution_raised();
     test_guest_sleep_stats();
+    test_guest_timed_wait_stats();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_present_pacing: %d failure(s)\n", g_failures);
         return 1;

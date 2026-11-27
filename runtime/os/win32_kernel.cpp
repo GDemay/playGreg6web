@@ -2,6 +2,7 @@
 
 #include "os/audio_file_stats.h"
 #include "os/guest_window.h"
+#include "os/host_sleep.h"
 #include "os/xmem_windows.h"
 
 #include <algorithm>
@@ -2471,7 +2472,10 @@ int32_t pg6_win32_reset_event(Pg6Handle event_handle) {
 uint32_t pg6_win32_wait_for_single_object(Pg6Handle handle, uint32_t timeout_ms) {
     if (timeout_ms != 0) {
         const playgta6::os::ThreadSpan frame_span(playgta6::os::SpanKind::Wait);
-        return playgta6::os::win32::WaitForSingleObject(handle, timeout_ms);
+        const playgta6::os::host_sleep::GuestTimedWait tw(timeout_ms);
+        const uint32_t r = playgta6::os::win32::WaitForSingleObject(handle, timeout_ms);
+        tw.done(r == playgta6::os::win32::WAIT_TIMEOUT);
+        return r;
     }
     return playgta6::os::win32::WaitForSingleObject(handle, timeout_ms);
 }
