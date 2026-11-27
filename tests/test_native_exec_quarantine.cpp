@@ -1,6 +1,10 @@
 // Shader quarantine parsing and drop-table accounting (gpu/native_exec/shader_quarantine.h).
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <vector>
 
 #include "gpu/drop_table.h"
 #include "gpu/native_exec/shader_quarantine.h"
@@ -17,9 +21,24 @@ void check_impl(bool cond, const char* expr, int line) {
 using playgta6::gpu::d3d12_guest::DropTable;
 using playgta6::gpu::native_exec::ShaderQuarantine;
 bool has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
+std::string slurp(const std::string& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+size_t count(const std::string& s, const std::string& part) {
+    size_t n = 0;
+    for (size_t at = s.find(part); at != std::string::npos; at = s.find(part, at + 1)) ++n;
+    return n;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc >= 4 && std::string(argv[1]) == "--persist-child") {  // child of the kill test below
+        std::vector<uint64_t> f;
+        for (int i = 3; i < argc; ++i) f.push_back(std::strtoull(argv[i], nullptr, 16));
+        ShaderQuarantine::persist_auto_file(argv[2], f);
+        std::_Exit(0);  // no destructors, no atexit flush: only what persist_auto_file flushed survives
+    }
     uint64_t h = 0;
     CHECK(ShaderQuarantine::parse_hash("0xDEADbeef", &h) && h == 0xdeadbeefull);
     CHECK(ShaderQuarantine::parse_hash("ff", &h) && h == 0xff);
@@ -70,6 +89,39 @@ int main() {
     ShaderQuarantine rt;
     CHECK(rt.add_text(a2, false, "auto", &err) && rt.size() == 2 && rt.contains(0x20));
     CHECK(ShaderQuarantine::merge_auto_file("zz\n", {0x30}).empty());  // unparsable file is never rewritten
+
+    // persist_auto_file (the --auto-quarantine write in boot_main.cpp).
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / ("pg6_aq_" + std::to_string(std::rand()));
+    fs::create_directories(dir);
+    const std::string file = (dir / "auto.txt").string();
+    CHECK(ShaderQuarantine::persist_auto_file(file, {}) == 0 && !fs::exists(file));  // nothing to add: no file
+    CHECK(ShaderQuarantine::persist_auto_file(file, {0x10}) == 1);                    // created on first failure
+    std::string body = slurp(file);
+    CHECK(body[0] == '#' && count(body, "0x0000000000000010 pipeline_failed auto\n") == 1);
+    CHECK(ShaderQuarantine::persist_auto_file(file, {0x10}) == 0 && slurp(file) == body);  // no duplicates
+    CHECK(ShaderQuarantine::persist_auto_file(file, {0x10, 0x20}) == 1);
+    body = slurp(file);
+    CHECK(count(body, "0x0000000000000010") == 1 && count(body, "0x0000000000000020") == 1);
+    const std::string hand = (dir / "hand.txt").string();
+    std::ofstream(hand, std::ios::binary) << "# my note\n0x99 hangs it https://example.invalid/1\n";
+    CHECK(ShaderQuarantine::persist_auto_file(hand, {0x99, 0x30}) == 1);  // 0x99 already there: only 0x30 added
+    body = slurp(hand);
+    CHECK(body.rfind("# my note\n0x99 hangs it https://example.invalid/1\n", 0) == 0 &&
+          count(body, "0x0000000000000030") == 1 && !has(body, "0000000000000099"));
+    const std::string killed = (dir / "killed.txt").string();  // flushed before the process is killed right after
+    std::string cmd = "\"" + std::string(argv[0]) + "\" --persist-child \"" + killed + "\" 1a 2b";
+#ifdef _WIN32
+    cmd = "\"" + cmd + "\"";  // cmd.exe /c strips one outer pair of quotes
+#endif
+    CHECK(std::system(cmd.c_str()) == 0);
+    body = slurp(killed);
+    CHECK(has(body.c_str(), "0x000000000000001a pipeline_failed auto\n") && has(body.c_str(), "0x000000000000002b pipeline_failed auto\n"));
+    // an unwritable path (a directory in place of the file, and a missing parent) just reports -1
+    CHECK(ShaderQuarantine::persist_auto_file(dir.string(), {0x40}) == -1);
+    CHECK(ShaderQuarantine::persist_auto_file((dir / "no" / "such" / "f.txt").string(), {0x40}) == -1);
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 
     if (g_failures) return 1;
     std::printf("test_native_exec_quarantine: ok\n");
