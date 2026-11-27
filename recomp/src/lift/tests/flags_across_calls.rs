@@ -110,11 +110,15 @@ fn summaries_hold_the_flags_a_callee_may_observe() {
         ALL,
         "a call passes the callee's live-in on"
     );
-    assert_eq!(live(NESTED), AF, "only AF survives the call to KILL");
+    assert_eq!(
+        live(NESTED),
+        0,
+        "KILL leaves AF untouched and adc overwrites AF before ret"
+    );
     assert_eq!(
         live(SHIFT_CL),
-        CF | PF | ZF | SF | OF,
-        "shl by cl may keep them"
+        0,
+        "shl by cl only needs incoming flags when live after it, and add kills all 6"
     );
     assert_eq!(summaries.live_in(CODE_BASE + 0xF000), None);
 }
@@ -166,18 +170,22 @@ fn stored_flags(text: &str) -> Vec<usize> {
 fn calls_store_only_the_flags_the_callee_may_observe() {
     let functions = program().discover();
     let ir = lift_module(functions.values()).expect("lifts").ir;
-    // KILL observes AF only: CF/OF of the imul (and the rest) are not stored before the call.
-    assert_eq!(stored_flags(&before_transfer(&ir, CALLER, KILL)), vec![2]);
-    // ADC observes CF, PASS every flag.
+    // KILL overwrites CF/PF/ZF/SF/OF and never touches AF (`touched_flags & live_in == 0`), so
+    // CALLER keeps AF in its local alloca across the call and stores zero flags before it.
+    assert_eq!(stored_flags(&before_transfer(&ir, CALLER, KILL)), Vec::<usize>::new());
+    // ADC reads CF, so CF is stored before the call.
     assert_eq!(
         stored_flags(&before_transfer(&ir, ADC_CALLER, ADC)),
         vec![0]
     );
+    // PASS touches no flags at all (`touched_flags == 0`): caller keeps flags in local allocas
+    // across the call and stores them at its own return instead of before `call PASS`.
     assert_eq!(
         stored_flags(&before_transfer(&ir, PASS_CALLER, PASS)),
-        vec![0, 1, 2, 3, 4, 5]
+        Vec::<usize>::new()
     );
-    // The tail jump into SETZ stores the flags SETZ observes (all of them).
+    // The tail jump into SETZ stores the flags SETZ observes (all of them, since SETZ's caller
+    // after the tail jump may observe flags SETZ does not touch).
     let tail = ir
         .split("define ")
         .find(|f| f.contains(&format!("@{}(ptr noalias", function_symbol(TAIL_CALLER))))
@@ -426,11 +434,11 @@ fn r67_dead_flags_after_direct_and_indirect_calls_are_not_reloaded() {
         assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
     }
     assert_eq!(out[0].regs[RAX], 20);
-    assert_eq!(out[0].flags[3], false, "DIRECT_DEAD ZF");
+    assert!(!out[0].flags[3], "DIRECT_DEAD ZF");
     assert_eq!(out[1].regs[RAX], 11, "DIRECT_PARTIAL CF=1");
     assert_eq!(out[2].regs[RAX], 20, "DIRECT_PARTIAL CF=0");
     assert_eq!(out[3].regs[RAX], 0, "INDIRECT_DEAD rax");
-    assert_eq!(out[3].flags[3], true, "INDIRECT_DEAD ZF=1");
+    assert!(out[3].flags[3], "INDIRECT_DEAD ZF=1");
     assert_eq!(out[4].regs[RAX], 8, "INDIRECT_LIVE ZF=1 -> dl=1, 7+1=8");
     assert_eq!(out[5].regs[RAX], 7, "INDIRECT_LIVE ZF=0 -> dl=0, 7+0=7");
 }

@@ -304,8 +304,9 @@ impl FunctionLifter<'_> {
                 self.xset(ins.op_register(0), &r, F64)?;
             }
             M::Cvtpd2dq | M::Vcvtpd2dq | M::Cvttpd2dq | M::Vcvttpd2dq => {
-                // Zero-extend the `<2 x i32>` `fptosi.sat` result to `<4 x i32>` before selecting
-                // the indefinite lane value so LLVM emits native `i32x4.trunc_sat_f64x2_s_zero`.
+                // Zero-extend the `<2 x i32>` `fptosi.sat` result to `<4 x i32>` and blend via
+                // `@llvm.wasm.bitselect.v4i32` so LLVM emits native `i32x4.trunc_sat_f64x2_s_zero`
+                // without legalizing `<4 x i1>` masks into `shl 31; shr_s 31`.
                 let truncate = matches!(m, M::Cvttpd2dq | M::Vcvttpd2dq);
                 let v = self.v128(ins, 1, F64)?;
                 let x = if truncate {
@@ -317,12 +318,18 @@ impl FunctionLifter<'_> {
                 let sat4 = self.zext_lanes(&sat2, I32, 2);
                 let limit = Ty::v(F64).splat(&fconst(2f64.powi(31)));
                 let ok2 = self.val(&format!("fcmp olt <2 x double> {x}, {limit}"));
-                let ok4 = self.val(&format!(
-                    "shufflevector <2 x i1> {ok2}, <2 x i1> poison, <4 x i32> <i32 0, i32 1, i32 0, i32 1>"
-                ));
-                let r = self.val(&format!(
-                    "select <4 x i1> {ok4}, <4 x i32> {sat4}, <4 x i32> <i32 -2147483648, i32 -2147483648, i32 0, i32 0>"
-                ));
+                let ok64 = self.val(&format!("sext <2 x i1> {ok2} to <2 x i64>"));
+                let ok32 = self.cast(&ok64, Ty::v(Elem::I64), Ty::v(I32));
+                let mask = self.shuffle(&ok32, "poison", I32, &[0, 2, 0, 2]);
+                let r = self.intr(
+                    Intr::Bitselect,
+                    Ty::v(I32),
+                    &[
+                        &sat4,
+                        "<i32 -2147483648, i32 -2147483648, i32 0, i32 0>",
+                        &mask,
+                    ],
+                );
                 self.xset(ins.op_register(0), &r, I32)?;
             }
             M::Cvtps2pd | M::Vcvtps2pd => {
@@ -907,10 +914,18 @@ impl FunctionLifter<'_> {
         let dx = self.val(&format!("xor {it} {d}, {sneg}"));
         let ds = self.val(&format!("sub {it} {dx}, {sneg}"));
         let lsb_top = self.val(&format!("shl {it} {bits}, {sh63}"));
-        let even_b = self.val(&format!("icmp eq {it} {lsb_top}, {zero_i}"));
-        let even = self.val(&format!("sext {bt} {even_b} to {it}"));
-        let step = self.val(&format!("and {it} {ds}, {even}"));
-        let odd = self.val(&format!("add {it} {bits}, {step}"));
+        let odd = if n == 2 {
+            // Avoid InstCombine turning `icmp eq (shl bits, 63), 0` back into `v128.const 0` +
+            // `v128.const 1` + `i64x2.eq`: `ashr(shl(bits, 63), 63)` is all-ones iff `bits` is odd.
+            let stepped = self.val(&format!("add {it} {bits}, {ds}"));
+            let odd_m = self.val(&format!("ashr {it} {lsb_top}, {sh63}"));
+            self.intr(Intr::Bitselect, Ty::v(Elem::I64), &[&bits, &stepped, &odd_m])
+        } else {
+            let even_b = self.val(&format!("icmp eq {it} {lsb_top}, {zero_i}"));
+            let even = self.val(&format!("sext {bt} {even_b} to {it}"));
+            let step = self.val(&format!("and {it} {ds}, {even}"));
+            self.val(&format!("add {it} {bits}, {step}"))
+        };
         let odd = self.val(&format!("bitcast {it} {odd} to {dt}"));
         self.val(&format!("fptrunc {dt} {odd} to {ft}"))
     }

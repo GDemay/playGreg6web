@@ -583,19 +583,18 @@ fn partially_lifted_instructions_are_rolled_back() {
 
 #[test]
 fn division_has_a_divide_error_path_and_wide_ops_use_internal_helpers() {
-    let func = asm_function(0x1000, |a| {
-        a.xor(edx, edx)?;
+    // 1. General 128-bit `div`/`idiv` (arbitrary incoming `rdx`) use internal helpers; both
+    //    divide-error paths branch to the shared `cold_trap` sink (1 helper call).
+    let wide = asm_function(0x1000, |a| {
         a.div(rcx)?;
         a.mul(rcx)?;
-        a.cqo()?;
         a.idiv(r8)?;
         a.rol(eax, 3)?;
         a.add(eax, ecx)?;
         a.ret()
     });
-    let module = lift_module([&func]).expect("lifts");
+    let module = lift_module([&wide]).expect("lifts");
     let ir = &module.ir;
-    // Both div/idiv divide-error paths branch to the shared cold_trap sink (1 helper call).
     assert_eq!(
         ir.matches(&format!("call void @{HELPER_DIVIDE_ERROR}"))
             .count(),
@@ -618,6 +617,23 @@ fn division_has_a_divide_error_path_and_wide_ops_use_internal_helpers() {
     assert!(
         !ir.contains(" i128 "),
         "no i128 arithmetic (would need compiler-rt on wasm)"
+    );
+
+    // 2. Fast-path 64-bit `xor edx, edx; div rcx` and `cqo; idiv r8` emit native `udiv`/`sdiv i64`
+    //    directly without pulling in `@__playgta6_udiv128` or `@__playgta6_sdiv128`.
+    let fast = asm_function(0x2000, |a| {
+        a.xor(edx, edx)?;
+        a.div(rcx)?;
+        a.cqo()?;
+        a.idiv(r8)?;
+        a.ret()
+    });
+    let fast_ir = lift_module([&fast]).expect("lifts").ir;
+    assert!(fast_ir.contains(" = udiv i64 ") && fast_ir.contains(" = urem i64 "), "{fast_ir}");
+    assert!(fast_ir.contains(" = sdiv i64 ") && fast_ir.contains(" = srem i64 "), "{fast_ir}");
+    assert!(
+        !fast_ir.contains("__playgta6_udiv128") && !fast_ir.contains("__playgta6_sdiv128"),
+        "fast-path 64-bit div/idiv must not pull in 128-bit helpers:\n{fast_ir}"
     );
 }
 

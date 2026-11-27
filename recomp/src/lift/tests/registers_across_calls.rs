@@ -232,9 +232,10 @@ fn calls_keep_untouched_registers_out_of_the_state() {
     let (before, after) = around_call(&ir, CALLER, LEAF);
     assert_eq!(gprs(&before), vec![RAX, RSP], "stores before the call");
     assert_eq!(gprs(&after), vec![RAX, RSP], "reloads after the call");
-    // MID reads r8 without writing it: r8 is stored before the call but NOT reloaded after.
+    // MID reads r8 without writing it, and MID_CALLER also only reads r8: r8 needs neither a
+    // pre-call store (already live in `%state`) nor a post-call reload.
     let (before, after) = around_call(&ir, MID_CALLER, MID);
-    assert_eq!(gprs(&before), vec![RAX, RSP, R8]);
+    assert_eq!(gprs(&before), vec![RAX, RSP]);
     assert_eq!(gprs(&after), vec![RAX, RSP]);
     // TAIL also touches rdx; rsi stays.
     let (before, _) = around_call(&ir, TAIL_CALLER, TAIL);
@@ -243,16 +244,17 @@ fn calls_keep_untouched_registers_out_of_the_state() {
     let (before, after) = around_call(&ir, VECTOR_CALLER, VECTOR);
     assert_eq!(gprs(&before), vec![RAX, RSP]);
     assert_eq!(gprs(&after), vec![RAX, RSP]);
-    // UNMODELLED_CALLEE may touch anything: every tracked register goes through the state.
+    // UNMODELLED_CALLEE may touch anything: every written tracked register goes through the state.
     let (before, after) = around_call(&ir, UNMODELLED_CALLER, UNMODELLED_CALLEE);
     assert_eq!(gprs(&before), vec![RAX, RSP, RSI]);
     assert_eq!(gprs(&after), vec![RAX, RSP, RSI]);
-    // The caller's own return still writes every tracked register back.
+    // The caller's own return writes back every register CALLER itself modifies (skipping
+    // read-only `rdx`, whose value in `%state` is already up to date).
     let caller = function_ir(&ir, CALLER);
     let ret = caller.rfind("ret void").expect("returns");
     let tail = &caller[..ret];
     let last_call = tail.rfind("after_call").expect("after the call");
-    assert_eq!(gprs(&tail[last_call..]), vec![RAX, RCX, RDX, RSP, RSI, R9]);
+    assert_eq!(gprs(&tail[last_call..]), vec![RAX, RCX, RSP, RSI, R9]);
 }
 
 #[test]
@@ -260,7 +262,9 @@ fn calls_without_summaries_sync_every_register() {
     let functions = program().discover();
     let lifted = crate::lift::lift_function(&functions[&CALLER]).expect("lifts");
     let (before, after) = around_call(&lifted.ir, CALLER, LEAF);
-    assert_eq!(gprs(&before), vec![RAX, RCX, RDX, RSP, RSI, R9]);
+    // `rdx` is strictly read-only in CALLER so pre-call sync_out skips it, while post-call
+    // sync_in reloads every tracked register without summaries.
+    assert_eq!(gprs(&before), vec![RAX, RCX, RSP, RSI, R9]);
     assert_eq!(gprs(&after), vec![RAX, RCX, RDX, RSP, RSI, R9]);
 }
 
@@ -1087,8 +1091,8 @@ fn r67_split_live_in_and_written_state_summaries_ir_and_wasm64() {
     let (before_ro, after_ro) = around_call(&ir, CALLER_READONLY_ARGS, CALLEE_READONLY_ARGS);
     assert_eq!(
         gprs(&before_ro),
-        vec![RCX, RDX, RSP],
-        "write-first rax/r10 must NOT be stored before call:\n{before_ro}"
+        vec![RSP],
+        "write-first rax/r10 and read-only rcx/rdx must NOT be stored before call:\n{before_ro}"
     );
     assert_eq!(
         state_xmms(&before_ro),
@@ -1109,8 +1113,8 @@ fn r67_split_live_in_and_written_state_summaries_ir_and_wasm64() {
     let (before_cond, after_cond) = around_call(&ir, CALLER_COND_WRITE, CALLEE_COND_WRITE);
     assert_eq!(
         gprs(&before_cond),
-        vec![RAX, RCX, RSP],
-        "conditionally written rax MUST be stored before call:\n{before_cond}"
+        vec![RAX, RSP],
+        "conditionally written rax MUST be stored before call (read-only rcx skipped):\n{before_cond}"
     );
     assert_eq!(
         gprs(&after_cond),
@@ -1121,8 +1125,8 @@ fn r67_split_live_in_and_written_state_summaries_ir_and_wasm64() {
     let (before_part, after_part) = around_call(&ir, CALLER_PARTIAL, CALLEE_PARTIAL);
     assert_eq!(
         gprs(&before_part),
-        vec![RAX, RCX, RDX, RSP, R8],
-        "partial/conditional GPR writes MUST be stored before call:\n{before_part}"
+        vec![RAX, RDX, RSP, R8],
+        "partial/conditional GPR writes MUST be stored before call (read-only rcx skipped):\n{before_part}"
     );
     assert_eq!(
         gprs(&after_part),

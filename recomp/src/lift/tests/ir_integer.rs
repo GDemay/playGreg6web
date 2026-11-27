@@ -718,9 +718,9 @@ fn r60_same_block_predicate_fusion_and_scalar_lowering_compactness() {
     assert!(fn_ir.contains(" = icmp sgt i32 "), "{fn_ir}");
     // `dec rcx` -> `jle` fused directly to `icmp sle i64 ..., 1`.
     assert!(fn_ir.contains(" = icmp sle i64 ") && fn_ir.contains(", 1\n"), "{fn_ir}");
-    // 32-bit `div` / `idiv` use native `udiv i64` / `sdiv i64`, NOT 128-bit software helpers!
-    assert!(fn_ir.contains(" = udiv i64 ") && fn_ir.contains(" = urem i64 "), "{fn_ir}");
-    assert!(fn_ir.contains(" = sdiv i64 ") && fn_ir.contains(" = srem i64 "), "{fn_ir}");
+    // 32-bit `xor edx, edx; div` and `cdq; idiv` use native `udiv i32` / `sdiv i32` directly!
+    assert!(fn_ir.contains(" = udiv i32 ") && fn_ir.contains(" = urem i32 "), "{fn_ir}");
+    assert!(fn_ir.contains(" = sdiv i32 ") && fn_ir.contains(" = srem i32 "), "{fn_ir}");
     assert!(
         !scalar.contains("__playgta6_udiv128") && !scalar.contains("__playgta6_sdiv128"),
         "32-bit div/idiv must not pull in 128-bit helpers:\n{scalar}"
@@ -846,5 +846,97 @@ fn r71_bit_ops_const_fast_paths_lzcnt_tzcnt_mulx_and_adcx_adox() {
         adcx_ir.matches("zext i1 ").count(),
         1,
         "first adcx with known CF=0 must skip zext i1:\n{adcx_ir}"
+    );
+}
+
+#[test]
+fn wasm64_batch2_scalar_carry_fusion_div_mul128_and_crc32_ir() {
+    // 1. Carry consumption fusion: `cmp; sbb eax, eax`, `neg; sbb`, `add; adc rdx, 0`,
+    //    `bt; sbb`, `cmp; cmc; adc`, `cmp; adcx` — zero `%cf` alloca traffic in body!
+    let carry_ir = module_ir(|a| {
+        a.cmp(rcx, rdx)?;
+        a.sbb(eax, eax)?;
+        a.neg(r8)?;
+        a.sbb(r8, r8)?;
+        a.add(rax, rbx)?;
+        a.adc(rdx, 0)?;
+        a.bt(rsi, 3)?;
+        a.sbb(r9d, r9d)?;
+        a.cmp(rcx, rdx)?;
+        a.cmc()?;
+        a.adc(r10, 0)?;
+        a.cmp(rcx, rdx)?;
+        a.adcx(r11, rbx)?;
+        a.xor(ecx, ecx)?; // kill trailing flags
+        a.ret()
+    });
+    let body = carry_ir
+        .split("bb_1000:\n")
+        .nth(1)
+        .expect("bb_1000")
+        .split("store i64 ")
+        .take(999)
+        .collect::<Vec<_>>()
+        .join("store i64 ");
+    let before_ret = body.split("add i64 %").next().unwrap_or(&body);
+    assert!(
+        !before_ret.contains("ptr %cf"),
+        "fused carry consumers must not touch %cf alloca:\n{before_ret}"
+    );
+    assert!(
+        carry_ir.contains("sext i1 ") && carry_ir.contains(" to i32"),
+        "sbb r, r should emit sext i1:\n{carry_ir}"
+    );
+
+    // 2. `mul128` constant-operand swap (`mov rax, MAGIC; mul rcx` puts constant in 2nd arg)
+    //    and zero-fold (`xor eax, eax; mul rcx` emits zero umul128 calls!).
+    let mul_swap_ir = module_ir(|a| {
+        a.mov(rax, 0xAAAA_AAAA_AAAA_AAABu64)?;
+        a.mul(rcx)?;
+        a.ret()
+    });
+    assert!(
+        mul_swap_ir.contains(", i64 -6148914691236517205)"),
+        "constant RAX must be swapped into 2nd arg of @__playgta6_umul128:\n{mul_swap_ir}"
+    );
+    let mul_zero_ir = module_ir(|a| {
+        a.xor(eax, eax)?;
+        a.mul(rcx)?;
+        a.ret()
+    });
+    assert!(
+        !mul_zero_ir.contains("@__playgta6_umul128"),
+        "zero-operand mul must fold to (0, 0) without umul128:\n{mul_zero_ir}"
+    );
+
+    // 3. Table-driven `@__playgta6_crc32c_u8` (256-entry lookup table, zero bit loop).
+    let crc_ir = module_ir(|a| {
+        a.crc32(rax, rcx)?;
+        a.ret()
+    });
+    assert!(
+        crc_ir.contains("@__playgta6_crc32c_tbl = internal unnamed_addr constant [256 x i32]"),
+        "crc32c must use 256-entry lookup table:\n{crc_ir}"
+    );
+    assert!(
+        !crc_ir.contains("br i1 %done"),
+        "crc32c must not emit 8-iteration bit loop:\n{crc_ir}"
+    );
+
+    // 4. `merge_gpr` constant-`old` folding: `xor eax, eax; setcc al` skips `and`/`or`.
+    let merge_ir = module_ir(|a| {
+        a.xor(eax, eax)?;
+        a.cmp(rcx, rdx)?;
+        a.sete(al)?;
+        a.xor(ecx, ecx)?;
+        a.ret()
+    });
+    let merge_bb = merge_ir.split("bb_1000:\n").nth(1).expect("bb_1000");
+    assert!(
+        !merge_bb.contains("-256")
+            && !merge_bb.contains(" = or i64 ")
+            && merge_bb.contains("zext i8 ")
+            && merge_bb.contains(" to i64"),
+        "xor eax, eax; sete al must fold directly to zext i8->i64 without and/or in merge_gpr:\n{merge_bb}"
     );
 }

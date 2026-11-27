@@ -105,6 +105,8 @@ pub(super) const fn ymmh_state_bit(idx: usize) -> StateMask {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlagSummaries {
     live_in: BTreeMap<u64, FlagMask>,
+    touched_flags: BTreeMap<u64, FlagMask>,
+    written_flags: BTreeMap<u64, FlagMask>,
     touched: BTreeMap<u64, StateMask>,
     written: BTreeMap<u64, StateMask>,
     live_in_state: BTreeMap<u64, StateMask>,
@@ -117,6 +119,7 @@ impl FlagSummaries {
         let functions: Vec<&cfg::Function> = functions.into_iter().collect();
         let (touched, written) = state_effects(&functions);
         let live_in_state = state_live_in(&functions, &touched);
+        let (touched_flags, written_flags) = flag_effects(&functions);
         let functions: BTreeMap<u64, Model> = functions
             .into_iter()
             .map(|f| (f.entry, Model::new(f)))
@@ -137,7 +140,7 @@ impl FlagSummaries {
         while let Some(entry) = work.pop_front() {
             queued.remove(&entry);
             let old = live_in[&entry];
-            let mask = old | functions[&entry].entry_live(&live_in);
+            let mask = old | functions[&entry].entry_live(&live_in, &touched_flags);
             live_in.insert(entry, mask);
             if mask != old {
                 for &caller in callers.get(&entry).into_iter().flatten() {
@@ -149,6 +152,8 @@ impl FlagSummaries {
         }
         Self {
             live_in,
+            touched_flags,
+            written_flags,
             touched,
             written,
             live_in_state,
@@ -158,6 +163,18 @@ impl FlagSummaries {
     /// Flags the function at `entry` may observe on entry; `None` for a function outside the set.
     pub fn live_in(&self, entry: u64) -> Option<u8> {
         self.live_in.get(&entry).copied()
+    }
+
+    /// Arithmetic flags a call to the function at `entry` may read or write; `None` for a function
+    /// outside the set.
+    pub fn touched_flags(&self, entry: u64) -> Option<u8> {
+        self.touched_flags.get(&entry).copied()
+    }
+
+    /// Arithmetic flags a call to the function at `entry` may write (subset of
+    /// [`Self::touched_flags`]); `None` for a function outside the set.
+    pub fn written_flags(&self, entry: u64) -> Option<u8> {
+        self.written_flags.get(&entry).copied()
     }
 
     /// Guest state a call to the function at `entry` may read or write: GPR `n` as bit `n`,
@@ -192,9 +209,24 @@ impl FlagSummaries {
         self.written(target).unwrap_or(ALL_STATE)
     }
 
-    /// Flags a direct call or tail jump to `target` must store first.
+    /// Flags a tail jump to `target` must store first (`live_in`).
     pub(super) fn needed_by(&self, target: u64) -> FlagMask {
         self.live_in(target).unwrap_or(ALL_FLAGS)
+    }
+
+    /// Flags a direct call to `target` may touch (`touched_flags`).
+    pub(super) fn touched_flags_by(&self, target: u64) -> FlagMask {
+        self.touched_flags(target).unwrap_or(ALL_FLAGS)
+    }
+
+    /// Flags a direct call to `target` must store before calling (`touched_flags & live_in`).
+    pub(super) fn sync_out_flags_by(&self, target: u64) -> FlagMask {
+        self.touched_flags_by(target) & self.needed_by(target)
+    }
+
+    /// Flags a direct call to `target` may overwrite (`written_flags`).
+    pub(super) fn written_flags_by(&self, target: u64) -> FlagMask {
+        self.written_flags(target).unwrap_or(ALL_FLAGS)
     }
 }
 
@@ -259,17 +291,26 @@ impl Model {
     }
 
     /// Flags live at the entry block under the current summaries (least fixed point).
-    fn entry_live(&self, summaries: &BTreeMap<u64, FlagMask>) -> FlagMask {
+    fn entry_live(
+        &self,
+        summaries: &BTreeMap<u64, FlagMask>,
+        touched: &BTreeMap<u64, FlagMask>,
+    ) -> FlagMask {
         if self.entry >= self.blocks.len() {
             return ALL_FLAGS;
         }
         let needed = |target: u64| summaries.get(&target).copied().unwrap_or(ALL_FLAGS);
-        self.block_live_in(needed)[self.entry]
+        let touched = |target: u64| touched.get(&target).copied().unwrap_or(ALL_FLAGS);
+        self.block_live_in(needed, touched)[self.entry]
     }
 
     /// Flags live at the start of every block, given the flags each direct callee or tail-jump
-    /// target needs (least fixed point).
-    fn block_live_in(&self, needed: impl Fn(u64) -> FlagMask) -> Vec<FlagMask> {
+    /// target needs and touches (least fixed point).
+    fn block_live_in(
+        &self,
+        needed: impl Fn(u64) -> FlagMask,
+        touched: impl Fn(u64) -> FlagMask,
+    ) -> Vec<FlagMask> {
         let mut live_in = vec![0 as FlagMask; self.blocks.len()];
         loop {
             let mut changed = false;
@@ -285,7 +326,7 @@ impl Model {
                 for step in block.steps.iter().rev() {
                     live = match *step {
                         Step::Effect { gen_, kill } => gen_ | (live & !kill),
-                        Step::Call(target) => needed(target),
+                        Step::Call(target) => (touched(target) | live) & needed(target),
                     };
                 }
                 let grown = live_in[i] | live;
@@ -308,8 +349,9 @@ pub(super) fn block_live_out(
     summaries: Option<&FlagSummaries>,
 ) -> BTreeMap<u64, FlagMask> {
     let needed = |target: u64| summaries.map_or(ALL_FLAGS, |s| s.needed_by(target));
+    let touched = |target: u64| summaries.map_or(ALL_FLAGS, |s| s.touched_flags_by(target));
     let model = Model::new(func);
-    let live_in = model.block_live_in(needed);
+    let live_in = model.block_live_in(needed, touched);
     let mut out = BTreeMap::new();
     for (block, model_block) in func.blocks.values().zip(&model.blocks) {
         let mut live = 0;
@@ -338,7 +380,9 @@ enum ProducerKind {
     Compare { has_diff_or_zero: bool },
     /// `test` / `and` / `or` / `xor` / `andn`: `CF = 0, OF = 0`, `ZF`/`SF` from result.
     LogicZero,
-    /// `add` / `blsi` / `blsr` / `bzhi` / non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`:
+    /// `add a, b`: `ZF`/`SF` from `result`, `CF` from `result <u a`.
+    Add,
+    /// `blsi` / `blsr` / `bzhi` / `adc` / `sbb` / non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`:
     /// `ZF`/`SF` from result.
     ResultZeroSign,
     /// `dec a`: `ZF`/`SF`/`OF` from `a - 1` (`CF` preserved).
@@ -380,6 +424,7 @@ impl ProducerKind {
                     | C::le
                     | C::g
             ),
+            Self::Add => matches!(cc, C::e | C::ne | C::s | C::ns | C::b | C::ae),
             Self::ResultZeroSign => matches!(cc, C::e | C::ne | C::s | C::ns),
             Self::Dec | Self::Inc => {
                 matches!(cc, C::e | C::ne | C::s | C::ns | C::l | C::ge | C::le | C::g)
@@ -481,7 +526,8 @@ fn producer_kind(ins: &Instruction) -> Option<ProducerKind> {
             Some(ProducerKind::LogicZero)
         }
         M::Test | M::And | M::Or | M::Andn => Some(ProducerKind::LogicZero),
-        M::Add | M::Blsi | M::Blsr | M::Bzhi => Some(ProducerKind::ResultZeroSign),
+        M::Add => Some(ProducerKind::Add),
+        M::Adc | M::Sbb | M::Blsi | M::Blsr | M::Bzhi => Some(ProducerKind::ResultZeroSign),
         M::Shl | M::Sal | M::Shr | M::Sar => {
             let bits = operand_bits(ins)?;
             let count_mask = if bits == 64 { 63 } else { 31 };
@@ -540,6 +586,7 @@ pub(super) fn dead_flags_for_block(
     bursts: &[WindowBurst],
 ) -> Vec<FlagMask> {
     let needed = |target: u64| summaries.map_or(ALL_FLAGS, |s| s.needed_by(target));
+    let touched = |target: u64| summaries.map_or(ALL_FLAGS, |s| s.touched_flags_by(target));
     let (body, transfer) = match block.instructions.split_last() {
         Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
         _ => (&block.instructions[..], None),
@@ -550,8 +597,9 @@ pub(super) fn dead_flags_for_block(
             .position(|b| idx >= b.start && idx <= b.end)
     };
 
-    // Identify same-block `setcc`/`cmovcc`/`jcc` consumers that will be answered directly from
-    // an earlier producer's `FlagSource` without reading any flag alloca.
+    // Identify same-block `setcc`/`cmovcc`/`jcc` and carry-consuming (`sbb`/`adc`/`adcx`/`cmc`)
+    // consumers that will be answered directly from an earlier producer's `FlagSource` without
+    // reading any flag alloca.
     let mut fused_body = vec![false; body.len()];
     let mut fused_term = false;
     for (p, prod) in body.iter().enumerate() {
@@ -570,6 +618,20 @@ pub(super) fn dead_flags_for_block(
                     fused_body[j] = true;
                 }
                 continue;
+            }
+            if flag_effect(cur).is_some()
+                && matches!(
+                    cur.mnemonic(),
+                    Mnemonic::Sbb | Mnemonic::Adc | Mnemonic::Adcx | Mnemonic::Cmc
+                )
+            {
+                if kind.supports(ConditionCode::b)
+                    && (p_burst.is_none() || p_burst == burst_of(j))
+                {
+                    fused_body[j] = true;
+                }
+                reaches_end = false;
+                break;
             }
             if cur.mnemonic() != Mnemonic::Call
                 && cur.rflags_modified() == 0
@@ -608,7 +670,7 @@ pub(super) fn dead_flags_for_block(
             }
             Step::Call(target) => {
                 dead[idx] = ALL_FLAGS & !live;
-                needed(target)
+                (touched(target) | live) & needed(target)
             }
         };
     }
@@ -837,8 +899,11 @@ pub(super) fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
                 shift_flags
             };
             match ins.op_kind(1) {
-                // A zero count at run time leaves the flags unchanged: they are read.
-                OpKind::Register if ins.op_register(1) == Register::CL => Some((flags, 0)),
+                // Variable count in CL: a zero count preserves flags and `shift()` only reads
+                // `get_flag(f)` when `flag_live(f)` is true, so `live_in(f) == live_out(f)`
+                // (`gen = 0, kill = 0`). `may_write_flags()` separately tracks that CL shifts
+                // may overwrite `flags` for interprocedural `touched_flags`/`written_flags`.
+                OpKind::Register if ins.op_register(1) == Register::CL => Some((0, 0)),
                 OpKind::Register => None,
                 _ => {
                     let count_mask = if operand_bits(ins) == Some(64) {
@@ -856,7 +921,8 @@ pub(super) fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
                 && operand_bits(ins).is_some_and(|b| b >= 16) =>
         {
             match ins.op_kind(2) {
-                OpKind::Register if ins.op_register(2) == Register::CL => Some((shift_flags, 0)),
+                // See `Shl..Ror` above: `double_shift()` only reads `get_flag(f)` when live.
+                OpKind::Register if ins.op_register(2) == Register::CL => Some((0, 0)),
                 OpKind::Register => None,
                 _ => {
                     let count_mask = if operand_bits(ins) == Some(64) {
@@ -906,6 +972,193 @@ fn simd_flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
         | M::Vpcmpestrm64 => Some((0, ALL_FLAGS)),
         _ => Some((0, 0)),
     }
+}
+
+/// Arithmetic flags a modelled non-trapping instruction (`flag_effect(ins) == Some((gen_, kill))`)
+/// may write at run time. Matches `kill` except for variable-count `CL` shifts/rotates, which do
+/// not unconditionally kill flags (for liveness `kill == 0`) yet DO overwrite them when `CL != 0`.
+fn may_write_flags(ins: &Instruction, kill: FlagMask) -> FlagMask {
+    use Mnemonic as M;
+    match ins.mnemonic() {
+        M::Rol | M::Ror
+            if ins.op_kind(1) == OpKind::Register && ins.op_register(1) == Register::CL =>
+        {
+            mask_of(&[0, 5])
+        }
+        M::Shl | M::Sal | M::Shr | M::Sar
+            if ins.op_kind(1) == OpKind::Register && ins.op_register(1) == Register::CL =>
+        {
+            mask_of(&[0, 5, 3, 4, 1])
+        }
+        M::Shld | M::Shrd
+            if ins.op_kind(2) == OpKind::Register && ins.op_register(2) == Register::CL =>
+        {
+            mask_of(&[0, 5, 3, 4, 1])
+        }
+        _ => kill,
+    }
+}
+
+/// [`FlagSummaries::touched_flags`] and [`FlagSummaries::written_flags`] for every function:
+/// least fixed point of "own flag reads/writes plus the flag effects of every direct callee and
+/// tail-jump target".
+fn flag_effects(
+    functions: &[&cfg::Function],
+) -> (BTreeMap<u64, FlagMask>, BTreeMap<u64, FlagMask>) {
+    let own: BTreeMap<u64, (FlagMask, FlagMask, BTreeSet<u64>)> = functions
+        .iter()
+        .map(|f| (f.entry, own_flag_effects(f)))
+        .collect();
+    let mut touched: BTreeMap<u64, FlagMask> = own.keys().map(|&entry| (entry, 0)).collect();
+    let mut written: BTreeMap<u64, FlagMask> = own.keys().map(|&entry| (entry, 0)).collect();
+    let mut callers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for (&entry, (_, _, callees)) in &own {
+        for &callee in callees {
+            if own.contains_key(&callee) {
+                callers.entry(callee).or_default().insert(entry);
+            }
+        }
+    }
+    let mut queued: BTreeSet<u64> = own.keys().copied().collect();
+    let mut work: VecDeque<u64> = own.keys().copied().collect();
+    while let Some(entry) = work.pop_front() {
+        queued.remove(&entry);
+        let (own_t, own_w, callees) = &own[&entry];
+        let old_t = touched[&entry];
+        let old_w = written[&entry];
+        let mut new_t = old_t | own_t;
+        let mut new_w = old_w | own_w;
+        for callee in callees {
+            new_t |= touched.get(callee).copied().unwrap_or(ALL_FLAGS);
+            new_w |= written.get(callee).copied().unwrap_or(ALL_FLAGS);
+        }
+        if new_t != old_t || new_w != old_w {
+            touched.insert(entry, new_t);
+            written.insert(entry, new_w);
+            for &caller in callers.get(&entry).into_iter().flatten() {
+                if queued.insert(caller) {
+                    work.push_back(caller);
+                }
+            }
+        }
+    }
+    (touched, written)
+}
+
+fn own_flag_effects(func: &cfg::Function) -> (FlagMask, FlagMask, BTreeSet<u64>) {
+    let mut callees = BTreeSet::new();
+    if !func.blocks.contains_key(&func.entry) {
+        return (ALL_FLAGS, ALL_FLAGS, callees);
+    }
+    let mut touched: FlagMask = 0;
+    let mut written: FlagMask = 0;
+    for block in func.blocks.values() {
+        let (body, transfer) = match block.instructions.split_last() {
+            Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
+            _ => (&block.instructions[..], None),
+        };
+        for ins in body {
+            match instruction_step(block, ins) {
+                Step::Call(target) => {
+                    callees.insert(target);
+                }
+                Step::Effect { .. } if ins.mnemonic() == Mnemonic::Call => {
+                    touched = ALL_FLAGS;
+                    written = ALL_FLAGS;
+                }
+                Step::Effect { gen_, kill } => match flag_effect(ins) {
+                    Some(_) => {
+                        let w = may_write_flags(ins, kill);
+                        touched |= gen_ | w;
+                        written |= w;
+                    }
+                    None => {
+                        touched = ALL_FLAGS;
+                        written = ALL_FLAGS;
+                    }
+                },
+            }
+        }
+        match (block.terminator, transfer) {
+            (Terminator::Fallthrough | Terminator::Jump, _) => {}
+            (Terminator::Branch, Some(ins)) if ins.is_jcc_short_or_near() => {
+                touched |= read_mask(ins);
+            }
+            (Terminator::Return, Some(ins))
+                if matches!(ins.code(), Code::Retnq | Code::Retnq_imm16) => {}
+            _ => {
+                touched = ALL_FLAGS;
+                written = ALL_FLAGS;
+            }
+        }
+        if matches!(
+            block.terminator,
+            Terminator::Fallthrough | Terminator::Jump | Terminator::Branch
+        ) {
+            if block.successors.is_empty() {
+                touched = ALL_FLAGS;
+                written = ALL_FLAGS;
+            }
+            for edge in &block.successors {
+                match *edge {
+                    Edge::TailCall(target) => {
+                        callees.insert(target);
+                    }
+                    _ => match edge.intra_target() {
+                        Some(target) if func.blocks.contains_key(&target) => {}
+                        _ => {
+                            touched = ALL_FLAGS;
+                            written = ALL_FLAGS;
+                        }
+                    },
+                }
+            }
+        }
+    }
+    (touched, written, callees)
+}
+
+/// Registers and arithmetic flags that `func`'s own instructions may write into its local allocas
+/// (excluding callee writes, which go straight to `%state` and are mirrored back via `sync_in`).
+/// Registers/flags outside this mask are strictly read-only in `func`, so `sync_out_parts` can
+/// skip storing them back to `%state` (their `%state` slots already hold the exact live values).
+pub(super) fn own_written_state_and_flags(func: &cfg::Function) -> (StateMask, FlagMask) {
+    if !func.blocks.contains_key(&func.entry) {
+        return (ALL_STATE, ALL_FLAGS);
+    }
+    let rsp: StateMask = 1 << Register::RSP.number();
+    let mut factory = InstructionInfoFactory::new();
+    let mut written_state: StateMask = 0;
+    let mut written_flags: FlagMask = 0;
+    for block in func.blocks.values() {
+        let (body, transfer) = match block.instructions.split_last() {
+            Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
+            _ => (&block.instructions[..], None),
+        };
+        for ins in body {
+            if ins.mnemonic() == Mnemonic::Call {
+                written_state |= rsp;
+                continue;
+            }
+            let Some((_, kill)) = flag_effect(ins) else {
+                return (ALL_STATE, ALL_FLAGS);
+            };
+            let (_, w) = used_and_written_state(ins, factory.info(ins));
+            written_state |= w;
+            written_flags |= may_write_flags(ins, kill);
+        }
+        match (block.terminator, transfer) {
+            (Terminator::Fallthrough | Terminator::Jump | Terminator::IndirectJump, _) => {}
+            (Terminator::Branch, Some(ins)) if ins.is_jcc_short_or_near() => {}
+            (Terminator::Return, Some(ins))
+                if matches!(ins.code(), Code::Retnq | Code::Retnq_imm16) =>
+            {
+                written_state |= rsp;
+            }
+            _ => return (ALL_STATE, ALL_FLAGS),
+        }
+    }
+    (written_state, written_flags)
 }
 
 /// [`FlagSummaries::touched`] and [`FlagSummaries::written`] for every function: least fixed point
