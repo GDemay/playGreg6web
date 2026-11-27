@@ -9308,6 +9308,181 @@ void test_native_flush_page_index() {
     dg::set_flush_mode(dg::FlushMode::Index);
 }
 
+// #1963 edge cases: a buffer destroyed and re-created at the same address, a vmem remap / decommit
+// of a primed buffer's pages, an unchanged remap, a one-byte buffer at a page edge, overlapping
+// buffers, and writes racing the flush (the shadow a consumer rebuilds from the uploads must end up
+// equal to the guest bytes; flush_crosscheck_misses must stay 0).
+void test_native_flush_edge_cases() {
+    constexpr uint64_t kPage = 4096, k64K = 64ull << 10;
+    playgta6::os::set_write_tracking(true);
+    const dg::FlushMode modes[] = {dg::FlushMode::Full, dg::FlushMode::Index, dg::FlushMode::CrossCheck};
+    for (const dg::FlushMode mode : modes) {
+        dg::set_flush_mode(mode);
+        dg::set_flush_crosscheck_every(1);
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        auto& arena = com::guest_memory();
+        const uint64_t mem = com::guest_alloc(4 * k64K);
+        CHECK(mem != 0);
+        int32_t result = -1;
+        std::vector<uint32_t> watch;  // buffer ids whose uploads are recorded
+        struct Write {
+            uint32_t id;
+            uint32_t offset;
+            std::vector<uint8_t> bytes;
+        };
+        auto flush = [&] {
+            gpu::CommandEncoder enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(enc);
+            dev->end_submission();
+            std::vector<Write> out;
+            size_t off = 0;
+            while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+                GpuPacketHeader h{};
+                std::memcpy(&h, enc.data() + off, sizeof(h));
+                off += sizeof(h);
+                if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::WriteBuffer) {
+                    GpuWriteBufferPayload w{};
+                    std::memcpy(&w, enc.data() + off, sizeof(w));
+                    if (std::find(watch.begin(), watch.end(), w.id) != watch.end()) {
+                        Write x{w.id, w.dst_offset, {}};
+                        x.bytes.assign(enc.data() + off + sizeof(w), enc.data() + off + h.payload_bytes);
+                        out.push_back(std::move(x));
+                    }
+                }
+                off += h.payload_bytes;
+            }
+            return out;
+        };
+        auto touches = [](const std::vector<Write>& w, uint32_t id, uint64_t byte) {
+            return std::any_of(w.begin(), w.end(), [&](const Write& x) {
+                return x.id == id && x.offset <= byte && byte < x.offset + x.bytes.size();
+            });
+        };
+        const uint64_t misses0 = dg::work_total(dg::Work::FlushCrosscheckMisses);
+        const uint32_t one = 1, two = 2;
+        auto make = [&](uint64_t at, uint64_t bytes, uint64_t* obj) {
+            *obj = fx.create(scene.device, Slot2::CreatePlacedResourceX, {I(at), I(put(buffer_desc(bytes))), I(0), I(0)},
+                             dg::IID_ID3D12Resource, &result);
+            CHECK(result == 0);
+            const uint32_t id = object_of<dg::Resource>(*obj)->id();
+            watch.push_back(id);
+            return id;
+        };
+
+        // 1. Destroyed and re-created at the same address, with the old one primed.
+        uint64_t a = 0;
+        uint32_t id_a = make(mem, 3 * kPage + 100, &a);
+        CHECK(com::write_guest(mem + kPage + 4, one));
+        flush();
+        flush();
+        CHECK(flush().empty());
+        fx.vcall(a, Slot::Release);
+        CHECK(com::write_guest(mem + 2 * kPage + 4, two));  // lands while no buffer exists
+        CHECK(flush().empty());                               // the dead id is not visited
+        uint64_t a2 = 0;
+        const uint32_t id_a2 = make(mem, 3 * kPage + 100, &a2);
+        {
+            const auto w = flush();  // brand new: uploads its current bytes, both written pages
+            CHECK(touches(w, id_a2, kPage + 4) && touches(w, id_a2, 2 * kPage + 4));
+            CHECK(!touches(w, id_a, kPage + 4));
+        }
+        flush();
+        CHECK(flush().empty());
+        CHECK(com::write_guest(mem + 4, two));
+        CHECK(touches(flush(), id_a2, 4));
+        CHECK(flush().empty());
+
+        // 2. vmem remap / decommit-recommit of a primed buffer's page.
+        {
+            uint8_t src[kPage];
+            std::memset(src, 0xAB, sizeof(src));
+            CHECK(arena.fill_committed(mem + 2 * kPage, src, kPage));  // in-place remap of page 2
+            CHECK(touches(flush(), id_a2, 2 * kPage));
+            CHECK(flush().empty());
+            CHECK(arena.fill_committed(mem + 2 * kPage, src, kPage));  // same bytes: compared, nothing uploaded
+            CHECK(flush().empty());
+            CHECK(arena.fill_committed(mem + kPage, nullptr, kPage));  // zero fill remap of page 1 (held a 1)
+            CHECK(touches(flush(), id_a2, kPage + 4));
+            CHECK(flush().empty());
+            // Decommit + recommit (zero pages, no write): the commit log reports it.
+            CHECK(com::write_guest(mem + 3 * kPage + 8, one));
+            flush();
+            CHECK(flush().empty());
+            CHECK(arena.decommit(mem + 3 * kPage, kPage));
+            CHECK(arena.commit(mem + 3 * kPage, kPage, playgta6::os::PageProtect::ReadWrite));
+            CHECK(touches(flush(), id_a2, 3 * kPage + 8));
+            CHECK(flush().empty());
+        }
+
+        // 3. A one-byte buffer on the last byte of a page, and one overlapping A's tail.
+        uint64_t tiny = 0, over = 0;
+        const uint32_t id_t = make(mem + k64K + kPage - 4, 4, &tiny);
+        const uint32_t id_o = make(mem + 3 * kPage, kPage, &over);  // overlaps A2's last page
+        flush();
+        flush();
+        CHECK(flush().empty());
+        CHECK(com::write_guest(mem + k64K + kPage - 4, two));
+        CHECK(touches(flush(), id_t, 0));
+        CHECK(com::write_guest(mem + 3 * kPage + 50, two));  // names both overlapping buffers
+        {
+            const auto w = flush();
+            CHECK(touches(w, id_a2, 3 * kPage + 50) && touches(w, id_o, 50));
+        }
+        CHECK(flush().empty());
+        fx.vcall(over, Slot::Release);
+        CHECK(com::write_guest(mem + 3 * kPage + 52, one));
+        CHECK(touches(flush(), id_a2, 3 * kPage + 52));
+        fx.vcall(tiny, Slot::Release);
+
+        // 4. Writes racing the flush: rebuild the shadow from the uploads.
+        flush();
+        flush();
+        std::vector<uint8_t> mirror(3 * kPage + 100, 0);
+        std::memcpy(mirror.data(), com::guest_to_host(mem, mirror.size()), mirror.size());
+        auto apply = [&](const std::vector<Write>& ws) {
+            for (const auto& x : ws) {
+                if (x.id == id_a2 && x.offset + x.bytes.size() <= mirror.size()) {
+                    std::memcpy(mirror.data() + x.offset, x.bytes.data(), x.bytes.size());
+                }
+            }
+        };
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            uint32_t v = 1;
+            uint64_t s = 12345;
+            while (!stop.load()) {
+                s = s * 6364136223846793005ull + 1442695040888963407ull;
+                const uint64_t off = (s >> 33) % (3 * kPage + 96);
+                com::write_guest(mem + (off & ~3ull), ++v);
+                if ((v & 63) == 0) {
+                    std::this_thread::yield();
+                }
+            }
+        });
+        for (int i = 0; i < 300; ++i) {
+            apply(flush());
+        }
+        stop = true;
+        writer.join();
+        apply(flush());  // a write after the last take is uploaded by the next flush, nothing is lost
+        apply(flush());
+        apply(flush());
+        {
+            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(mem, mirror.size()));
+            CHECK(live != nullptr && std::memcmp(live, mirror.data(), mirror.size()) == 0);
+        }
+        CHECK(flush().empty());
+        CHECK(dg::work_total(dg::Work::FlushCrosscheckMisses) == misses0);
+        fx.vcall(a2, Slot::Release);
+        scene.release_all();
+        com::guest_free(mem);
+    }
+    dg::set_flush_mode(dg::FlushMode::Index);
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -9321,6 +9496,7 @@ int main() {
     test_streaming_texture_hash_skip();
     test_shared_view_write_tracking_flush();
     test_native_flush_page_index();
+    test_native_flush_edge_cases();
     test_export_registration();
     test_create_device();
     test_queue_allocator_fence();
