@@ -17,10 +17,14 @@ namespace gw=os::guest_window;
 int main(int argc,char** argv) {
  if(argc!=4)return 2;
  const size_t mapped_bytes=std::strtoull(argv[1],nullptr,0)*1024*1024;
- const bool dense_resident=std::strcmp(argv[3],"fragmented-dense-resident")==0;
+ const bool quarter=std::strcmp(argv[3],"fragmented-quarter")==0;
+ const bool half=std::strcmp(argv[3],"fragmented-half")==0;
+ const bool nearly=std::strcmp(argv[3],"fragmented-nearly-dense")==0;
+ const bool dense_resident=quarter||half||nearly||std::strcmp(argv[3],"fragmented-dense-resident")==0;
  const bool dense=dense_resident||std::strcmp(argv[3],"fragmented-dense")==0;
  const bool unaligned=std::strcmp(argv[3],"fragmented-unaligned")==0;
  const size_t bytes=mapped_bytes-(unaligned?246:0);
+ const size_t dirty_bytes=quarter?bytes/4:half?bytes/2:nearly?bytes-gw::kSlotBytes:bytes;
  const size_t frames=std::strtoull(argv[2],nullptr,0);
  const bool scattered=dense||unaligned||std::strcmp(argv[3],"fragmented")==0;
  if(!mapped_bytes||mapped_bytes%gw::kSlotBytes||!frames||(!scattered&&std::strcmp(argv[3],"contiguous")))return 2;
@@ -48,13 +52,13 @@ int main(int argc,char** argv) {
  for(size_t f=0;f<frames;++f){
   const size_t at=(f%(bytes/gw::kSlotBytes))*gw::kSlotBytes+4096;
   const uint32_t value=static_cast<uint32_t>(f+1);
-  if(dense){for(size_t i=0;i<bytes;i+=4096)if(!com::write_guest(cpu+i,value))throw std::runtime_error("dense write failed");}
+  if(dense){for(size_t i=0;i<dirty_bytes;i+=4096)if(!com::write_guest(cpu+i,value))throw std::runtime_error("dense write failed");}
   else if(!com::write_guest(cpu+at,value))throw std::runtime_error("write failed");
   gpu::CommandEncoder e;const auto t=std::chrono::steady_clock::now();flush(e);
   ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
   using namespace playgta6;
   size_t cursor=0, uploaded=0;
-  const size_t expected_bytes=dense?bytes:4096;
+  const size_t expected_bytes=dense?dirty_bytes:4096;
   while(cursor<e.size()){
    GpuPacketHeader h{};GpuWriteBufferPayload w{};
    if(e.size()-cursor<sizeof(h)+sizeof(w))throw std::runtime_error("short packet");
@@ -79,7 +83,7 @@ int main(int argc,char** argv) {
   if(!gw::unmap_slot(base+mapped_bytes-gw::kSlotBytes))throw std::runtime_error("unmap failed");
   gpu::CommandEncoder hole;flush(hole);if(hole.size())throw std::runtime_error("unmapped page changed");
  }
- std::printf("{\"bytes\":%zu,\"flushes\":%zu,\"mapping\":\"%s\",\"wall_ms\":%.9f,\"compared_bytes\":%llu,\"digest\":\"%016llx\",\"correct\":true}\n",bytes,frames,argv[3],ms,(unsigned long long)compared,(unsigned long long)digest);
+ std::printf("{\"bytes\":%zu,\"written_bytes_per_flush\":%zu,\"flushes\":%zu,\"mapping\":\"%s\",\"wall_ms\":%.9f,\"compared_bytes\":%llu,\"digest\":\"%016llx\",\"correct\":true}\n",bytes,dense?dirty_bytes:4096,frames,argv[3],ms,(unsigned long long)compared,(unsigned long long)digest);
  r.reset();dev.reset();com::reset_com_bridge();com::set_guest_memory(nullptr);gw::reset_for_testing();
  }catch(const std::exception& e){std::fprintf(stderr,"%s\n",e.what());return 1;}
 }
