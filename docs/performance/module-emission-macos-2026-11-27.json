@@ -359,5 +359,5 @@
     }
   ],
   "measuredProductionCommit": "5e0fd084078a483b9e0d5d3020a8e18c684fc019",
-  "status": "Exploratory Apple M5 native lane; same deterministic requested allocation/capacity reductions, no speed claim. Independent Linux default-dispatch run is primary."
+  "status": "Exploratory Apple M5 native 14-shape lane at production5e0fd084; the dispatch-dominant review control was not measured here. Independent 15-shape Linux run at7728185e is primary. No speed claim."
 }
