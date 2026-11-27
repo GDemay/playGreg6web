@@ -1,0 +1,45 @@
+name: Matched public Rust module emitter
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: true
+      patch_ref:
+        required: true
+permissions:
+  contents: read
+jobs:
+  linux-emitter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: PlayGreg6Web/playGreg6web
+          ref: ${{ inputs.base_ref }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.patch_ref }}
+          path: patch
+      - name: Same benchmark source, separate release builds
+        run: |
+          mkdir -p baseline/recomp/examples results
+          cp patch/recomp/examples/bench_module_emission.rs baseline/recomp/examples/bench_module_emission.rs
+          python3 runner/tools/perf_run_fragmented_flush.py --environment-only --output results/environment.json --base "${{ inputs.base_ref }}" --patch "${{ inputs.patch_ref }}"
+          rustc --version > results/rust-toolchain.txt
+          cargo build --manifest-path baseline/Cargo.toml --release -p playgta6-recomp --example bench_module_emission -j4
+          cargo build --manifest-path patch/Cargo.toml --release -p playgta6-recomp --example bench_module_emission -j4
+      - name: Alternating seven-pair matched emission and allocation samples
+        run: |
+          python3 patch/tools/bench_module_emission.py baseline/target/release/examples/bench_module_emission patch/target/release/examples/bench_module_emission --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.patch_ref }}" --samples 7 > results/emitter.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: module-emitter-controls
+          path: results/*
+          if-no-files-found: ignore
