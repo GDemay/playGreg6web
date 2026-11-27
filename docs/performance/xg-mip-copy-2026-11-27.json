@@ -405,5 +405,11 @@
     "baselineBinarySha256": "7e1fdca44fbfe0f7c53847f6ab1f65d10b73197b13e64db5ab38dd84f77553af",
     "patchBinarySha256": "0d06eefa90ed10ed6e27e01300d0d8e8be32bb4c12bfa597ac58e89f7ce6ab98",
     "buildProcedure": "reset --hard exact baseline; copy measured harness; build+copy baseline binary; replace only wrapper with measured source; rebuild+copy patch binary; run correctness before matched timing"
+  },
+  "postMeasurementChanges": {
+    "productionCode": "unchanged",
+    "benchmarkFunctionAndRunnerLogic": "unchanged",
+    "regressionCleanup": "removed two unrelated retired slot8/mip0 regression functions and their main calls; selected-mip, source-validation, alias, translated and threshold tests retained",
+    "benchmarkFunctionSha256": "6fc1959de8a6fc530e94d55941b2027cf9e9d2390e6bfe475c7753e0106b6aa8"
   }
 }
