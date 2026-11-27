@@ -866,6 +866,259 @@ void test_held_pointer_blocks_decommit() {
     CHECK(!arena.host_ptr_const_held(0, 1, hold2));
 }
 
+// #1077: Lazy commit (commit-on-first-touch on Windows) + NoAccess commit deferral + write-watch
+// compatibility + HostWriteScope materialization for kernel writes.
+void test_lazy_commit_savings_and_first_touch() {
+    VirtualMemoryArena arena;
+    CHECK(arena.valid());
+
+    // Deferred NoAccess commits cost 0 host commit on every platform.
+    constexpr uint64_t k4M = 4ull << 20;
+    const uint64_t na = arena.reserve(0, k4M, PageProtect::NoAccess);
+    CHECK(na != 0);
+    CHECK(arena.commit(na, k4M, PageProtect::NoAccess));
+    CHECK(arena.committed_bytes() == k4M);
+    CHECK(arena.host_committed_bytes() == 0);
+    CHECK(arena.lazy_deferred_bytes() == k4M);
+    CHECK(arena.query(na).state == MemState::Commit);
+    CHECK(arena.query(na).protect == PageProtect::NoAccess);
+    CHECK(arena.protect(na, k4M, PageProtect::ReadWrite));
+    uint64_t zero_val = 0xDEADBEEFull;
+    CHECK(arena.read(na + kPageSize, &zero_val, sizeof(zero_val)) && zero_val == 0);
+    CHECK(arena.release(na));
+    CHECK(arena.committed_bytes() == 0 && arena.host_committed_bytes() == 0 && arena.lazy_deferred_bytes() == 0);
+
+#if defined(_WIN32)
+    constexpr uint64_t k64M = 64ull << 20;
+    constexpr uint64_t k64K = 64ull << 10;
+    constexpr uint64_t k1M = 1ull << 20;
+    const bool prev_lazy = lazy_commit_enabled();
+    set_lazy_commit(true);
+    CHECK(lazy_commit_enabled());
+
+    const uint64_t va = arena.virtual_alloc(0, k64M, kMemReserve | kMemCommit, PageProtect::ReadWrite);
+    CHECK(va != 0);
+    CHECK(arena.committed_bytes() == k64M);
+    CHECK(arena.host_committed_bytes() == 0);
+    CHECK(arena.lazy_deferred_bytes() == k64M);
+    CHECK(arena.query(va + 17 * k1M).state == MemState::Commit);
+    CHECK(arena.query(va + 17 * k1M).protect == PageProtect::ReadWrite);
+
+    // OS VirtualQuery confirms the untouched pages are still MEM_RESERVE (0 OS private commit).
+    MEMORY_BASIC_INFORMATION mbi{};
+    CHECK(VirtualQuery(arena.translate(va), &mbi, sizeof(mbi)) == sizeof(mbi));
+    CHECK(mbi.State == MEM_RESERVE);
+
+    // arena.read() and zero fill_committed() return zeros without materializing any host pages.
+    std::vector<uint8_t> buf(256 * 1024, 0xCC);
+    CHECK(arena.read(va + 5 * k1M, buf.data(), buf.size()));
+    CHECK(all_zero(buf.data(), buf.size()));
+    CHECK(arena.fill_committed(va + 6 * k1M, nullptr, k1M));
+    CHECK(arena.host_committed_bytes() == 0);
+    CHECK(arena.lazy_deferred_bytes() == k64M);
+
+    // First raw guest store faults in exactly one 64 KiB granule (99.9% untouched commit saved).
+    const uint64_t faults0 = lazy_commit_faults();
+    uint8_t* raw = arena.translate(va);
+    raw[17 * k1M + 123] = 0x7E;
+    CHECK(lazy_commit_faults() == faults0 + 1);
+    CHECK(arena.host_committed_bytes() == k64K);
+    CHECK(arena.lazy_deferred_bytes() == k64M - k64K);
+    CHECK(raw[17 * k1M + 0] == 0 && raw[17 * k1M + 123] == 0x7E && raw[17 * k1M + k64K - 1] == 0);
+
+    // First raw guest read faults in one 64 KiB granule, deterministically zero.
+    const volatile uint8_t* vraw = raw;
+    CHECK(vraw[40 * k1M + 42] == 0);
+    CHECK(lazy_commit_faults() == faults0 + 2);
+    CHECK(arena.host_committed_bytes() == 2 * k64K);
+
+    // HostWriteScope eagerly materializes before a Windows kernel write (fread).
+    {
+        const char* path = "test_vmem_lazy_io.tmp";
+        if (std::FILE* f = std::fopen(path, "wb")) {
+            std::vector<uint8_t> payload(128 * 1024, 0x3D);
+            std::fwrite(payload.data(), 1, payload.size(), f);
+            std::fclose(f);
+        }
+        std::FILE* f = std::fopen(path, "rb");
+        CHECK(f != nullptr);
+        if (f != nullptr) {
+            std::setvbuf(f, nullptr, _IONBF, 0);
+            {
+                const HostWriteScope host_write(raw + 2 * k1M, 128 * 1024);
+                CHECK(arena.host_committed_bytes() == 4 * k64K);
+                CHECK(std::fread(raw + 2 * k1M, 1, 128 * 1024, f) == 128 * 1024);
+            }
+            std::fclose(f);
+            CHECK(raw[2 * k1M] == 0x3D && raw[2 * k1M + 128 * 1024 - 1] == 0x3D);
+        }
+        std::remove(path);
+    }
+
+    // Protection changes on unmaterialized sub-ranges do not materialize, and remain enforced.
+    const uint64_t hc_before_prot = arena.host_committed_bytes();
+    CHECK(arena.protect(va + 32 * k1M, k1M, PageProtect::ReadOnly));
+    CHECK(arena.protect(va + 33 * k1M, k1M, PageProtect::NoAccess));
+    CHECK(arena.host_committed_bytes() == hc_before_prot);
+#if defined(_MSC_VER)
+    CHECK(!faults_on_read(raw + 32 * k1M + 16));
+    CHECK(raw[32 * k1M + 16] == 0);
+    CHECK(faults_on_write(raw + 32 * k1M + 16));
+    CHECK(faults_on_read(raw + 33 * k1M + 16));
+    CHECK(faults_on_write(raw + 33 * k1M + 16));
+#endif
+
+    // MEM_RESET succeeds cleanly across mixed materialized + unmaterialized lazy ranges.
+    const uint64_t hc_before_reset = arena.host_committed_bytes();
+    CHECK(arena.virtual_alloc(va, k64M, kMemReset, PageProtect::ReadWrite) == va);
+    CHECK(arena.host_committed_bytes() == hc_before_reset);
+
+    // Decommit reclaims both materialized and deferred bytes.
+    CHECK(arena.decommit(va, k64M));
+    CHECK(arena.committed_bytes() == 0);
+    CHECK(arena.host_committed_bytes() == 0);
+    CHECK(arena.lazy_deferred_bytes() == 0);
+#if defined(_MSC_VER)
+    CHECK(faults_on_read(raw + 17 * k1M + 123));
+#endif
+    CHECK(arena.release(va));
+
+    // Toggle off -> eager commit materializes immediately.
+    set_lazy_commit(false);
+    const uint64_t eager = arena.virtual_alloc(0, 256 * 1024, kMemReserve | kMemCommit, PageProtect::ReadWrite);
+    CHECK(eager != 0);
+    CHECK(arena.host_committed_bytes() == 256 * 1024);
+    CHECK(arena.lazy_deferred_bytes() == 0);
+    CHECK(arena.release(eager));
+    set_lazy_commit(true);
+
+    // MEM_WRITE_WATCH tracks writes on lazy-committed ranges without reporting untouched pages.
+    set_write_tracking(true);
+    VirtualMemoryArena watched;
+    set_write_tracking(false);
+    const uint64_t wva = watched.virtual_alloc(0, 256 * 1024, kMemReserve | kMemCommit, PageProtect::ReadWrite);
+    CHECK(wva != 0 && watched.host_committed_bytes() == 0);
+    uint8_t* wp = watched.host_ptr(wva, 256 * 1024);
+    CHECK(wp != nullptr && watched.host_committed_bytes() == 0);
+    WriteCursor cur;
+    std::vector<uint64_t> dirty;
+    take_written_pages(wp, 256 * 1024, &cur, &dirty);
+    dirty.clear();
+    CHECK(take_written_pages(wp, 256 * 1024, &cur, &dirty) && dirty.empty());
+    CHECK(watched.host_committed_bytes() == 0);
+    wp[20 * kWrittenPageSize + 7] = 0x99;
+    CHECK(watched.host_committed_bytes() == k64K);
+    CHECK(take_written_pages(wp, 256 * 1024, &cur, &dirty));
+    CHECK(dirty == (std::vector<uint64_t>{20 * kWrittenPageSize}));
+    CHECK(watched.release(wva));
+
+    set_lazy_commit(prev_lazy);
+#endif
+}
+
+// #1077 + #1913/#1928: Concurrent first-touch VEH faults (including while holding
+// VirtualMemoryArena::mutex_ via host_ptr_const_held) racing with decommit/recommit/protect/reset.
+void test_lazy_commit_concurrent_stress() {
+    VirtualMemoryArena arena;
+    CHECK(arena.valid());
+    constexpr uint64_t kGranules = 32;  // 32 x 64 KiB = 2 MiB
+    constexpr uint64_t k64K = 64ull << 10;
+    constexpr uint64_t kTotal = kGranules * k64K;
+    const uint64_t va = arena.virtual_alloc(0, kTotal, kMemReserve | kMemCommit, PageProtect::ReadWrite);
+    CHECK(va != 0);
+
+    std::atomic<int> failures{0};
+    std::atomic<bool> stop{false};
+
+    // 4 reader threads using host_ptr_const_held (holds arena::mutex_ while faulting on lazy pages!)
+    // plus arena.read().
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r) {
+        readers.emplace_back([&, r] {
+            uint64_t s = 0x123456789ull + static_cast<uint64_t>(r) * 97;
+            std::vector<uint8_t> tmp(kPageSize);
+            while (!stop.load(std::memory_order_relaxed)) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                const uint64_t g = s % kGranules;
+                const uint64_t addr = va + g * k64K;
+                if ((s & 1) == 0) {
+                    std::unique_lock<std::mutex> hold;
+                    const uint8_t* p = arena.host_ptr_const_held(addr, k64K, hold);
+                    if (p != nullptr) {
+                        const uint8_t v0 = p[0];
+                        const uint8_t v1 = p[k64K - 1];
+                        if (v0 != 0 && v0 != 0xA5 && v0 != 0x5A) {
+                            failures.fetch_add(1);
+                        }
+                        if (v1 != 0 && v1 != 0xA5 && v1 != 0x5A) {
+                            failures.fetch_add(1);
+                        }
+                    }
+                } else {
+                    if (arena.read(addr, tmp.data(), tmp.size())) {
+                        const uint8_t v = tmp[0];
+                        if (v != 0 && v != 0xA5 && v != 0x5A) {
+                            failures.fetch_add(1);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // 4 mutator threads cycling lazy commits, decommits, protects, resets, writes, and zero-fills.
+    std::vector<std::thread> mutators;
+    for (int m = 0; m < 4; ++m) {
+        mutators.emplace_back([&, m] {
+            uint64_t s = 0xCAFEBABE1ull + static_cast<uint64_t>(m) * 131;
+            std::vector<uint8_t> fill(k64K);
+            for (int i = 0; i < 600; ++i) {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                const uint64_t g = (static_cast<uint64_t>(m) * (kGranules / 4)) + (s % (kGranules / 4));
+                const uint64_t addr = va + g * k64K;
+                switch (s % 6) {
+                    case 0:
+                        arena.decommit(addr, k64K);
+                        break;
+                    case 1:
+                        arena.commit(addr, k64K, PageProtect::ReadWrite);
+                        break;
+                    case 2:
+                        arena.virtual_alloc(addr, k64K, kMemReset, PageProtect::ReadWrite);
+                        break;
+                    case 3:
+                        arena.fill_committed(addr, nullptr, k64K);
+                        break;
+                    case 4:
+                        arena.protect(addr, k64K, (s & 16) ? PageProtect::ReadOnly : PageProtect::ReadWrite);
+                        break;
+                    default: {
+                        const uint8_t tag = (s & 8) ? 0xA5 : 0x5A;
+                        std::memset(fill.data(), tag, fill.size());
+                        arena.write(addr, fill.data(), fill.size());
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    for (auto& t : mutators) {
+        t.join();
+    }
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& t : readers) {
+        t.join();
+    }
+    CHECK(failures.load() == 0);
+    CHECK(arena.release(va));
+    CHECK(arena.committed_bytes() == 0 && arena.host_committed_bytes() == 0 && arena.lazy_deferred_bytes() == 0);
+}
+
 int main() {
     std::printf("test_vmem_contiguous\n");
     test_translation_and_contiguity();
@@ -884,6 +1137,8 @@ int main() {
     test_mem_reset_and_reclaim_telemetry();
     test_lookup_cache_consistency();
     test_held_pointer_blocks_decommit();
+    test_lazy_commit_savings_and_first_touch();
+    test_lazy_commit_concurrent_stress();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_vmem_contiguous: %d failure(s)\n", g_failures);
         return 1;

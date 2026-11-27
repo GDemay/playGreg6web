@@ -686,6 +686,48 @@ void test_native_shared_view_write_tracking() {
 #endif
 }
 
+// #1077: Chunked GPU page table crosses 256 MiB chunk boundaries cleanly and reclaims on unmap / forget.
+void test_gpu_page_table_chunk_boundaries_and_reclaim() {
+    reset();
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuWindows);
+    const uint64_t S = 1 * GiB;
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kWindowType, 0x21u, kCpuProtect);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kWindowType, 0x3u, kGpuProtect);
+    CHECK(cpu != nullptr && gpu != nullptr);
+    const uint64_t G = va_of(gpu);
+
+    // Map across the 256 MiB chunk boundary (4094..4099) and in chunk 2 (512 MiB + 10).
+    std::vector<xw::PageMappingRange> ranges(2);
+    ranges[0].gpu_va = G + 4094 * k64K;
+    ranges[0].entries = {{0, 100, 6}};  // 2 pages in chunk 0, 4 pages in chunk 1
+    ranges[1].gpu_va = G + 512 * MiB + 10 * k64K;
+    ranges[1].entries = {{1, 777, 3}};  // 3 pages in chunk 2
+    auto r = xw::apply_gpu_page_mappings(ranges, 0, 4096);
+    CHECK(r.mapped_pages == 9 && r.outside_window == 0);
+    CHECK(xw::accounting().gpu_window_mapped == 9 * k64K);
+    for (uint64_t i = 0; i < 6; ++i) {
+        CHECK(xw::gpu_page_pool_index(G + (4094 + i) * k64K) == static_cast<int64_t>(100 + i));
+    }
+    CHECK(xw::gpu_page_pool_index(G + 512 * MiB + 11 * k64K) == 777);
+
+    // Unmap chunk 0 pages completely (reclaims chunk 0) while leaving chunk 1 intact.
+    std::vector<xw::PageMappingRange> unmap(1);
+    unmap[0].gpu_va = G + 4094 * k64K;
+    unmap[0].entries = {{2, 0, 2}};
+    xw::apply_gpu_page_mappings(unmap, 0, 4096);
+    CHECK(xw::gpu_page_pool_index(G + 4094 * k64K) == -1);
+    CHECK(xw::gpu_page_pool_index(G + 4095 * k64K) == -1);
+    CHECK(xw::gpu_page_pool_index(G + 4096 * k64K) == 102);
+    CHECK(xw::accounting().gpu_window_mapped == 7 * k64K);
+
+    // Releasing the GPU window reclaims all remaining chunks.
+    CHECK(xmem_virtual_free(gpu) && xmem_virtual_free(cpu));
+    CHECK(xw::accounting().gpu_window_mapped == 0);
+    CHECK(xw::gpu_page_pool_index(G + 4096 * k64K) == -1);
+    CHECK(xw::gpu_page_pool_index(G + 512 * MiB + 11 * k64K) == -1);
+    reset();
+}
+
 }  // namespace
 
 int main() {
@@ -702,6 +744,7 @@ int main() {
     test_native_shared_page_aliases();
     test_native_shared_view_write_tracking();
     test_view_only_write_tracking();
+    test_gpu_page_table_chunk_boundaries_and_reclaim();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xmem_windows: %d failure(s)\n", g_failures);
         return 1;

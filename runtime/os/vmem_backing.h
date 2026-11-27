@@ -25,6 +25,25 @@ bool reset_undo_pages(uint8_t* p, uint64_t len);
 // Applies a protection to committed pages (no-op where protections cannot be enforced).
 bool protect(uint8_t* p, uint64_t len, PageProtect protect);
 bool enforces_protection();
+
+// #1077: Windows lazy commit (commit-on-first-touch via leaf-locked VEH). When enabled (default
+// on Windows, false elsewhere), commit() calls >= 64 KiB defer OS MEM_COMMIT until first touch or
+// explicit materialization, avoiding private commit charge for untouched zero pages.
+void set_lazy_commit(bool on);
+bool lazy_commit_enabled();
+uint64_t lazy_deferred_bytes();
+uint64_t lazy_deferred_bytes_in_range(const uint8_t* base, uint64_t size);
+uint64_t lazy_commit_faults();
+// Copies [src, src + len) into dst without materializing unmaterialized lazy pages (fills zeros).
+// When `try_lock_only` is true (DiagnosticReads, #1916), uses bounded try-locks and returns false
+// on contention instead of blocking.
+bool read_backing(const uint8_t* src, void* dst, size_t len, bool try_lock_only = false);
+// Materializes any lazy pages in [dst, dst + len) before a bulk write (avoids per-chunk faults).
+bool materialize_for_write(uint8_t* dst, size_t len);
+// Zeroes [dst, dst + len), skipping unmaterialized lazy pages (already logically zero).
+void zero_backing(uint8_t* dst, size_t len);
+// Returns the mapped shared-view size starting at `at`, or 0 if not a tracked view head.
+uint64_t shared_view_size(const uint8_t* at);
 // See playgta6::os::take_written_pages (vmem.h). Windows reservations carry MEM_WRITE_WATCH and
 // shared page views are tracked by write protection (R40); other platforms return false.
 // `view_clock`: the caller's position for shared page views (null: report them all written).
