@@ -2,7 +2,7 @@
 // Consumer-contract benchmark: the C++ boot test separately proves activation.
 // Before: small pooled textures receive CPU zero WriteTextures, large textures are recreated.
 // After: both use the existing ClearTexture consumer packet. Does not time C++ packet generation.
-window.runTextureClearBenchmark = async function ({ mode = 'baseline', samples = 9, warmups = 3, operationsPerSample = 4 } = {}) {
+window.runTextureClearBenchmark = async function ({ mode = 'baseline', samples = 9, warmups = 3, operationsPerSample = 4, sizes = [128, 1024] } = {}) {
   const check = (ok,message) => { if(!ok) throw new Error(message); };
   check(mode==='baseline'||mode==='gpu-clear'||mode==='consume-only','mode must be baseline, gpu-clear or consume-only');
   check(crossOriginIsolated && typeof SharedArrayBuffer==='function','COOP/COEP required for Wasm-like SAB packets');
@@ -70,7 +70,8 @@ window.runTextureClearBenchmark = async function ({ mode = 'baseline', samples =
   }
   correctness.push('write -> ClearTexture -> partial write exact readback');
   const results=[];
-  for(const size of [128,1024]){
+  for(const size of sizes){
+    check(size===128||size===1024,'size must be 128 or 1024');
     const textureId=size===128?1:2;create(textureId,size,size);const zeros=zeroPacket(textureId,size,size);
     // Force every created/cleared texture to be observed by identical GPU work.
     // Otherwise fresh baseline textures could remain lazily uninitialized forever.
