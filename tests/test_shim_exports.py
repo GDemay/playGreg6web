@@ -154,6 +154,8 @@ AUDITED_FAMILY_INTERNALS: dict[str, str] = {
     "pg6_ws2_WSASetLastError": "declared, not registered by winsock_ordinals.cpp",
     "pg6_mw_xma_context_census": "host helper: boot report / audio trace census of XMA contexts",
     "pg6_mw_xma_contexts": "host helper: the AcpHal guest model's view of the XMA context array",
+    "pg6_mw_apu_map_apu_range": "host helper: single-lock APU range mapping for AcpHal guest model",
+    "pg6_mw_set_xma_contexts_released_callback": "host helper: quiesce XMA pump callback on AcpHalReleaseShapeContexts",
 }
 AUDIT_ROW_RE = re.compile(r'\bX\((pg6_\w+),\s*(ok|deny|pending),\s*"([^"]*)"\)')
 EXPORTED_RE = re.compile(r'"([^"]+)",[\s\\]*(?:\w+\(\s*)?&?(pg6_\w+)')
