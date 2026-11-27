@@ -14,8 +14,12 @@ import BootTracerDefault, {
   DEFAULT_TRACE_PID,
   DEFAULT_TRACE_TID,
   STAGE_NOT_STARTED,
+  FAULT_RECORD_PREFIX,
+  FAULT_RECORD_EVENT_TYPE,
   BootTracer,
   parseLogLine,
+  isFaultRecordLine,
+  parseFaultRecordLine,
   extractGuestVa,
   extractImportRef,
   normalizeGuestVa,
@@ -1443,4 +1447,173 @@ test('W290: validates recorder options, ingests fast-boot log lines, and clears 
   assert.equal(reMenu.firstReach, true);
   assert.equal(reMenu.bootToMainMenuMs, 333);
   assert.equal(tracer.getSnapshot().bootToMainMenuMs, 333);
+});
+
+test('Orch-39 parseFaultRecordLine and parseLogLine parse JSON (including \\uXXXX escaped kind) and KV [fault-record] payloads without misfiring as WASM_TRAP', () => {
+  assert.equal(FAULT_RECORD_PREFIX, '[fault-record]');
+  assert.equal(FAULT_RECORD_EVENT_TYPE, 'fault-record');
+
+  const jsonLine =
+    '[23:07:45][wasm] [fault-record] {"kind":"\\u0075nimplemented_slot","va":"0x00000001400ABC00","rip":"0x1400ABC00","thread":7,"elapsed_ms":4210,"function":{"entry":"0x1400AB000","offset":"0xc00"},"import":{"dll":"XStoreExt.dll","symbol":"#71"},"unimplemented_slot":{"interface":"IXStoreContext","guid":"{1234}","slot":71,"name":"QueryLicense"},"hard_stop":"S1","registers":{"rax":"0x1","rcx":"0x2"},"call_stack":{"method":"frame_pointer","frames":[{"address":"0x1400ABC00","symbol":{"name":"unreachable_trap_helper"}}]}}';
+
+  assert.equal(isFaultRecordLine(jsonLine), true);
+  assert.equal(isFaultRecordLine('[wasm] normal boot line'), false);
+
+  const parsedRecord = parseFaultRecordLine(jsonLine);
+  assert.ok(parsedRecord);
+  assert.equal(parsedRecord.kind, 'unimplemented_slot');
+  assert.equal(parsedRecord.va, '0x1400abc00');
+  assert.equal(parsedRecord.target, '0x1400abc00');
+  assert.equal(parsedRecord.rip, '0x1400abc00');
+  assert.equal(parsedRecord.thread, 7);
+  assert.equal(parsedRecord.elapsed_ms, 4210);
+  assert.equal(parsedRecord.unimplemented_slot.slot, 71);
+  assert.equal(parsedRecord.hard_stop, 'S1');
+  assert.equal(parsedRecord.registers.rax, '0x1');
+  assert.equal(parsedRecord.call_stack.frames[0].symbol.name, 'unreachable_trap_helper');
+
+  // Must parse as fault_record, NOT misfire as WASM_TRAP even when symbol contains "unreachable"/"trap".
+  const parsedLog = parseLogLine(jsonLine);
+  assert.equal(parsedLog?.type, 'fault_record');
+  assert.equal(parsedLog?.tag, 'fault-record');
+  assert.equal(parsedLog?.faultRecord.kind, 'unimplemented_slot');
+
+  // Compact key=value [fault-record] payload support.
+  const kvLine =
+    '[wasm] [fault-record] kind=guest_trap va=0x140001234 function=sub_140001200 import=kernel32.dll!CreateFileW com_slot=71 hard_stop=true thread=3 registers={"rax":"0xdead"}';
+  const parsedKv = parseFaultRecordLine(kvLine);
+  assert.ok(parsedKv);
+  assert.equal(parsedKv.kind, 'guest_trap');
+  assert.equal(parsedKv.va, '0x140001234');
+  assert.equal(parsedKv.target, '0x140001234');
+  assert.equal(parsedKv.function, 'sub_140001200');
+  assert.equal(parsedKv.import, 'kernel32.dll!CreateFileW');
+  assert.equal(parsedKv.com_slot, 71);
+  assert.equal(parsedKv.hard_stop, true);
+  assert.equal(parsedKv.thread, 3);
+  assert.deepEqual(parsedKv.registers, { rax: '0xdead' });
+
+  // Malformed [fault-record] JSON must return null and NEVER fall through to WASM_TRAP_RE.
+  const brokenLine = '[wasm] [fault-record] {"kind":"trap","detail":"RuntimeError unreachable"';
+  assert.equal(parseFaultRecordLine(brokenLine), null);
+  assert.equal(parseLogLine(brokenLine), null);
+
+  // Trailing CRLF / multiline strings and quoted unicode/forbidden KV keys must be handled safely.
+  const trailingNl = '[wasm] [fault-record] {"kind":"\\u0074rap","va":"0x140001000"}\r\n';
+  assert.equal(isFaultRecordLine(trailingNl), true);
+  assert.equal(parseFaultRecordLine(trailingNl)?.kind, 'trap');
+  assert.equal(parseLogLine(trailingNl)?.type, 'fault_record');
+
+  const multilineAbort = 'Aborted\n[fault-record] kind="\\u0074rap" __proto__=evil constructor=bad va=0x140002000\nextra line';
+  const parsedMulti = parseFaultRecordLine(multilineAbort);
+  assert.equal(parsedMulti?.kind, 'trap');
+  assert.equal(parsedMulti?.va, '0x140002000');
+  assert.equal(Object.prototype.hasOwnProperty.call(parsedMulti, '__proto__'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(parsedMulti, 'constructor'), false);
+});
+
+test('Orch-39 BootTracer persists lastFaultRecord outside trap/log rings, emits sync console.error + fault-record events, sanitizes paths, and exports in getSnapshot/CrashReporter', () => {
+  const clock = createClock(1000);
+  const hud = createHud();
+  const crashReporter = new CrashReporter({ now: clock.now, maxLogs: 4 });
+  const consoleErrors = [];
+  const callbackEvents = [];
+  const listenerEvents = [];
+  const targetEvents = [];
+  const fakeEventTarget = {
+    dispatchEvent(evt) {
+      targetEvents.push(evt);
+      return true;
+    },
+  };
+
+  const tracer = new BootTracer({
+    now: clock.now,
+    maxTraps: 4,
+    crashReporter,
+    hud,
+    console: {
+      error(msg) {
+        consoleErrors.push(msg);
+      },
+    },
+    eventTarget: fakeEventTarget,
+    onFaultRecord(detail) {
+      callbackEvents.push(detail);
+    },
+  });
+  tracer.addEventListener(FAULT_RECORD_EVENT_TYPE, (ev) => {
+    listenerEvents.push(ev);
+  });
+
+  assert.equal(tracer.lastFaultRecord, null);
+  assert.equal(tracer.getSnapshot().lastFaultRecord, null);
+
+  clock.advance(50);
+  tracer.markMilestone('GDK_INIT');
+
+  clock.advance(25);
+  const rawLine =
+    '[wasm] [fault-record] {"kind":"\\u0074rap","va":"0x140009999","rip":"0x140009999","function":{"entry":"0x140009900","offset":"0x99"},"unimplemented_slot":{"interface":"IXStore","slot":71},"hard_stop":"S2","detail":"path C:\\\\Users\\\\alice\\\\secret\\\\game.exe token=ghp_123456789012345678901234567890123456","registers":{"rax":"0x42","rsp":"0x7fff0000"},"call_stack":{"method":"fp","frames":[{"address":"0x140009999"}]}}';
+  const ingested = tracer.ingestLogLine(rawLine);
+
+  assert.equal(ingested?.type, 'fault_record');
+  assert.equal(ingested.faultRecord.kind, 'trap');
+  assert.equal(ingested.faultRecord.va, '0x140009999');
+  assert.equal(ingested.faultRecord.stage, 'GDK_INIT');
+  assert.equal(ingested.faultRecord.recordedAtMs, 75);
+  assert.equal(ingested.faultRecord.seq, 1);
+
+  // Sanitization strips host paths and tokens from nested fault-record fields.
+  assert.doesNotMatch(ingested.faultRecord.detail, /alice|ghp_123456/);
+
+  // Synchronous console.error and fault-record events fired immediately.
+  assert.equal(consoleErrors.length, 1);
+  assert.ok(consoleErrors[0].startsWith('[fault-record] '));
+  assert.equal(callbackEvents.length, 1);
+  assert.equal(callbackEvents[0].faultRecord.kind, 'trap');
+  assert.equal(listenerEvents.length, 1);
+  assert.equal(listenerEvents[0].type, 'fault-record');
+  assert.equal(listenerEvents[0].detail.faultRecord.va, '0x140009999');
+  assert.equal(targetEvents.length, 1);
+  assert.equal(targetEvents[0].type, 'fault-record');
+
+  // Flood the TrapRing (maxTraps=4) and CrashReporter log ring (maxLogs=4): lastFaultRecord must NEVER be evicted!
+  for (let i = 0; i < 20; i += 1) {
+    clock.advance(1);
+    tracer.recordTrap({
+      kind: TRAP_KIND.UNRESOLVED_IMPORT,
+      dll: 'foo.dll',
+      symbol: `Sym${i}`,
+      message: `unresolved foo.dll!Sym${i}`,
+    });
+    crashReporter.recordLog('info', 'flood', `noise line ${i}`);
+  }
+
+  const snap = tracer.getSnapshot();
+  assert.equal(snap.recentTraps.length, 4);
+  assert.ok(snap.lastFaultRecord);
+  assert.equal(snap.lastFaultRecord.kind, 'trap');
+  assert.equal(snap.lastFaultRecord.va, '0x140009999');
+  assert.equal(snap.lastFaultRecord.unimplemented_slot.slot, 71);
+  assert.equal(snap.lastFaultRecord.hard_stop, 'S2');
+  assert.deepEqual(snap.lastFaultRecord.registers, { rax: '0x42', rsp: '0x7fff0000' });
+  assert.deepEqual(JSON.parse(tracer.toJson()).lastFaultRecord, snap.lastFaultRecord);
+  assert.deepEqual(tracer.toChromeTraceEvents().metadata.lastFaultRecord, snap.lastFaultRecord);
+
+  // Export Report (CrashReporter.buildReport) preserves the structured faultRecord under errors[].context.
+  const exported = crashReporter.buildReport();
+  const faultErr = exported.errors.find(
+    (entry) => entry && entry.context && entry.context.type === 'fault-record',
+  );
+  assert.ok(faultErr, 'expected fault-record entry in exported CrashReporter report');
+  assert.equal(faultErr.context.faultRecord.kind, 'trap');
+  assert.equal(faultErr.context.faultRecord.unimplemented_slot.slot, 71);
+  assert.deepEqual(faultErr.context.faultRecord.registers, { rax: '0x42', rsp: '0x7fff0000' });
+
+  // Reset clears lastFaultRecord and faultRecordCount cleanly.
+  tracer.reset();
+  assert.equal(tracer.lastFaultRecord, null);
+  assert.equal(tracer.faultRecordCount, 0);
+  assert.equal(tracer.getSnapshot().lastFaultRecord, null);
 });

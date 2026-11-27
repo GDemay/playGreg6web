@@ -15,6 +15,8 @@ export const DEFAULT_TRACE_TID = 1;
 export const MAX_MESSAGE_LENGTH = 512;
 export const MAX_GPU_ADAPTER_LENGTH = 96;
 export const STAGE_NOT_STARTED = 'NOT_STARTED';
+export const FAULT_RECORD_PREFIX = '[fault-record]';
+export const FAULT_RECORD_EVENT_TYPE = 'fault-record';
 
 /** Guest boot milestones in the order the real boot path reaches them. */
 export const BOOT_MILESTONES = Object.freeze([
@@ -82,6 +84,15 @@ const TRAP_KIND_SET = new Set(TRAP_KIND_VALUES);
 const NON_FATAL_BY_DEFAULT = new Set([TRAP_KIND.UNRESOLVED_IMPORT]);
 
 const LOG_TAG_RE = /\[(wasm|boot|trap|unimpl|import)\]\s*(.*)$/i;
+const FAULT_RECORD_LINE_RE = /\[fault-record\][ \t]*([^\r\n]*)/i;
+const FAULT_RECORD_FORBIDDEN_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const FAULT_RECORD_NUMERIC_KEYS = new Set([
+  'thread',
+  'elapsed_ms',
+  'slot',
+  'com_slot',
+  'unimplemented_com_slot',
+]);
 const MILESTONE_TOKEN_RE = new RegExp(`\\b(${ALL_MILESTONES.join('|')})\\b`, 'gi');
 const TRAP_KIND_TOKEN_RE = new RegExp(`\\b(${TRAP_KIND_VALUES.join('|')})\\b`, 'i');
 const FAILURE_RE =
@@ -320,17 +331,256 @@ function isUnresolvedImportText(text) {
   return !/\b(?:bound|resolved|binding\s+ok)\b/i.test(text);
 }
 
+function parseFaultRecordKvValue(key, rawValue) {
+  if (rawValue === 'null') {
+    return null;
+  }
+  if (rawValue === 'true') {
+    return true;
+  }
+  if (rawValue === 'false') {
+    return false;
+  }
+  if (
+    (rawValue.startsWith('{') && rawValue.endsWith('}')) ||
+    (rawValue.startsWith('[') && rawValue.endsWith(']'))
+  ) {
+    try {
+      return JSON.parse(rawValue);
+    } catch {
+      return rawValue;
+    }
+  }
+  if (FAULT_RECORD_NUMERIC_KEYS.has(key) && /^-?\d+$/.test(rawValue)) {
+    const parsedInt = Number.parseInt(rawValue, 10);
+    if (Number.isSafeInteger(parsedInt)) {
+      return parsedInt;
+    }
+  }
+  return rawValue;
+}
+
+function parseFaultRecordKv(rawPayload) {
+  const out = {};
+  let matchedAny = false;
+  let i = 0;
+  const len = rawPayload.length;
+
+  while (i < len) {
+    while (i < len && /\s/.test(rawPayload[i])) {
+      i += 1;
+    }
+    if (i >= len) {
+      break;
+    }
+    const keyStart = i;
+    while (i < len && /[A-Za-z0-9_.-]/.test(rawPayload[i])) {
+      i += 1;
+    }
+    const key = rawPayload.slice(keyStart, i);
+    if (!key || i >= len || rawPayload[i] !== '=') {
+      while (i < len && !/\s/.test(rawPayload[i])) {
+        i += 1;
+      }
+      continue;
+    }
+    const allowedKey = !FAULT_RECORD_FORBIDDEN_KEYS.has(key);
+    i += 1; // skip '='
+    if (i >= len) {
+      if (allowedKey) {
+        out[key] = '';
+        matchedAny = true;
+      }
+      break;
+    }
+
+    const ch = rawPayload[i];
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      const quotedStart = i;
+      i += 1;
+      let buf = '';
+      while (i < len && rawPayload[i] !== quote) {
+        if (rawPayload[i] === '\\' && i + 1 < len) {
+          i += 1;
+        }
+        buf += rawPayload[i];
+        i += 1;
+      }
+      const hasClosingQuote = i < len && rawPayload[i] === quote;
+      if (hasClosingQuote) {
+        i += 1;
+      }
+      let decoded = buf;
+      if (quote === '"' && hasClosingQuote) {
+        try {
+          decoded = JSON.parse(rawPayload.slice(quotedStart, i));
+        } catch {
+          decoded = buf;
+        }
+      }
+      if (allowedKey) {
+        out[key] = decoded;
+        matchedAny = true;
+      }
+      continue;
+    }
+
+    if (ch === '{' || ch === '[') {
+      const openCh = ch;
+      const closeCh = ch === '{' ? '}' : ']';
+      let depth = 0;
+      let inStr = false;
+      let escaped = false;
+      const valStart = i;
+      while (i < len) {
+        const c = rawPayload[i];
+        if (inStr) {
+          if (escaped) {
+            escaped = false;
+          } else if (c === '\\') {
+            escaped = true;
+          } else if (c === '"') {
+            inStr = false;
+          }
+        } else if (c === '"') {
+          inStr = true;
+        } else if (c === openCh) {
+          depth += 1;
+        } else if (c === closeCh) {
+          depth -= 1;
+          if (depth === 0) {
+            i += 1;
+            break;
+          }
+        }
+        i += 1;
+      }
+      const rawVal = rawPayload.slice(valStart, i);
+      if (allowedKey) {
+        out[key] = parseFaultRecordKvValue(key, rawVal);
+        matchedAny = true;
+      }
+      continue;
+    }
+
+    const valStart = i;
+    while (i < len && !/\s/.test(rawPayload[i])) {
+      i += 1;
+    }
+    const rawVal = rawPayload.slice(valStart, i);
+    if (allowedKey) {
+      out[key] = parseFaultRecordKvValue(key, rawVal);
+      matchedAny = true;
+    }
+  }
+
+  return matchedAny ? out : null;
+}
+
+function sanitizeFaultRecord(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return null;
+  }
+  const rawKind = typeof raw.kind === 'string' ? raw.kind.trim() : '';
+  if (!rawKind) {
+    return null;
+  }
+
+  const clean = sanitizeValue(raw);
+  if (!clean || typeof clean !== 'object' || Array.isArray(clean)) {
+    return null;
+  }
+
+  clean.kind = sanitizeString(rawKind);
+
+  const normVa = normalizeGuestVa(raw.va);
+  if (normVa !== null) {
+    clean.va = normVa;
+  }
+  const normRip = normalizeGuestVa(raw.rip);
+  if (normRip !== null) {
+    clean.rip = normRip;
+  }
+  const normTarget = normalizeGuestVa(raw.target);
+  if (normTarget !== null) {
+    clean.target = normTarget;
+  } else if (clean.target === undefined && typeof clean.va === 'string' && clean.va.length > 0) {
+    clean.target = clean.va;
+  }
+
+  return clean;
+}
+
+/**
+ * Returns true if `line` contains a `[fault-record]` tag.
+ *
+ * @param {unknown} line
+ * @returns {boolean}
+ */
+export function isFaultRecordLine(line) {
+  return typeof line === 'string' && FAULT_RECORD_LINE_RE.test(line);
+}
+
+/**
+ * Parses a structured `[fault-record]` JSON or key=value log line without mutating
+ * tracer state. Handles `[wasm] [fault-record] {...}`, timestamp-prefixed lines,
+ * `\uXXXX`-escaped JSON strings (e.g. `"\u0074rap"`), and compact `key=value` payloads.
+ *
+ * @param {unknown} line
+ * @returns {object|null}
+ */
+export function parseFaultRecordLine(line) {
+  if (typeof line !== 'string' || line.length === 0) {
+    return null;
+  }
+  const match = FAULT_RECORD_LINE_RE.exec(line);
+  if (!match) {
+    return null;
+  }
+  const payload = match[1].trim();
+  if (!payload) {
+    return null;
+  }
+
+  let parsed = null;
+  if (payload.startsWith('{')) {
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+  } else {
+    parsed = parseFaultRecordKv(payload);
+  }
+
+  return sanitizeFaultRecord(parsed);
+}
+
 /**
  * Parses one structured runtime log line without mutating any tracer state.
  *
  * @param {unknown} line
- * @returns {null | { type: 'milestone', tag: string, milestones: string[], message: string }
+ * @returns {null
+ *   | { type: 'fault_record', tag: 'fault-record', faultRecord: object }
+ *   | { type: 'milestone', tag: string, milestones: string[], message: string }
  *   | { type: 'trap', tag: string, trap: { kind: string, guestVa: string|null, dll: string|null,
  *       symbol: string|null, message: string, fatal: boolean } }}
  */
 export function parseLogLine(line) {
   if (typeof line !== 'string' || line.length === 0) {
     return null;
+  }
+  if (FAULT_RECORD_LINE_RE.test(line)) {
+    const faultRecord = parseFaultRecordLine(line);
+    if (!faultRecord) {
+      return null;
+    }
+    return {
+      type: 'fault_record',
+      tag: 'fault-record',
+      faultRecord,
+    };
   }
   const tagMatch = LOG_TAG_RE.exec(line);
   if (!tagMatch) {
@@ -735,6 +985,10 @@ export class BootTracer {
       slowThresholdMs = DEFAULT_SLOW_THRESHOLD_MS,
       crashReporter = null,
       hud = null,
+      onFaultRecord = null,
+      console: consoleObj = typeof console !== 'undefined' ? console : null,
+      eventTarget = null,
+      emitConsoleError = true,
     } = options;
 
     if (!Number.isInteger(maxTraps) || maxTraps < 1) {
@@ -743,6 +997,9 @@ export class BootTracer {
     if (typeof now !== 'function') {
       throw new TypeError('now must be a function returning milliseconds');
     }
+    if (onFaultRecord !== null && onFaultRecord !== undefined && typeof onFaultRecord !== 'function') {
+      throw new TypeError('onFaultRecord must be a function or null');
+    }
     const validatedSlowThresholdMs = validateSlowThresholdMs(slowThresholdMs);
 
     this._maxTraps = maxTraps;
@@ -750,6 +1007,12 @@ export class BootTracer {
     this._slowThresholdMs = validatedSlowThresholdMs;
     this._crashReporter = crashReporter && typeof crashReporter === 'object' ? crashReporter : null;
     this._hud = hud && typeof hud === 'object' ? hud : null;
+    this._onFaultRecord = typeof onFaultRecord === 'function' ? onFaultRecord : null;
+    this._console = consoleObj && typeof consoleObj === 'object' ? consoleObj : null;
+    this._eventTarget =
+      eventTarget && typeof eventTarget.dispatchEvent === 'function' ? eventTarget : null;
+    this._emitConsoleError = emitConsoleError !== false;
+    this._eventListeners = new Map();
     this._traps = new TrapRing(maxTraps);
     this.reset(startMs);
   }
@@ -770,9 +1033,72 @@ export class BootTracer {
     return this._gpuAdapter;
   }
 
+  get lastFaultRecord() {
+    return this._lastFaultRecord ? sanitizeValue(this._lastFaultRecord) : null;
+  }
+
+  get faultRecordCount() {
+    return this._faultRecordCount;
+  }
+
   /**
-   * Clears milestones, traps, GPU adapter label, and the import table and restarts the boot clock.
-   * Keeps the attached crash reporter and HUD.
+   * Registers an event listener (e.g. `'fault-record'`) on this tracer instance.
+   *
+   * @param {string} type
+   * @param {(event: object) => void} listener
+   */
+  addEventListener(type, listener) {
+    if (typeof type !== 'string' || type.length === 0 || typeof listener !== 'function') {
+      return;
+    }
+    let set = this._eventListeners.get(type);
+    if (!set) {
+      set = new Set();
+      this._eventListeners.set(type, set);
+    }
+    set.add(listener);
+  }
+
+  /**
+   * Removes an event listener previously added with `addEventListener`.
+   *
+   * @param {string} type
+   * @param {(event: object) => void} listener
+   */
+  removeEventListener(type, listener) {
+    const set = this._eventListeners.get(type);
+    if (set) {
+      set.delete(listener);
+    }
+  }
+
+  /**
+   * Synchronously dispatches an event object to registered listeners for `event.type`.
+   *
+   * @param {{ type: string, detail?: any }} event
+   * @returns {boolean}
+   */
+  dispatchEvent(event) {
+    if (!event || typeof event !== 'object' || typeof event.type !== 'string') {
+      return false;
+    }
+    const set = this._eventListeners.get(event.type);
+    if (!set || set.size === 0) {
+      return true;
+    }
+    for (const listener of Array.from(set)) {
+      try {
+        listener(event);
+      } catch {
+        // Telemetry listeners must never break the boot or fault capture path.
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Clears milestones, traps, GPU adapter label, fault record, and the import table and restarts the boot clock.
+   * Keeps the attached crash reporter, HUD, and event listeners.
    *
    * @param {number} [startMs]
    */
@@ -792,6 +1118,9 @@ export class BootTracer {
     this._signatures = new Map();
     this._imports = new Map();
     this._lastTrap = null;
+    this._lastFaultRecord = null;
+    this._faultRecordCount = 0;
+    this._faultRecordSeq = 0;
   }
 
   _elapsed() {
@@ -1291,15 +1620,139 @@ export class BootTracer {
   }
 
   /**
-   * Parses a structured runtime log line and applies it as milestones or a trap record.
+   * Captures and persists a structured `[fault-record]` payload (or raw `[fault-record]`
+   * log line) outside the bounded trap/log rings so it is never evicted by subsequent
+   * logs, emits a synchronous `console.error`, dispatches a `'fault-record'` event,
+   * and forwards the sanitized payload to CrashReporter and HUD sinks.
+   *
+   * @param {object|string} recordOrLine
+   * @param {{ rawLine?: string, emitConsole?: boolean }} [options]
+   * @returns {object} Defensive copy of the stored sanitized fault record.
+   */
+  recordFaultRecord(recordOrLine, options = {}) {
+    if (options !== undefined && (options === null || typeof options !== 'object' || Array.isArray(options))) {
+      throw new TypeError('recordFaultRecord options must be an object');
+    }
+    const parsed =
+      typeof recordOrLine === 'string'
+        ? parseFaultRecordLine(recordOrLine)
+        : sanitizeFaultRecord(recordOrLine);
+    if (!parsed) {
+      throw new TypeError('recordFaultRecord requires a fault-record object or [fault-record] line with a non-empty kind');
+    }
+
+    const recordedAtMs = this._elapsed();
+    this._faultRecordSeq += 1;
+    this._faultRecordCount += 1;
+
+    const stored = sanitizeValue({
+      ...parsed,
+      seq: this._faultRecordSeq,
+      recordedAtMs,
+      stage: this._stage(),
+    });
+    this._lastFaultRecord = stored;
+
+    const consoleLine = `${FAULT_RECORD_PREFIX} ${JSON.stringify(stored)}`;
+    const shouldEmitConsole =
+      this._emitConsoleError && options.emitConsole !== false;
+    if (shouldEmitConsole && this._console && typeof this._console.error === 'function') {
+      try {
+        this._console.error(consoleLine);
+      } catch {
+        // Console failures must never interrupt fault-record capture.
+      }
+    }
+
+    const vaLabel = typeof stored.va === 'string' && stored.va.length > 0 ? ` @ ${stored.va}` : '';
+    const slotLabel =
+      stored.unimplemented_slot && typeof stored.unimplemented_slot === 'object'
+        ? ` ${stored.unimplemented_slot.interface || 'COM'}#${stored.unimplemented_slot.slot ?? '?'}`
+        : stored.com_slot !== undefined && stored.com_slot !== null
+          ? ` slot#${stored.com_slot}`
+          : '';
+    const importObj = stored.import && typeof stored.import === 'object' ? stored.import : null;
+    const importLabel = importObj
+      ? ` ${importObj.dll ? `${importObj.dll}!` : ''}${importObj.symbol || ''}`
+      : typeof stored.import === 'string' && stored.import.length > 0
+        ? ` ${stored.import}`
+        : '';
+    const summaryText = `fault-record ${stored.kind}${vaLabel}${slotLabel}${importLabel}`.trim();
+
+    this._forward(
+      'recordError',
+      'wasm_trap',
+      { name: 'GuestFaultRecord', message: summaryText },
+      {
+        type: FAULT_RECORD_EVENT_TYPE,
+        faultRecord: sanitizeValue(stored),
+        stage: stored.stage,
+        recordedAtMs,
+      },
+    );
+    this._notifyHud(`Fault ${stored.kind}${vaLabel}${slotLabel}`, 'error');
+
+    const eventDetail = {
+      faultRecord: sanitizeValue(stored),
+      rawLine:
+        typeof options.rawLine === 'string' && isFaultRecordLine(options.rawLine)
+          ? sanitizeString(options.rawLine)
+          : consoleLine,
+      recordedAtMs,
+      stage: stored.stage,
+    };
+
+    if (this._onFaultRecord) {
+      try {
+        this._onFaultRecord(eventDetail);
+      } catch {
+        // Fault-record callbacks must never break capture.
+      }
+    }
+
+    this.dispatchEvent({ type: FAULT_RECORD_EVENT_TYPE, detail: eventDetail });
+
+    const externalTarget =
+      this._eventTarget ||
+      (typeof window !== 'undefined' &&
+      window &&
+      typeof window.dispatchEvent === 'function'
+        ? window
+        : null);
+    if (externalTarget) {
+      try {
+        const evt =
+          typeof CustomEvent === 'function'
+            ? new CustomEvent(FAULT_RECORD_EVENT_TYPE, { detail: eventDetail })
+            : { type: FAULT_RECORD_EVENT_TYPE, detail: eventDetail };
+        externalTarget.dispatchEvent(evt);
+      } catch {
+        // Ignore DOM/global event dispatch failures in restricted environments.
+      }
+    }
+
+    return sanitizeValue(stored);
+  }
+
+  /**
+   * Parses a structured runtime log line and applies it as a fault record, milestones, or a trap record.
    *
    * @param {unknown} line
-   * @returns {null | { type: 'milestone', milestones: object[] } | { type: 'trap', trap: object }}
+   * @returns {null
+   *   | { type: 'fault_record', faultRecord: object }
+   *   | { type: 'milestone', milestones: object[] }
+   *   | { type: 'trap', trap: object }}
    */
   ingestLogLine(line) {
     const parsed = parseLogLine(line);
     if (!parsed) {
       return null;
+    }
+    if (parsed.type === 'fault_record') {
+      return {
+        type: 'fault_record',
+        faultRecord: this.recordFaultRecord(parsed.faultRecord, { rawLine: line }),
+      };
     }
     if (parsed.type === 'trap') {
       return { type: 'trap', trap: this.recordTrap(parsed.trap) };
@@ -1520,6 +1973,7 @@ export class BootTracer {
       liveTelemetry,
       milestonesReached: this._milestones.size,
       trapCount: this._trapCount,
+      lastFaultRecord: this._lastFaultRecord ? sanitizeValue(this._lastFaultRecord) : null,
     };
     if (threshold !== null) {
       metadata.slowThresholdMs = threshold;
@@ -1620,6 +2074,7 @@ export class BootTracer {
       trapCount: this._trapCount,
       uniqueTrapCount: this._signatures.size,
       lastTrap: this._lastTrap ? { ...this._lastTrap } : null,
+      lastFaultRecord: this._lastFaultRecord ? sanitizeValue(this._lastFaultRecord) : null,
       unresolvedImports,
       recentTraps: this._traps.toArray().map((record) => ({ ...record })),
     });
