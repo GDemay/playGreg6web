@@ -46,6 +46,11 @@ void record_guest_timed_wait(uint32_t requested_ms, std::chrono::steady_clock::d
 void reset_guest_timed_wait_stats();
 std::string guest_timed_wait_stats_json();
 
+// A window in which every thread of the process is suspended on purpose (the minidump helper). Sleeps and
+// timed waits overlapping it are counted separately ("frozen_by_dump") and kept out of the overshoot stats.
+void frozen_window_begin();
+void frozen_window_end();
+
 // Construct before the wait, call done() with the outcome afterwards.
 class GuestTimedWait {
 public:
