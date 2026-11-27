@@ -2366,6 +2366,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             crosscheck_uniforms_.clear();
             for (auto& [key, r] : relocations_) {
                 r.primed = false;
+                uniform_unprimed_.insert(&r);
             }
         }
         page_index_live_ = indexed;
@@ -2567,13 +2568,13 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     {
         std::lock_guard<std::mutex> lock(relocation_mutex_);
         std::vector<uint8_t> bytes;
+        std::vector<const void*> uniform_visit;
         if (indexed) {
-            std::vector<const void*> visit;
-            uniform_page_index_.collect_pages(dirty_pages, os::kWrittenPageSize, &visit);
+            uniform_page_index_.collect_pages(dirty_pages, os::kWrittenPageSize, &uniform_visit);
             for (const auto& h : taken_failed) {
-                uniform_page_index_.collect_range(h.first, h.second, &visit);
+                uniform_page_index_.collect_range(h.first, h.second, &uniform_visit);
             }
-            for (const void* key : visit) {
+            for (const void* key : uniform_visit) {
                 const_cast<RelocatedUniform*>(static_cast<const RelocatedUniform*>(key))->visit_seq = seq;
             }
             for (const void* key : crosscheck_uniforms_) {
@@ -2589,18 +2590,25 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             crosscheck_uniforms_.clear();
         }
         uint64_t compared = 0, skipped = 0;
-        for (auto& [key, r] : relocations_) {
+        auto visit_uniform = [&](RelocatedUniform& r) {
             // (Covered again this time: the buffer around it may have left the index since.)
             uintptr_t u_lo = 0, u_hi = 0;
             const bool skip = indexed && r.primed && r.visit_seq != seq && uniform_page_index_.range_of(&r, &u_lo, &u_hi) &&
                               ranges_cover(taken_ok, u_lo, u_hi);
             if (skip && !crosscheck) {
                 ++skipped;
-                continue;
+                return;
+            }
+            if (crosscheck && !skip && r.primed && r.visit_seq != seq) {
+                // The indexed flush below visits only the reported and the unprimed entries: this one
+                // needed a comparison although it is neither.
+                count_work(Work::FlushCrosscheckMisses);
+                std::fprintf(stderr, "[flush-crosscheck] uniform range 0x%llx (%llu bytes) not a flush candidate\n",
+                             static_cast<unsigned long long>(r.va), static_cast<unsigned long long>(r.size));
             }
             const uint64_t cpu = cpu_address_for_gpu(r.va);
             if (!indexed && unwritten(cpu, r.size) && !r.shadow.empty()) {
-                continue;
+                return;
             }
             ++compared;
             if (skip) {
@@ -2637,7 +2645,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 changed = true;
             }
             if (!indexed) {
-                continue;
+                return;
             }
             if (skip && changed) {
                 crosscheck_uniforms_.insert(&r);
@@ -2651,6 +2659,38 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             } else {
                 uniform_page_index_.remove(&r);
                 r.primed = false;
+            }
+            if (r.primed) {
+                uniform_unprimed_.erase(&r);
+            } else {
+                uniform_unprimed_.insert(&r);
+            }
+        };
+        if (indexed && !crosscheck) {
+            // Only the entries a take reported (visit_seq == seq) and the unprimed ones can need a
+            // comparison: a primed entry is indexed, so its range lies in a take range that either
+            // succeeded (and named none of its pages) or failed (collect_range above visited it).
+            // Visiting just those makes this loop O(reported) instead of O(relocations_); the
+            // --flush-crosscheck flushes walk every entry and count a needed one that is neither.
+            std::vector<RelocatedUniform*> candidates;
+            candidates.reserve(uniform_visit.size() + uniform_unprimed_.size());
+            for (const void* key : uniform_visit) {
+                candidates.push_back(const_cast<RelocatedUniform*>(static_cast<const RelocatedUniform*>(key)));
+            }
+            candidates.insert(candidates.end(), uniform_unprimed_.begin(), uniform_unprimed_.end());
+            // Deterministic order (guest VA, then size); each entry has its own home, so the uploads'
+            // order does not matter for the result.
+            std::sort(candidates.begin(), candidates.end(), [](const RelocatedUniform* a, const RelocatedUniform* b) {
+                return a->va != b->va ? a->va < b->va : (a->size != b->size ? a->size < b->size : a < b);
+            });
+            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+            for (RelocatedUniform* r : candidates) {
+                visit_uniform(*r);
+            }
+            skipped += static_cast<uint64_t>(relocations_.size() - candidates.size());
+        } else {
+            for (auto& [key, r] : relocations_) {
+                visit_uniform(r);
             }
         }
         if (indexed) {
@@ -2796,6 +2836,7 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
                                                                                          lru->second.offset);
             uniform_page_index_.remove(&lru->second);
             crosscheck_uniforms_.erase(&lru->second);
+            uniform_unprimed_.erase(&lru->second);
             relocations_.erase(lru);
             relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
         }
@@ -2822,6 +2863,7 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
             relocation_used_ += need;
         }
         it = relocations_.emplace(std::make_tuple(va, size, need), std::move(r)).first;
+        uniform_unprimed_.insert(&it->second);  // new: compared at the next flush
     }
     it->second.last_used_seq = ++relocation_seq_;
     *buffer_id = it->second.buffer_id;
