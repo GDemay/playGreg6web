@@ -783,7 +783,7 @@ pub fn emit_module_with_dispatch(
             n.saturating_add(f.symbol.len()).saturating_add(94 + 3 * digits)
         })
     });
-    if function_bytes > out.capacity() {
+    if function_bytes.saturating_add(dispatch_bytes) > out.capacity() {
         out.reserve(function_bytes.saturating_add(dispatch_bytes).saturating_add(1024));
     }
     for func in &sorted {
