@@ -37,6 +37,11 @@ impl Pred<'_> {
     pub fn sources(&self) -> Vec<u64> {
         self.entries.iter().map(|&(from, _)| from).collect()
     }
+
+    /// Every incoming edge with its source block, `from` first.
+    pub fn edges(&self) -> &[(u64, Edge)] {
+        self.entries
+    }
 }
 
 impl PredIndex {

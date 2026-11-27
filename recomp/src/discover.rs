@@ -197,6 +197,23 @@ fn check_continued_rounds(image: &CodeImage<'_>, threads: usize, fresh: &Analysi
             );
         }
     }
+    // The no-return functions added to a session that decoded without them.
+    if !image.no_return.is_empty() {
+        let mut t = DiscoveryTimings::default();
+        let mut session = Session::new(image, threads, entries, BTreeSet::new(), &mut t);
+        let first = session.round(&mut t);
+        let thunks: BTreeSet<u64> = image.no_return.iter().copied().collect();
+        session.reclaim(first);
+        if session.add_no_return(&thunks) {
+            let continued = session.round(&mut t);
+            if !session.diverged() {
+                assert_eq!(
+                    &continued, fresh,
+                    "discovery continued through no-return functions differs from a fresh run"
+                );
+            }
+        }
+    }
 }
 
 /// Discovery state kept between the code-pointer refinement rounds of
@@ -214,8 +231,9 @@ fn check_continued_rounds(image: &CodeImage<'_>, threads: usize, fresh: &Analysi
 /// records every event that is not of that kind ([`Self::diverged`]): a resolved table revised to
 /// one that drops targets or no longer matching, a retry or revision cap reached, a
 /// pointer-slot seed on a jump that later resolved as a table. The caller then starts a fresh
-/// session. New no-return functions also need a fresh session (they end blocks that are already
-/// decoded); the caller handles that.
+/// session. New no-return functions end blocks that are already decoded: [`Self::add_no_return`]
+/// cuts those blocks back when the code after the call derived nothing, and refuses otherwise
+/// (the caller then starts a fresh session too).
 pub struct Session<'i, 'a> {
     state: Discovery<'i, 'a>,
 }
@@ -235,6 +253,7 @@ impl<'i, 'a> Session<'i, 'a> {
         timings.time(Phase::Seed, || {
             for &entry in entries {
                 state.add_function(entry);
+                state.seeds.insert(entry);
             }
             for &(owner, target) in &image.eh.resume_targets {
                 state.seed_resume_target(owner, target);
@@ -260,6 +279,7 @@ impl<'i, 'a> Session<'i, 'a> {
             .collect();
         for entry in entries {
             state.add_function(entry);
+            state.seeds.insert(entry);
         }
         for (site, leaf) in failed {
             if state.leaf_extent(site) != leaf {
@@ -268,41 +288,84 @@ impl<'i, 'a> Session<'i, 'a> {
         }
     }
 
-    /// Adds no-return functions for the next [`Self::round`] when that cannot change anything
-    /// decoded so far: `no_return` is only read at direct calls, so this holds when no decoded
-    /// block calls one of `thunks` directly. Returns `false` (and changes nothing) otherwise; the
-    /// session must then not be continued.
+    /// Adds no-return functions for the next [`Self::round`] (after [`Self::reclaim`] and
+    /// [`Self::add_entries`]). `no_return` is only read at calls, where it ends the block, so
+    /// every decoded block that calls one of `thunks` directly is cut back to end at that call,
+    /// as a fresh run decodes it ([`Discovery::no_return_cut`]). What the code after the call
+    /// derived must hold without it: the leaders it reached (its fall-through, a `jmp` target)
+    /// must be seed entries or the target of a branch from a block that still reaches back to a
+    /// seed entry without the cut edges ([`Discovery::live_leaders`]), and it may contain only
+    /// instructions that derive nothing else. The jumps whose slices or reaching paths see the
+    /// lost edges are matched again by the round.
+    ///
+    /// Returns `false` when that does not hold for every such block, when one of `thunks` is
+    /// called through a slot or is a `setjmp` thunk (its calls' return sites are resume
+    /// targets), or when a pointer-slot jump's slice starts at a block that loses an edge. The
+    /// state is then unchanged but the session must not be continued (the caller starts over).
     pub fn add_no_return(&mut self, thunks: &BTreeSet<u64>) -> bool {
         assert!(self.state.reclaimed.is_none(), "add_no_return before reclaim");
-        let called = self.state.blocks.values().any(|block| {
-            block
-                .calls
-                .iter()
-                .any(|call| matches!(call.target, CallTarget::Direct(t) if thunks.contains(&t)))
-        });
-        if called {
+        let state = &mut self.state;
+        if thunks.iter().any(|&t| state.is_setjmp_thunk(t)) {
             return false;
         }
-        self.state.no_return.extend(thunks.iter().copied());
-        true
-    }
-
-    /// Whether a block of the last round (still in `analysis`, before [`Self::reclaim`]) calls
-    /// one of `thunks` directly, i.e. whether [`Self::add_no_return`] would refuse them after
-    /// the reclaim. Lets the caller start over without reclaiming first.
-    pub fn calls_directly(&self, analysis: &Analysis, thunks: &BTreeSet<u64>) -> bool {
-        let calls = |block: &BasicBlock| {
-            block
-                .calls
-                .iter()
-                .any(|call| matches!(call.target, CallTarget::Direct(t) if thunks.contains(&t)))
+        let mut cuts: Vec<(u64, usize)> = Vec::new();
+        let mut reached: BTreeSet<u64> = BTreeSet::new();
+        for block in state.blocks.values() {
+            match state.no_return_cut(block, thunks) {
+                Cut::Keep => {}
+                Cut::At(index, leaders) => {
+                    cuts.push((block.start, index));
+                    reached.extend(leaders);
+                }
+                Cut::Refuse => return false,
+            }
+        }
+        if cuts.is_empty() {
+            state.no_return.extend(thunks.iter().copied());
+            return true;
+        }
+        let cut: BTreeSet<u64> = cuts.iter().map(|&(start, _)| start).collect();
+        if !state.live_leaders(&reached, &cut) {
+            return false;
+        }
+        // A pointer-slot hit is kept across rounds: its slice must not run through a block whose
+        // incoming edges change (each block's first instruction starts it).
+        let preds = &state.preds;
+        let slot_slice_changes = state.pointer_slots.keys().any(|&site| {
+            state.jump_trace(site, preds).is_some_and(|(trace, _)| {
+                trace.iter().any(|step| reached.contains(&step.instr.ip()))
+            })
+        });
+        if slot_slice_changes {
+            return false;
+        }
+        let Some(retry) = state.jumps_after(&reached) else {
+            return false;
         };
-        !thunks.is_empty()
-            && (self.state.blocks.values().any(calls)
-                || analysis
-                    .functions
-                    .values()
-                    .any(|function| function.blocks.values().any(calls)))
+        for (start, index) in cuts {
+            let Some(block) = state.blocks.get_mut(&start) else {
+                continue;
+            };
+            let call = &block.instructions[index];
+            let (site, end) = (call.ip(), call.next_ip());
+            block.instructions.truncate(index + 1);
+            block.end = end;
+            block.terminator = Terminator::NoReturnCall;
+            block.calls.retain(|c| c.site <= site);
+            block.diagnostics.retain(|d| d.site <= site);
+            state.set_successors(start, Vec::new());
+        }
+        // Jumps whose reaching paths may have run through a lost edge: matched again (a fresh
+        // run never saw those edges).
+        for site in retry {
+            if state.failed_jumps.contains_key(&site) && !state.jump_tables.contains_key(&site) {
+                state.pending_jumps.insert(site);
+            }
+        }
+        state.check_preds();
+        state.warm = true;
+        state.no_return.extend(thunks.iter().copied());
+        true
     }
 
     /// Ends the session, freeing its block map and indexes on a background thread.
@@ -452,6 +515,248 @@ impl Session<'_, '_> {
         state.pointer_slots = pointer_slots;
         state.check_preds();
         state.restore_demoted(demoted);
+    }
+}
+
+/// What [`Session::add_no_return`] does with one block.
+enum Cut {
+    /// The block calls none of the new no-return functions.
+    Keep,
+    /// End the block at its `index`-th instruction (the first call to one of them); the code
+    /// after it reached these leaders (they must hold without it).
+    At(usize, Vec<u64>),
+    /// The code after that call may have derived something else: start over.
+    Refuse,
+}
+
+/// Blocks a backward or forward walk of [`Session::add_no_return`] visits before it gives up.
+const MAX_CUT_WALK: usize = 1 << 16;
+
+impl Discovery<'_, '_> {
+    /// How `block` ends once `thunks` are no-return ([`Session::add_no_return`]): unchanged,
+    /// cut back to the first call to one of them, or not continuable. The instructions after
+    /// that call may only be plain ones whose RIP-relative operands derive nothing (no code
+    /// address; a data address whose relocated pointers are all seed entries), ending in a trap,
+    /// a `ret`, a direct `jmp` or a fall-through; the leaders the `jmp` and the fall-through
+    /// reach are returned for [`Self::live_leaders`].
+    fn no_return_cut(&self, block: &BasicBlock, thunks: &BTreeSet<u64>) -> Cut {
+        let Some(call) = block.calls.iter().find(|call| match call.target {
+            CallTarget::Direct(t) => thunks.contains(&t),
+            CallTarget::Indirect { slot } => slot.is_some_and(|s| thunks.contains(&s)),
+        }) else {
+            return Cut::Keep;
+        };
+        if !matches!(call.target, CallTarget::Direct(_))
+            || block.calls.last().is_some_and(|last| last.site != call.site)
+            || block
+                .diagnostics
+                .iter()
+                .any(|d| d.site > call.site || d.kind == DiagnosticKind::OverlappingInstruction)
+        {
+            return Cut::Refuse;
+        }
+        let Ok(index) = block
+            .instructions
+            .binary_search_by_key(&call.site, Instruction::ip)
+        else {
+            return Cut::Refuse;
+        };
+        let tail = &block.instructions[index + 1..];
+        let (body, last) = match tail.split_last() {
+            Some((last, body)) => (body, Some(last)),
+            None => (tail, None),
+        };
+        let plain = |instr: &Instruction| {
+            instr.flow_control() == FlowControl::Next && instr.mnemonic() != Mnemonic::Hlt
+        };
+        if !body.iter().all(plain) || !tail.iter().all(|i| self.derives_nothing(i)) {
+            return Cut::Refuse;
+        }
+        let leaders = match (block.terminator, &block.successors[..], last) {
+            (Terminator::Trap, [], Some(_)) => Vec::new(),
+            (Terminator::Return, [Edge::Return], Some(_)) => Vec::new(),
+            (Terminator::Jump, &[Edge::Jump(target)], Some(jmp)) => {
+                // A jump to another `.pdata` function's entry makes it an entry: only a seed
+                // entry is one without it.
+                let table = &self.image.function_table;
+                let entry = !table.is_empty()
+                    && table.function_at(target) == Some(target)
+                    && table
+                        .function_at(jmp.ip())
+                        .is_some_and(|src| src != target);
+                if entry && !self.seeds.contains(&target) {
+                    return Cut::Refuse;
+                }
+                vec![target]
+            }
+            (Terminator::Fallthrough, &[Edge::Fallthrough(next)], last)
+                if next == block.end && last.is_none_or(plain) =>
+            {
+                vec![next]
+            }
+            _ => return Cut::Refuse,
+        };
+        Cut::At(index, leaders)
+    }
+
+    /// Whether `instr` (after a call that becomes no-return) derives nothing through a
+    /// RIP-relative operand: no code address (`lea` entries and resume targets) and no data
+    /// address the vtable scan finds a non-seed entry in.
+    fn derives_nothing(&self, instr: &Instruction) -> bool {
+        if !instr.is_ip_rel_memory_operand() {
+            return true;
+        }
+        let target = instr.ip_rel_memory_address();
+        match self.image.region_of(target) {
+            Region::Code => false,
+            Region::Data => {
+                if self.image.data_relocs.is_empty()
+                    || (!target.is_multiple_of(8) && !self.image.data_relocs.contains(&target))
+                {
+                    return true;
+                }
+                let mut slot = target;
+                for _ in 0..MAX_VTABLE_ENTRIES {
+                    let Some(code) = self.relocated_code_target(slot) else {
+                        break;
+                    };
+                    if !self.seeds.contains(&code) {
+                        return false;
+                    }
+                    let Some(next) = slot.checked_add(8) else {
+                        break;
+                    };
+                    slot = next;
+                }
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether every leader in `reached` is still one once the blocks in `cut` lose their
+    /// successors: a seed entry, an EH resume target of a seed entry, or the target of a
+    /// leader-deriving edge (`jcc`, `jmp`, table) from a block that still reaches back to such
+    /// a root. A leader is only proven through leaders already proven (no circular support).
+    fn live_leaders(&self, reached: &BTreeSet<u64>, cut: &BTreeSet<u64>) -> bool {
+        let eh_roots: BTreeSet<u64> = self
+            .image
+            .eh
+            .resume_targets
+            .iter()
+            .filter(|(owner, _)| self.seeds.contains(owner))
+            .map(|&(_, target)| target)
+            .collect();
+        let root = |va: u64| self.seeds.contains(&va) || eh_roots.contains(&va);
+        let mut unproven: BTreeSet<u64> = reached.iter().copied().filter(|&l| !root(l)).collect();
+        loop {
+            let proven: Vec<u64> = unproven
+                .iter()
+                .copied()
+                .filter(|&leader| self.derived_leader(leader, cut, &unproven, &root))
+                .collect();
+            if proven.is_empty() {
+                return unproven.is_empty();
+            }
+            for leader in proven {
+                unproven.remove(&leader);
+            }
+        }
+    }
+
+    /// Whether a block outside `cut` derives `leader` and reaches back to a `root` without
+    /// passing through `cut` or `avoid`.
+    fn derived_leader(
+        &self,
+        leader: u64,
+        cut: &BTreeSet<u64>,
+        avoid: &BTreeSet<u64>,
+        root: &dyn Fn(u64) -> bool,
+    ) -> bool {
+        let Some(preds) = self.preds.get(&leader) else {
+            return false;
+        };
+        preds.edges().iter().any(|&(from, edge)| {
+            let derives = match edge {
+                Edge::Taken(_) | Edge::Jump(_) | Edge::JumpTable(_) => true,
+                Edge::Fallthrough(_) => self
+                    .blocks
+                    .get(&from)
+                    .is_some_and(|b| b.terminator == Terminator::Branch),
+                _ => false,
+            };
+            derives && !cut.contains(&from) && self.reaches_root(from, cut, avoid, root)
+        })
+    }
+
+    /// Backward walk over the incoming intra-function edges from `start`, skipping the blocks in
+    /// `cut` (their edges are gone) and `avoid`: whether it reaches a `root`.
+    fn reaches_root(
+        &self,
+        start: u64,
+        cut: &BTreeSet<u64>,
+        avoid: &BTreeSet<u64>,
+        root: &dyn Fn(u64) -> bool,
+    ) -> bool {
+        let mut seen = BTreeSet::from([start]);
+        let mut stack = vec![start];
+        while let Some(va) = stack.pop() {
+            if avoid.contains(&va) {
+                continue;
+            }
+            if root(va) {
+                return true;
+            }
+            if seen.len() > MAX_CUT_WALK {
+                return false;
+            }
+            if let Some(preds) = self.preds.get(&va) {
+                for &(from, _) in preds.edges() {
+                    if !cut.contains(&from) && seen.insert(from) {
+                        stack.push(from);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The indirect jumps a backward reaching walk ([`reach`]) from them could reach one of
+    /// `leaders` in (walks stop at entries), found by walking forward from those leaders.
+    /// `None` when the walk is too large.
+    fn jumps_after(&self, leaders: &BTreeSet<u64>) -> Option<Vec<u64>> {
+        let is_entry = |va: u64| {
+            self.entries.contains(&va)
+                || self.return_sites.contains(&va)
+                || self.resume_targets.contains(&va)
+        };
+        let mut seen: BTreeSet<u64> = BTreeSet::new();
+        let mut stack: Vec<u64> = leaders.iter().copied().filter(|&l| !is_entry(l)).collect();
+        let mut jumps = Vec::new();
+        while let Some(va) = stack.pop() {
+            if !seen.insert(va) {
+                continue;
+            }
+            if seen.len() > MAX_CUT_WALK {
+                return None;
+            }
+            let Some(block) = self.blocks.get(&va) else {
+                continue;
+            };
+            if block.terminator == Terminator::IndirectJump
+                && let Some(last) = block.instructions.last()
+            {
+                jumps.push(last.ip());
+            }
+            for edge in &block.successors {
+                if let Some(target) = edge.intra_target()
+                    && !is_entry(target)
+                {
+                    stack.push(target);
+                }
+            }
+        }
+        Some(jumps)
     }
 }
 
@@ -627,6 +932,8 @@ struct Discovery<'i, 'a> {
     /// Pending block starts popped in ascending VA order for input-order independence.
     worklist: VaSet,
     entries: BTreeSet<u64>,
+    /// The entries a [`Session`] was seeded with ([`Session::new`], [`Session::add_entries`]).
+    seeds: BTreeSet<u64>,
     /// `jmp reg` sites decoded since the last jump-table round.
     pending_jumps: BTreeSet<u64>,
     /// Jumps that did not resolve: the shape of their slice when last tried
@@ -698,6 +1005,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             leaders: VaSet::with_range(lo, hi),
             worklist: VaSet::with_range(lo, hi),
             entries: BTreeSet::new(),
+            seeds: BTreeSet::new(),
             pending_jumps: BTreeSet::new(),
             failed_jumps: BTreeMap::new(),
             jump_retries: BTreeMap::new(),
@@ -2571,6 +2879,65 @@ mod tests {
         assert_eq!(b.terminator, Terminator::NoReturnCall);
         assert_eq!(instr_offsets(b), [0]);
         assert_eq!(block(func(&analysis, 6), 6).terminator, Terminator::Trap);
+    }
+
+    /// A session continued through a new no-return function cuts the blocks calling it and
+    /// matches a fresh run when the code after each call derived nothing that does not also
+    /// hold without it (padding into a trap, a fall-through into a seed entry or into a branch
+    /// target); a jump only that code reaches, or a loop only it enters, makes it start over.
+    #[test]
+    fn continued_session_cuts_blocks_at_new_no_return_calls() {
+        let mut code = vec![0xcc; 0x61];
+        let parts: [(usize, &[u8]); 9] = [
+            (0x00, &[0xe8, 0x5b, 0, 0, 0, 0x90, 0xcc]), // call 0x60; nop; int3
+            (0x07, &[0xe8, 0x54, 0, 0, 0, 0xc3]),       // call 0x60; 0xc: ret (a seed entry)
+            (0x0d, &[0x85, 0xc9, 0x74, 0x08]),          // test ecx, ecx; jz 0x19
+            (0x11, &[0xe8, 0x4a, 0, 0, 0, 0x0f, 0x1f, 0x00, 0xc3]), // call 0x60; nop; 0x19: ret
+            (0x20, &[0xe8, 0x3b, 0, 0, 0, 0xeb, 0x00, 0xc3]), // call 0x60; jmp 0x27; 0x27: ret
+            (0x28, &[0xe8, 0x33, 0, 0, 0, 0x90]),       // call 0x60; nop
+            (0x2e, &[0xff, 0xc9, 0x75, 0xfc]),          // 0x2e: dec ecx; jnz 0x2e
+            (0x32, &[0xc3]),                            // ret
+            (0x60, &[0xc3]),                            // the no-return callee
+        ];
+        for (at, bytes) in parts {
+            code[at..at + bytes.len()].copy_from_slice(bytes);
+        }
+        let image_with = |entries: &[u64], no_return: &[u64]| {
+            let mut image = CodeImage::new(
+                BASE,
+                vec![
+                    CodeSection::new(TEXT, &code, true),
+                    CodeSection::new(DATA, &DATA_BYTES, false),
+                ],
+                entries.iter().map(|e| TEXT + e).collect(),
+            );
+            image.no_return = no_return.iter().map(|o| TEXT + o).collect();
+            image
+        };
+        let thunks = BTreeSet::from([TEXT + 0x60]);
+        let cases: [(&[u64], bool); 3] = [
+            (&[0, 7, 0xc, 0xd], true),
+            (&[0, 7, 0xc, 0x20], false),
+            (&[0, 7, 0xc, 0x28], false),
+        ];
+        for (entries, accepted) in cases {
+            let image = image_with(entries, &[]);
+            let mut t = DiscoveryTimings::default();
+            let mut session = Session::new(&image, 1, &image.entry_points, BTreeSet::new(), &mut t);
+            let first = session.round(&mut t);
+            session.reclaim(first);
+            assert_eq!(session.add_no_return(&thunks), accepted, "{entries:x?}");
+            if accepted {
+                let continued = session.round(&mut t);
+                assert!(!session.diverged());
+                let fresh = discover(&image_with(entries, &[0x60]));
+                assert_eq!(continued, fresh);
+                let b = block(func(&fresh, 7), 7);
+                assert_eq!((b.terminator, b.end), (Terminator::NoReturnCall, TEXT + 0xc));
+                let b = block(func(&fresh, 0xd), 0x11);
+                assert_eq!((b.terminator, b.end), (Terminator::NoReturnCall, TEXT + 0x16));
+            }
+        }
     }
 
     #[test]

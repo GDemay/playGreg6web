@@ -1,6 +1,6 @@
 # Incremental discovery: design
 
-Status: Phase 0 implemented (0a #1962, 0b and 0c below); Phases 1-3 are proposals. Owner of the files involved (`recomp/src/discover.rs`,
+Status: Phase 0 implemented (0a #1962, 0b-0f below); Phases 1-3 are proposals. Owner of the files involved (`recomp/src/discover.rs`,
 `reach.rs`, `jump_table.rs`, `cfg.rs`, `eh.rs`): Marc. This page only describes the scheme and the
 numbers behind it; see "Rollout" for which step touches which file.
 
@@ -86,15 +86,16 @@ direct call, so those blocks would have to be decoded again), or when the contin
 event a fresh run may order differently (`Session::diverged`: a resolved table revised to one
 that drops targets or no longer matching, a retry or revision cap, a pointer-slot seed on a jump
 that later resolved as a table). On the game executable round 1 finds called no-return thunks, so
-round 2 starts over and rounds 3-4 continue (none diverged). Unit tests check every `discover()`
+round 2 started over and rounds 3-4 continued (none diverged); since Phase 0f round 2 continues
+too. Unit tests check every `discover()`
 call against a continued session (the entries split in two, and all added to an empty session)
 and `discover_refined_rounds` continued against fresh rounds.
 
 What is left is per-round full scans: decoding is serial, and the late resume targets, vtable /
 pointer-slot seeds, relocations and membership walks each visit all ~4M blocks once or more per
 round. Making those visit only blocks changed since their last pass, and continuing round 2
-through a no-return addition (retracting the decoded tails of the affected calls), are the
-remaining Phase 0-style wins; neither needs the match records of Phase 1.
+through a no-return addition (retracting the decoded tails of the affected calls, done in Phase
+0f below), are the remaining Phase 0-style wins; neither needs the match records of Phase 1.
 
 Phase 0d (measured, same output): the full-map scans that only read the block map (late resume
 targets, pointer-slot and vtable seeds, relocations) run as `par_map` waves whose results are
@@ -121,6 +122,24 @@ does not update the predecessor index edge by edge but builds it once at the end
 bit per byte, `BTreeSet` for other VAs); the cross-function tail-call check looks up the branch
 target first. Paired runs (`refine::discover_refined_timed`, cold, 4 rounds): decode 11.1-11.4 s
 -> 8.6-9.3 s, total 29.9-31.3 s -> 27.5-29.2 s; the encoded result has the same SHA-256 as `main`.
+
+Phase 0f (measured, same output): round 2 continues through the no-return thunks round 1 finds.
+`Session::add_no_return` (after the reclaim and the new entries) cuts every decoded block that
+calls one of them directly back to end at that call, as a fresh run decodes it, and drops its
+successors. It only does so when the code after the call derived nothing a fresh run lacks: that
+code may hold only plain instructions whose RIP-relative operands name no code and no data with
+non-seed relocated pointers, ending in a trap, `ret`, `jmp` or fall-through; the leaders it
+reached (fall-through, `jmp` target; a `jmp` to another `.pdata` entry must be a seed) must be
+seed entries, EH resume targets of seeds, or targets of a `jcc` / `jmp` / table edge from a
+block that still walks back to such a root without the cut edges (proven in rounds, so two
+leaders cannot support each other). A pointer-slot hit whose slice runs through a leader that
+loses an edge refuses, and the unresolved jumps forward of such leaders are matched again
+(their reaching paths lose the edge). Anything else starts over as before. On the game
+executable round 1's thunks are called from 313 blocks: 252 end in `nop` / `int3` padding, 59
+fall through (after a `nop`) into a branch target of the same function, one into an EH resume
+target, and one runs `nop; lea; jmp` into a seed entry; all are cut. Paired runs (cold, 4
+rounds, 4 continue now): round 2 10.3-11.2 s -> 2.0 s, decode 8.4-9.3 s -> 3.3 s, total
+27.2-28.4 s -> 17.5-17.7 s; the encoded result (126 MB) has the same SHA-256 as `main`.
 
 ## What a discovery rule can reach (measured)
 
