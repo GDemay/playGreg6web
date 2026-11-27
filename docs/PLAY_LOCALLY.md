@@ -21,6 +21,8 @@ open a **new** PowerShell window so they are picked up:
 stale and opens the game window. Add `-FreshSetup` to see the setup screens again (uses an empty save dir).
 `.\tools\play_native.ps1 -Help` prints a short summary of the switches.
 
+If it stops or crashes, see [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md) for where the report is and what to send.
+
 **Play without compiling (prebuilt).** `tools\update_prebuilt.ps1` builds once into a folder (default
 `%LOCALAPPDATA%\playgta6\prebuilt`, or `-Dir` / `PLAYGTA6_PREBUILT_DIR`) into a temp dir and swaps it in only when the
 build succeeded, so your playable copy is never broken; it records the source commit in `prebuilt.json`. Then
