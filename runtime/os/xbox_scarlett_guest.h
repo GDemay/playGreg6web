@@ -133,6 +133,9 @@
 //     s6  GetTexelElementOffsetBytes(plane, mip, x, y, zOrSlice, sample, bitOffset*) -> UINT64, 2 sites
 //         (element coordinates; the title divides BC texel coordinates by 4)                          m
 //     s8  CopyIntoSubresource(dst, plane, subresource, src, rowPitch, slicePitch)  1 site, arity 7 m
+//     s9  CopyFromSubresource(linearDst, plane, subresource, u32 0, resourceBase, rowPitch,
+//         slicePitch) -> HRESULT, 1 site (sub_140979E30, texture readback into a linear buffer it
+//         may re-pitch row by row itself); the inverse of s8 (detile with the same placement)     m
 //     s10 GetResourceTiling(numTiles*, packedMipInfo*, tileShape*, numTilings*, firstTiling,
 //         tilings*)                                1 site, arity 7, the D3D12 GetResourceTiling
 //                                                  shapes (12-byte packed-mip info, tile shape and
