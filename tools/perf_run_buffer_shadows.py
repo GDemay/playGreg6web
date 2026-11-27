@@ -11,7 +11,7 @@ def main():
     parser.add_argument('before')
     parser.add_argument('after')
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--case-filter', choices=('all', 'resident-sparse'), default='all')
+    parser.add_argument('--case-filter', choices=('all', 'resident-sparse', 'teardown'), default='all')
     args = parser.parse_args()
     cases = []
     workloads = [
@@ -25,6 +25,8 @@ def main():
     ]
     if args.case_filter == 'resident-sparse':
         workloads = [x for x in workloads if x[3] == 'sparse-fully-resident']
+    if args.case_filter == 'teardown':
+        workloads = [(4096, 1, 4096, 'dense-first'), (4096, 1, 0, 'sparse-first')]
     for workload in workloads:
         print('Measuring', workload, flush=True)
         def run(label):
@@ -48,6 +50,10 @@ def main():
             for field in ('shadow_resident_before_bytes', 'shadow_resident_after_bytes'):
                 if len({x[field] for x in group}) != 1:
                     raise RuntimeError('shadow allocation metric not repeatable: ' + label + '/' + field)
+        if args.case_filter == 'teardown':
+            for group in samples.values():
+                if any(x['shadow_payload_after_destroy_bytes'] != 0 for x in group):
+                    raise RuntimeError('shadow payload not released after Resource destruction')
         cases.append({'arguments': workload, 'samples': samples})
     environment = json.loads(Path('runner-environment.json').read_text(encoding='utf-8-sig'))
     result = {
@@ -56,6 +62,8 @@ def main():
         'sampling': 'separate prebuilt MSVC Release binaries; one untimed invocation each, then seven alternating A/B pairs; four warmup flushes per invocation; setup, guest writes, output checks and metric collection excluded from timed flush; dense-first times ONE flush and is not averaged with resident flushes',
         'metrics': 'elapsed wall and GetProcessTimes user+kernel CPU; allocated shadow payload bytes from Resource::shadow_resident_bytes, excluding pointer-vector and allocator metadata; 4KiB pointer slots require up to 12 pointers instead of one per48KiB buffer',
         'unmeasured': 'real game allocation/write distribution, shared XMem views, browser/Wasm, GPU execution, actual process RSS and sustained game FPS',
+        'scratchTeardownInstrumentation': args.case_filter == 'teardown',
+        'teardownScope': 'resources.clear() only: complete Resource destructor and all shadow chunk frees, including common untracking/resource retirement work. Excludes device reset, guest arena release, vector capacity cleanup and process exit. No per-destructor timers or logging.',
         'cases': cases,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)

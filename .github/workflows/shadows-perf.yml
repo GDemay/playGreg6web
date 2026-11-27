@@ -34,6 +34,10 @@ jobs:
       - name: Prepare identical benchmark source and record environment
         shell: pwsh
         run: |
+          if ('${{ inputs.case_filter }}' -eq 'teardown') {
+            python runner/tools/instrument_shadow_teardown.py patch/tests/bench_buffer_shadows.cpp
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
           Copy-Item patch/tests/bench_buffer_shadows.cpp baseline/tests/bench_buffer_shadows.cpp
           @'
           option(PLAYGTA6_PERFORMANCE_BENCHMARKS "Build manual performance probes" OFF)
