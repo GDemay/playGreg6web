@@ -492,6 +492,10 @@ struct BootState {
     // B2: call counters for the exports of the lifted Bink2Scarlett.dll and how its exports bound.
     ExportCounters bink;
     AudioProbes audio_probes;  // A4: title audio-stack call counters (main executable addresses)
+    GuestWatch watch;          // --watch-guest-va (guest/guest_watch.h)
+    std::mutex watch_mutex;
+    std::string watch_last_present;            // snapshot logged at the previous changed present
+    std::atomic<uint64_t> watch_presents{0};
     bool bink_present = false;        // a loaded module named Bink2Scarlett.dll
     uint64_t bink_exports_lifted = 0; // registry exports that are guest (lifted) code
     uint64_t bink_exports_shim = 0;   // registry exports that are host shims (would shadow the DLL)
@@ -1550,6 +1554,53 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     }
 }
 
+// --watch-guest-va: one line per runtime-side operation touching a watched range. Runs under the
+// arena's lock, so the range itself is not read here (a decommitted page would fault).
+void watch_arena_event(BootState& b, os::ArenaEvent event, uint64_t va, uint64_t size, bool ok) {
+    if (!b.log_progress || !b.watch.take_line()) {
+        return;
+    }
+    static const char* const kNames[] = {"reserve", "commit", "decommit", "release", "reset", "write"};
+    const long imp = t_last_import;
+    const std::string import = imp >= 0 && static_cast<size_t>(imp) < b.imports.size()
+                                   ? import_label(b.imports[static_cast<size_t>(imp)].import)
+                                   : std::string("runtime");
+    logf("[watch] t=%" PRIu64 " thread=%u %s va=0x%" PRIx64 " size=0x%" PRIx64 " ok=%d under=%s import_seq=%" PRIu64,
+         elapsed_ms(), t_active != nullptr ? t_active->thread_id : 0u, kNames[static_cast<int>(event)], va, size,
+         ok ? 1 : 0, import.c_str(), t_last_import_seq);
+}
+
+// Contents of the watched ranges, read through the arena's checked copy.
+std::string watch_snapshot(BootState& b) {
+    return b.watch.snapshot([&b](uint64_t va, void* dst, size_t len) {
+        return b.arena != nullptr && b.arena->read(va, dst, len);
+    });
+}
+
+// At each present, one line when a watched range changed since the previous present: how the
+// contents move frame by frame without a probe build (guest stores themselves are not seen).
+void watch_at_present(BootState& b) {
+    if (!b.watch.active() || !b.log_progress) {
+        return;
+    }
+    std::string now = watch_snapshot(b);
+    const uint64_t presents = b.watch_presents.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+        std::lock_guard<std::mutex> lock(b.watch_mutex);
+        if (now == b.watch_last_present) {
+            return;
+        }
+        b.watch_last_present = now;
+    }
+    if (!b.watch.take_line()) {
+        return;
+    }
+    char head[96];
+    std::snprintf(head, sizeof(head), "[watch] t=%" PRIu64 " thread=%u present %" PRIu64, elapsed_ms(),
+                  t_active != nullptr ? t_active->thread_id : 0u, presents);
+    os::log(std::string(head) + now);
+}
+
 // Address-space log: what the guest (through shims) reserves and commits, in order, attributed to
 // the import call running on the requesting thread. Runs under the arena's lock (no arena calls).
 void boot_arena_observer(const os::VirtualMemoryArena& arena,
@@ -1562,7 +1613,24 @@ void boot_arena_observer(const os::VirtualMemoryArena& arena,
     if (&arena != b.arena) {
         return;
     }
+    if (event == os::ArenaEvent::Write || event == os::ArenaEvent::Reset) {
+        // Not part of the address-space log: only a watched range cares.
+        if (b.watch.active() && b.watch.overlaps(va, size)) {
+            watch_arena_event(b, event, va, size, ok);
+        }
+        return;
+    }
     std::lock_guard<std::mutex> lock(b.arena_mutex);
+    if (b.watch.active()) {
+        uint64_t span = size;
+        if (event == os::ArenaEvent::Release) {
+            auto it = b.live_reservations.find(va);
+            span = it != b.live_reservations.end() ? it->second : 1;
+        }
+        if (b.watch.overlaps(va, span)) {
+            watch_arena_event(b, event, va, span, ok);
+        }
+    }
     ++b.arena_events;
     if (!ok) {
         ++b.arena_failures;
@@ -3066,6 +3134,13 @@ void log_trap() {
     }
     text += " (" + f.kind + ", " + function_text(f.va) + ")";
     logf("%s", text.c_str());
+    if (b.watch.active()) {
+        char head[96];
+        std::snprintf(head, sizeof(head), "[watch] t=%" PRIu64 " thread=%u at fault", f.elapsed_ms, f.thread_id);
+        if (b.log_progress) {
+            os::log(std::string(head) + watch_snapshot(b));
+        }
+    }
     if (b.fault_record) {
         // Compact sanitized lines next to the trap line; tools/fault_report.py prints the full record.
         ExportHit sym;
@@ -3862,6 +3937,7 @@ static void record_present() {
         }
         b.last_present_us = now_us;
     }
+    watch_at_present(boot());
     mark_first_present();
 }
 
@@ -4069,6 +4145,16 @@ BootResult run_boot(const BootConfig& config) {
     b.recent_capacity = config.recent_import_count;
     b.max_frames = config.max_backtrace_frames;
     b.fault_record = config.fault_record;
+    b.watch.configure(config.watch_guest_va);
+    b.watch_last_present.clear();
+    b.watch_presents.store(0, std::memory_order_relaxed);
+    for (const WatchRange& r : b.watch.ranges()) {
+        if (r.indirect) {
+            logf("[watch] watching guest *0x%" PRIx64 "+0x%" PRIx64 " (%" PRIu64 " bytes)", r.va, r.offset, r.len);
+        } else {
+            logf("[watch] watching guest 0x%" PRIx64 "..0x%" PRIx64, r.va, r.va + r.len);
+        }
+    }
     b.indirect_log = config.record_indirect_targets.empty()
                          ? nullptr
                          : std::make_shared<IndirectTargetLog>(config.record_indirect_targets);
@@ -4454,6 +4540,14 @@ BootResult run_boot(const BootConfig& config) {
 extern "C" void __playgta6_probe_hit(playgta6::GuestState* state, uint64_t va) {
     using namespace playgta6::guest;
     BootState& b = boot();
+    if (b.watch.active() && b.log_progress && b.watch.take_entry(va) && b.watch.take_line()) {
+        // Entry order across threads, with what the watched ranges hold at that moment.
+        char head[160];
+        std::snprintf(head, sizeof(head), "[watch] t=%" PRIu64 " thread=%u enter sub_%" PRIX64 " rcx=0x%" PRIx64
+                      " rdx=0x%" PRIx64, elapsed_ms(), t_active != nullptr ? t_active->thread_id : 0u, va,
+                      state->gpr[playgta6::GuestReg::Rcx], state->gpr[playgta6::GuestReg::Rdx]);
+        playgta6::os::log(std::string(head) + watch_snapshot(b));  // longer than logf's buffer
+    }
     if (!b.audio_probes.active()) {
         return;
     }

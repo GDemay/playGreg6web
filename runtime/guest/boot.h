@@ -10,6 +10,7 @@
 
 #include "abi/playgta6_abi.h"
 #include "guest/export_thunks.h"
+#include "guest/guest_watch.h"
 #include "guest/guest_runtime.h"
 #include "guest/memory_model.h"
 #include "guest/shard_dispatch.h"
@@ -459,6 +460,10 @@ struct BootConfig {
     // stack, the last 64 dispatched function entries of the faulting thread, elapsed time and the
     // newest present's draws. Off: the entry ring keeps one slot and no record is written.
     bool fault_record = true;
+    // `--watch-guest-va`: guest ranges whose runtime-side commit / decommit / release / MEM_RESET /
+    // checked writes are logged, with a snapshot of their contents at each `--probe-functions`
+    // entry and at the fault (guest/guest_watch.h). Empty: off.
+    std::vector<WatchRange> watch_guest_va;
     // Non-empty: append every distinct (call site, target) pair of guest code the run dispatched
     // through the indirect-call path to this file (guest/indirect_targets.h), at the end of the
     // run and at a fault. Feed it back with `playgta6-recomp build-program --seed-targets`.

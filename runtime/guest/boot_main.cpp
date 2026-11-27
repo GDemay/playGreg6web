@@ -284,6 +284,7 @@ struct Options {
     std::string record_indirect_targets;  // --record-indirect-targets <file>
     bool dump_on_fault = false;  // --dump-on-fault: also write a minidump on a guest fault
     bool fault_record = true;    // --no-fault-record: no fault_record / entry ring (benchmarks)
+    std::vector<playgta6::guest::WatchRange> watch;  // --watch-guest-va <addr>[:len] (repeatable)
     bool present_honor_interval = false;  // --present-interval honor|min1 (default min1)
     bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
@@ -299,7 +300,7 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet] [--no-fault-record] [--dump-on-fault] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages]\n"
+                 "                     [--no-entry] [--quiet] [--no-fault-record] [--dump-on-fault] [--watch-guest-va <addr>[:len]] [--record-indirect-targets <file>] [--no-present-pacing] [--no-xmem-shared-pages]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
@@ -343,6 +344,10 @@ bool parse(int argc, char** argv, Options& o) {
             o.dump_on_fault = true;
         } else if (a == "--no-fault-record") {
             o.fault_record = false;
+        } else if (a == "--watch-guest-va" && i + 1 < argc) {
+            playgta6::guest::WatchRange r;
+            if (!playgta6::guest::parse_watch_spec(argv[++i], &r)) return false;
+            o.watch.push_back(r);
         } else if (a == "--present-interval" && i + 1 < argc) {
             const std::string v = argv[++i];
             if (v != "honor" && v != "min1") return false;
@@ -1414,6 +1419,7 @@ void run_boot_thread() {
     cfg.call_entry = g_options.entry;
     cfg.log_progress = !g_options.quiet;
     cfg.fault_record = g_options.fault_record;
+    cfg.watch_guest_va = g_options.watch;
     cfg.record_indirect_targets = g_options.record_indirect_targets;
     cfg.capture_host_stack = &capture_host_stack;
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
