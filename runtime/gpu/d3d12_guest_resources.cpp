@@ -2435,6 +2435,16 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 uniform_unprimed_.insert(&r);
             }
         }
+        {
+            std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+            storage_page_index_.clear();
+            crosscheck_storage_.clear();
+            storage_unprimed_.clear();
+            for (auto& [key, r] : storage_relocations_) {
+                r.index_primed = false;
+                storage_unprimed_.insert(&r);
+            }
+        }
         page_index_live_ = indexed;
     }
     // The ranges taken are the indexed buffers' and relocated uniform ranges' (merged, page-aligned).
@@ -2452,6 +2462,12 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         // ones overlapping a written page are compared.
         std::lock_guard<std::mutex> lock(relocation_mutex_);
         const auto& h = uniform_page_index_.hulls();
+        take_ranges.insert(take_ranges.end(), h.begin(), h.end());
+    }
+    if (indexed) {
+        // And the relocated storage ranges, so only the ones overlapping a written page are hashed.
+        std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+        const auto& h = storage_page_index_.hulls();
         take_ranges.insert(take_ranges.end(), h.begin(), h.end());
         merge_ranges(&take_ranges);
     }
@@ -2488,6 +2504,9 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             {
                 std::lock_guard<std::mutex> rlock(storage_relocation_mutex_);
                 for (const auto& [key, r] : storage_relocations_) {
+                    if (indexed && storage_page_index_.contains(&r)) {
+                        continue;  // inside take_ranges
+                    }
                     add_range(cpu_address_for_gpu(r.va), r.size);
                 }
             }
@@ -2773,11 +2792,72 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     {
         std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
         std::vector<uint8_t> bytes;
-        for (auto& [key, r] : storage_relocations_) {
+        std::vector<const void*> storage_visit;
+        if (indexed) {
+            // As the uniform ranges above: the entries a take reported (or whose take failed) are
+            // visited; a primed entry no take named is unchanged since its last comparison.
+            storage_page_index_.collect_pages(dirty_pages, os::kWrittenPageSize, &storage_visit);
+            for (const auto& h : taken_failed) {
+                storage_page_index_.collect_range(h.first, h.second, &storage_visit);
+            }
+            for (const void* key : storage_visit) {
+                const_cast<RelocatedStorage*>(static_cast<const RelocatedStorage*>(key))->visit_seq = seq;
+            }
+            for (const void* key : crosscheck_storage_) {
+                const RelocatedStorage* r = static_cast<const RelocatedStorage*>(key);
+                if (r->visit_seq == seq || !r->index_primed) {
+                    count_work(Work::FlushCrosscheckLate);
+                } else {
+                    count_work(Work::FlushCrosscheckMisses);
+                    std::fprintf(stderr, "[flush-crosscheck] storage range 0x%llx (%llu bytes) changed unreported\n",
+                                 static_cast<unsigned long long>(r->va), static_cast<unsigned long long>(r->size));
+                }
+            }
+            crosscheck_storage_.clear();
+        }
+        uint64_t storage_compared = 0, storage_skipped = 0;
+        auto visit_storage = [&](RelocatedStorage& r) {
+            bool index_skip = false;
+            if (indexed && r.index_primed && r.ever_uploaded && r.visit_seq != seq) {
+                uintptr_t lo = 0, hi = 0;
+                index_skip = storage_page_index_.range_of(&r, &lo, &hi) && ranges_cover(taken_ok, lo, hi);
+            }
+            if (indexed) {
+                ++(index_skip ? storage_skipped : storage_compared);
+            }
+            if (index_skip && !crosscheck) {
+                return;
+            }
+            // Indexed flushes: (re-)index the range at the host address it was looked at (primed when
+            // this flush's take covered it), or drop it from the index when it is not mapped in one piece.
+            uintptr_t seen_host = 0;
+            bool uploaded = false;
+            const auto reindex = [&]() {
+                if (!indexed) {
+                    return;
+                }
+                if (index_skip && uploaded) {
+                    crosscheck_storage_.insert(&r);
+                }
+                if (seen_host != 0) {
+                    const uintptr_t hi = seen_host + static_cast<uintptr_t>(r.size);
+                    storage_page_index_.add(&r, seen_host, hi);
+                    r.index_primed = r.ever_uploaded && ranges_cover(taken_ok, seen_host, hi);
+                } else {
+                    storage_page_index_.remove(&r);
+                    r.index_primed = false;
+                }
+                if (r.index_primed) {
+                    storage_unprimed_.erase(&r);
+                } else {
+                    storage_unprimed_.insert(&r);
+                }
+            };
             const uint64_t write_len = align_up(r.size, 4u);
             const uint64_t cpu = cpu_address_for_gpu(r.va);
             if (unwritten(cpu, r.size) && r.ever_uploaded) {
-                continue;
+                reindex();
+                return;
             }
             // R40: hash the live bytes in place where they are mapped in one piece and copy them
             // only when they changed (most ranges are unchanged at most submissions).
@@ -2788,28 +2868,33 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 const com::GuestRangeView view(cpu, static_cast<size_t>(r.size));  // holds the arena lock
                 if (view.data() != nullptr) {
                     mapped = true;
+                    seen_host = reinterpret_cast<uintptr_t>(view.data());
                     if (native_unwritten(r.write_cursor, r.write_primed, view.data(), r.size) && r.ever_uploaded) {
-                        continue;  // no page written since the last hash: same bytes
-                    }
-                    hash = content_hash(view.data(), static_cast<size_t>(r.size));
-                    if (r.ever_uploaded && hash == r.last_hash) {
-                        unchanged = true;
+                        unchanged = true;  // no page written since the last hash: same bytes
                     } else {
-                        bytes.assign(view.data(), view.data() + r.size);
+                        hash = content_hash(view.data(), static_cast<size_t>(r.size));
+                        if (r.ever_uploaded && hash == r.last_hash) {
+                            unchanged = true;
+                        } else {
+                            bytes.assign(view.data(), view.data() + r.size);
+                        }
                     }
                 }
             }
             if (unchanged) {
-                continue;
+                reindex();
+                return;
             }
             if (!mapped) {
                 bytes.resize(static_cast<size_t>(r.size));
                 if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
-                    continue;
+                    reindex();
+                    return;
                 }
                 hash = content_hash(bytes.data(), bytes.size());
                 if (r.ever_uploaded && hash == r.last_hash) {
-                    continue;
+                    reindex();
+                    return;
                 }
             }
             bytes.resize(static_cast<size_t>(write_len), 0);
@@ -2822,6 +2907,35 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             note_upload(write_len);
             r.last_hash = hash;
             r.ever_uploaded = true;
+            uploaded = true;
+            reindex();
+        };
+        if (indexed && !crosscheck) {
+            // Only the entries a take reported (visit_seq == seq) and the unprimed ones can need a
+            // comparison (as the uniform ranges): O(reported) instead of O(storage_relocations_).
+            std::vector<RelocatedStorage*> candidates;
+            candidates.reserve(storage_visit.size() + storage_unprimed_.size());
+            for (const void* key : storage_visit) {
+                candidates.push_back(const_cast<RelocatedStorage*>(static_cast<const RelocatedStorage*>(key)));
+            }
+            candidates.insert(candidates.end(), storage_unprimed_.begin(), storage_unprimed_.end());
+            // Deterministic order (guest VA, then size); each entry has its own home.
+            std::sort(candidates.begin(), candidates.end(), [](const RelocatedStorage* a, const RelocatedStorage* b) {
+                return a->va != b->va ? a->va < b->va : (a->size != b->size ? a->size < b->size : a < b);
+            });
+            candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+            for (RelocatedStorage* r : candidates) {
+                visit_storage(*r);
+            }
+            storage_skipped += static_cast<uint64_t>(storage_relocations_.size() - candidates.size());
+        } else {
+            for (auto& [key, r] : storage_relocations_) {
+                visit_storage(r);
+            }
+        }
+        if (indexed) {
+            count_work(Work::FlushStorageCompared, storage_compared);
+            count_work(Work::FlushStorageSkipped, storage_skipped);
         }
     }
     // Relocated index / vertex buffers (G58): re-upload ring buffers the title wrote since.
@@ -3017,6 +3131,9 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             emptied_chunks.push_back(chunk);
         }
         storage_home_index_.erase(storage_home_key(it->second.buffer_id, it->second.offset));
+        storage_page_index_.remove(&it->second);
+        crosscheck_storage_.erase(&it->second);
+        storage_unprimed_.erase(&it->second);
         storage_relocations_.erase(it);
         relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
     };
@@ -3136,7 +3253,9 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     entry.ever_uploaded = true;
     entry.dedicated = dedicated;
     entry.created_epoch = relocation_evictions_.load(std::memory_order_relaxed);
-    storage_home_index_[storage_home_key(target_buf, target_off)] = storage_relocations_.emplace(key, entry).first;
+    const auto placed = storage_relocations_.emplace(key, entry).first;
+    storage_home_index_[storage_home_key(target_buf, target_off)] = placed;
+    storage_unprimed_.insert(&placed->second);  // new: compared at the next flush
     storage_relocation_lru_.emplace(seq, key);
     storage_relocation_bytes_ += target_cap;
     if (!dedicated) {
