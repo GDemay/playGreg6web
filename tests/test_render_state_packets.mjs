@@ -692,7 +692,8 @@ test('bind groups: texture view descriptors, null bindings, manifest layouts and
     { binding: 1, visibility: 2, texture: { sampleType: 'depth', viewDimension: 'cube', multisampled: false } },
     { binding: 2, visibility: 2, sampler: { type: 'comparison' } },
     { binding: 3, visibility: 4, storageTexture: { access: 'write-only', format: 'r32float', viewDimension: '2d-array' } },
-    { binding: 4, visibility: 2, texture: { sampleType: 'float', viewDimension: '2d', multisampled: true } },
+    // WebGPU forbids sampleType 'float' on multisampled textures; coerced to 'unfilterable-float'.
+    { binding: 4, visibility: 2, texture: { sampleType: 'unfilterable-float', viewDimension: '2d', multisampled: true } },
   ]);
   const layouts = gpu.results('createBindGroupLayout');
   assert.equal(layouts.length, 2); // ours + the empty layout for group 1; group 2 came from the manifest
@@ -774,9 +775,15 @@ test('explicit passes: dynamic state, v2 compute pipelines and v1 interop', () =
     new Stream()
       .shader(3, 2, 'cs')
       .texture(60, 32, 32, 0)
-      .texture(61, 32, 32, 3)
-      .packet(OPCODES.BEGIN_FRAME)
       .bytes(),
+    createTexture2Packet({
+      id: 61,
+      width: 32,
+      height: 32,
+      format: formatCodeOf('depth24plus-stencil8'),
+      usage: 0x10,
+    }),
+    new Stream().packet(OPCODES.BEGIN_FRAME).bytes(),
     header(V2_OPCODES.SET_VIEWPORT, new Uint8Array(24)), // outside a pass: ignored
     header(V2_OPCODES.BEGIN_RENDER_PASS, pass),
     header(V2_OPCODES.SET_BLEND_CONSTANT, blend),
@@ -1575,21 +1582,25 @@ function createTexture2Packet({
   id,
   width,
   height,
-  depthOrLayers = 1,
-  mipLevels = 1,
+  depthOrLayers,
+  depthOrArrayLayers,
+  mipLevels,
+  mipLevelCount,
   sampleCount = 1,
   usage = 0x04,
   dimension = 1, // 2d
   format,
   viewFormats = [],
 }) {
+  const effectiveDepth = depthOrLayers !== undefined ? depthOrLayers : depthOrArrayLayers !== undefined ? depthOrArrayLayers : 1;
+  const effectiveMips = mipLevels !== undefined ? mipLevels : mipLevelCount !== undefined ? mipLevelCount : 1;
   const payload = new Uint8Array(40);
   const view = new DataView(payload.buffer);
   view.setUint32(0, id, true);
   view.setUint32(4, width, true);
   view.setUint32(8, height, true);
-  view.setUint32(12, depthOrLayers, true);
-  view.setUint32(16, mipLevels, true);
+  view.setUint32(12, effectiveDepth, true);
+  view.setUint32(16, effectiveMips, true);
   view.setUint32(20, sampleCount, true);
   view.setUint32(24, usage, true);
   view.setUint8(28, dimension);
@@ -4321,9 +4332,18 @@ test('W186 (#927): W163 resolveStorageCompatibleFormat maps sRGB linear siblings
     assert.ok(warnings.some((w) => w.includes('depth-stencil-not-storage-compatible')));
 
     const [bg] = gpu.results('createBindGroup');
-    const dummyStorageTex = gpu.results('createTexture').at(-1);
-    assert.equal(dummyStorageTex.desc.format, 'rgba8unorm');
-    assert.equal(bg.desc.entries[0].resource.textureHandle, dummyStorageTex.result.handle);
+    const createdTex = gpu.results('createTexture');
+    const dummyStorageTex0 = createdTex.at(-2);
+    const dummyStorageTex1 = createdTex.at(-1);
+    assert.equal(dummyStorageTex0.desc.format, 'rgba8unorm');
+    assert.equal(dummyStorageTex1.desc.format, 'rgba8unorm');
+    assert.equal(bg.desc.entries[0].resource.textureHandle, dummyStorageTex0.result.handle);
+    assert.equal(bg.desc.entries[1].resource.textureHandle, dummyStorageTex1.result.handle);
+    assert.notEqual(
+      dummyStorageTex0.result.handle,
+      dummyStorageTex1.result.handle,
+      'distinct storageTexture bindings must receive distinct dummy GPUTextures (#1953/#1977)'
+    );
   }
 });
 
