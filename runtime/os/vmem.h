@@ -346,6 +346,10 @@ public:
 
     uint64_t reserved_bytes() const;
     uint64_t committed_bytes() const;
+    // Actual OS-committed bytes for this arena (committed_bytes() minus lazy/NoAccess deferred).
+    uint64_t host_committed_bytes() const;
+    // Logically committed bytes in this arena whose host OS commit is currently deferred.
+    uint64_t lazy_deferred_bytes() const;
     uint64_t peak_committed_bytes() const;
     uint64_t decommitted_bytes_total() const;
     uint64_t reclaimed_pages_reused() const;
@@ -355,6 +359,7 @@ private:
     static constexpr size_t kLookupCacheSize = 64;
     static constexpr uint64_t kDecommitChunkShift = 24;  // 16 MiB = 4096 pages = 64 * u64
     static constexpr size_t kDecommitChunkWords = 64;
+    static constexpr size_t kMetaChunkPages = 1024;  // 4 MiB VA = 2 KiB metadata per active chunk
 
     struct DecommitChunk {
         std::array<uint64_t, kDecommitChunkWords> bits{};
@@ -362,18 +367,28 @@ private:
     };
 
     struct PageMeta {
-        uint8_t state_raw = 0;  // 0 = Reserve, 1 = Commit
+        // 0 = Reserve, 1 = Commit (backed by OS/linear memory), 2 = Commit (deferred NoAccess)
+        uint8_t state_raw = 0;
         uint8_t protect_raw = static_cast<uint8_t>(PageProtect::NoAccess);
 
         PageMeta() = default;
-        PageMeta(MemState s, PageProtect p)
-            : state_raw(s == MemState::Commit ? 1 : 0),
+        PageMeta(MemState s, PageProtect p, bool deferred_noaccess = false)
+            : state_raw(s == MemState::Commit ? (deferred_noaccess ? 2 : 1) : 0),
               protect_raw(static_cast<uint8_t>(p)) {}
 
         MemState state() const { return state_raw != 0 ? MemState::Commit : MemState::Reserve; }
-        void set_state(MemState s) { state_raw = s == MemState::Commit ? 1 : 0; }
+        bool is_backed() const { return state_raw == 1; }
+        bool is_deferred_noaccess() const { return state_raw == 2; }
+        void set_state(MemState s, bool deferred_noaccess = false) {
+            state_raw = s == MemState::Commit ? (deferred_noaccess ? 2 : 1) : 0;
+        }
         PageProtect protect() const { return static_cast<PageProtect>(protect_raw); }
         void set_protect(PageProtect p) { protect_raw = static_cast<uint8_t>(p); }
+    };
+
+    struct PageMetaChunk {
+        std::array<PageMeta, kMetaChunkPages> pages{};
+        uint16_t committed_count = 0;
     };
 
     struct Reservation {
@@ -381,10 +396,52 @@ private:
         uint64_t size = 0;              // Page-aligned reserved size
         uint64_t granularity_size = 0;  // 64 KiB-aligned VA slot occupancy
         PageProtect allocation_protect = PageProtect::NoAccess;
-        std::vector<PageMeta> pages;
+        size_t page_count = 0;
+        // Sparse 2-level page metadata: empty while 0 pages are committed (0 host bytes for pure
+        // reservations, GPU windows, and placeholders); null chunk == all Reserve/NoAccess.
+        std::vector<std::unique_ptr<PageMetaChunk>> page_chunks;
         bool placeholder = false;            // a placeholder (see virtual_alloc / virtual_free)
         bool replaced_placeholder = false;   // a reservation made by replacing a placeholder
         bool shared = false;                 // O36: in the shared zone (pages are views)
+
+        PageMeta get_page(size_t p) const {
+            if (page_chunks.empty()) {
+                return PageMeta{};
+            }
+            const size_t c = p / kMetaChunkPages;
+            const auto& chunk = page_chunks[c];
+            return chunk ? chunk->pages[p % kMetaChunkPages] : PageMeta{};
+        }
+
+        void set_page(size_t p, PageMeta meta) {
+            const size_t c = p / kMetaChunkPages;
+            const size_t off = p % kMetaChunkPages;
+            if (meta.state_raw == 0) {
+                if (page_chunks.empty() || !page_chunks[c]) {
+                    return;
+                }
+                PageMeta& slot = page_chunks[c]->pages[off];
+                if (slot.state_raw != 0) {
+                    --page_chunks[c]->committed_count;
+                }
+                slot = meta;
+                if (page_chunks[c]->committed_count == 0) {
+                    page_chunks[c].reset();
+                }
+                return;
+            }
+            if (page_chunks.empty()) {
+                page_chunks.resize((page_count + kMetaChunkPages - 1) / kMetaChunkPages);
+            }
+            if (!page_chunks[c]) {
+                page_chunks[c] = std::make_unique<PageMetaChunk>();
+            }
+            PageMeta& slot = page_chunks[c]->pages[off];
+            if (slot.state_raw == 0) {
+                ++page_chunks[c]->committed_count;
+            }
+            slot = meta;
+        }
     };
 
     bool split_placeholder_locked(uint64_t addr, uint64_t size);
@@ -424,10 +481,19 @@ private:
     std::unordered_map<uint64_t, DecommitChunk> decommitted_chunks_;
     uint64_t reserved_bytes_ = 0;
     uint64_t committed_bytes_ = 0;
+    uint64_t deferred_noaccess_bytes_ = 0;
     uint64_t peak_committed_bytes_ = 0;
     uint64_t decommitted_bytes_total_ = 0;
     uint64_t reclaimed_pages_reused_ = 0;
 };
+
+// #1077: Windows lazy commit (commit-on-first-touch via leaf-locked VEH). Enabled by default on
+// Windows; off on other platforms. Allows toggling for A/B benchmarking and exposes global
+// deferred-commit / demand-fault telemetry.
+void set_lazy_commit(bool on);
+bool lazy_commit_enabled();
+uint64_t lazy_deferred_bytes();
+uint64_t lazy_commit_faults();
 
 // O36: shared page objects for VirtualMemoryArena::map_shared (native hosts; nullptr elsewhere).
 // view_shared_page gives the runtime its own view of the page's bytes.

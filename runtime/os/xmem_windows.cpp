@@ -3,13 +3,14 @@
 #include "os/xmem_windows.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
-#include <unordered_map>
 
 namespace playgta6::os::xmem_windows {
 
@@ -27,6 +28,18 @@ PlacementPolicy default_policy() {
 #endif
 }
 
+// Sparse chunked GPU page table (#1077): 4096 x 64 KiB pages = 256 MiB GPU VA per 16 KiB chunk
+// (4 B/page instead of ~48 B/node in unordered_map), freed immediately when a chunk empties.
+constexpr uint64_t kGpuPageChunkShift = 28;  // 256 MiB
+constexpr size_t kGpuPageChunkEntries = size_t{1} << (kGpuPageChunkShift - 16);
+constexpr uint32_t kGpuPageUnmapped = UINT32_MAX;
+
+struct GpuPageChunk {
+    std::array<uint32_t, kGpuPageChunkEntries> pool_pages;
+    uint16_t mapped_count = 0;
+    GpuPageChunk() { pool_pages.fill(kGpuPageUnmapped); }
+};
+
 struct State {
     std::shared_mutex mutex;
     std::atomic<PlacementPolicy> policy{default_policy()};
@@ -36,7 +49,8 @@ struct State {
     std::vector<AliasPair> pairs;
     std::map<uint64_t, AliasListener> listeners;
     uint64_t next_listener = 1;
-    std::unordered_map<uint64_t, uint64_t> gpu_pages;  // GPU page VA -> pool page index
+    std::map<uint64_t, std::unique_ptr<GpuPageChunk>> gpu_page_chunks;  // (gpu_va >> 28) -> chunk
+    uint64_t gpu_mapped_pages = 0;
     uint64_t gpu_mapping_updates = 0;
     uint64_t gpu_mapping_kind_entries[4] = {};
     uint64_t gpu_mapping_repeated_single_runs = 0;
@@ -174,8 +188,30 @@ bool forget_window(uint64_t base) {
     }
     if (it->second.kind == WindowKind::Gpu) {
         const uint64_t lo = it->second.base, hi = it->second.base + it->second.size;
-        for (auto p = s.gpu_pages.begin(); p != s.gpu_pages.end();) {
-            p = (p->first >= lo && p->first < hi) ? s.gpu_pages.erase(p) : std::next(p);
+        const uint64_t first_key = lo >> kGpuPageChunkShift;
+        const uint64_t last_key = hi > lo ? ((hi - 1) >> kGpuPageChunkShift) : first_key;
+        for (auto c = s.gpu_page_chunks.lower_bound(first_key);
+             c != s.gpu_page_chunks.end() && c->first <= last_key;) {
+            const uint64_t chunk_base = c->first << kGpuPageChunkShift;
+            const uint64_t chunk_end = chunk_base + (uint64_t{1} << kGpuPageChunkShift);
+            if (chunk_base >= lo && chunk_end <= hi) {
+                s.gpu_mapped_pages -= c->second->mapped_count;
+                c = s.gpu_page_chunks.erase(c);
+                continue;
+            }
+            const uint64_t ov_lo = std::max(lo, chunk_base);
+            const uint64_t ov_hi = std::min(hi, chunk_end);
+            const size_t i_lo = static_cast<size_t>((ov_lo - chunk_base) >> 16);
+            const size_t i_hi = static_cast<size_t>((ov_hi - chunk_base) >> 16);
+            GpuPageChunk& chunk = *c->second;
+            for (size_t i = i_lo; i < i_hi; ++i) {
+                if (chunk.pool_pages[i] != kGpuPageUnmapped) {
+                    chunk.pool_pages[i] = kGpuPageUnmapped;
+                    --chunk.mapped_count;
+                    --s.gpu_mapped_pages;
+                }
+            }
+            c = chunk.mapped_count == 0 ? s.gpu_page_chunks.erase(c) : std::next(c);
         }
     }
     s.pairs.erase(std::remove_if(s.pairs.begin(), s.pairs.end(),
@@ -235,6 +271,10 @@ PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> rang
     State& s = state();
     std::unique_lock<std::shared_mutex> lock(s.mutex);
     ++s.gpu_mapping_updates;
+    Window cached_win{};
+    bool has_cached_win = false;
+    uint64_t cached_chunk_key = ~uint64_t{0};
+    GpuPageChunk* cached_chunk = nullptr;
     for (const PageMappingRange& range : ranges) {
         uint64_t page_va = range.gpu_va & ~(kWindowPageSize - 1);
         for (const PageMappingEntry& e : range.entries) {
@@ -252,22 +292,53 @@ PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> rang
                 continue;
             }
             for (uint32_t i = 0; i < e.count; ++i, page_va += kWindowPageSize) {
-                Window w;
-                if (!window_containing_locked(s, page_va, kWindowPageSize, &w) || w.kind != WindowKind::Gpu) {
+                if (!has_cached_win || page_va < cached_win.base ||
+                    page_va - cached_win.base > cached_win.size - kWindowPageSize) {
+                    has_cached_win = window_containing_locked(s, page_va, kWindowPageSize, &cached_win) &&
+                                     cached_win.kind == WindowKind::Gpu;
+                }
+                if (!has_cached_win) {
                     ++r.outside_window;
                     continue;
                 }
+                const uint64_t chunk_key = page_va >> kGpuPageChunkShift;
+                const size_t entry_idx = static_cast<size_t>((page_va >> 16) & (kGpuPageChunkEntries - 1));
                 if (e.kind == kUnmap) {
-                    s.gpu_pages.erase(page_va);
+                    if (chunk_key != cached_chunk_key) {
+                        cached_chunk_key = chunk_key;
+                        auto cit = s.gpu_page_chunks.find(chunk_key);
+                        cached_chunk = cit != s.gpu_page_chunks.end() ? cit->second.get() : nullptr;
+                    }
+                    if (cached_chunk != nullptr && cached_chunk->pool_pages[entry_idx] != kGpuPageUnmapped) {
+                        cached_chunk->pool_pages[entry_idx] = kGpuPageUnmapped;
+                        --cached_chunk->mapped_count;
+                        --s.gpu_mapped_pages;
+                        if (cached_chunk->mapped_count == 0) {
+                            s.gpu_page_chunks.erase(chunk_key);
+                            cached_chunk = nullptr;
+                        }
+                    }
                     ++r.unmapped_pages;
                     continue;
                 }
                 const uint64_t pool_page = uint64_t{e.pool_page} + (e.kind == kMapConsecutive ? i : 0u);
-                if (pool_pages != 0 && pool_page >= pool_pages) {
+                if ((pool_pages != 0 && pool_page >= pool_pages) || pool_page >= kGpuPageUnmapped) {
                     ++r.outside_window;
                     continue;
                 }
-                s.gpu_pages[page_va] = pool_page;
+                if (chunk_key != cached_chunk_key || cached_chunk == nullptr) {
+                    cached_chunk_key = chunk_key;
+                    auto& slot = s.gpu_page_chunks[chunk_key];
+                    if (!slot) {
+                        slot = std::make_unique<GpuPageChunk>();
+                    }
+                    cached_chunk = slot.get();
+                }
+                if (cached_chunk->pool_pages[entry_idx] == kGpuPageUnmapped) {
+                    ++cached_chunk->mapped_count;
+                    ++s.gpu_mapped_pages;
+                }
+                cached_chunk->pool_pages[entry_idx] = static_cast<uint32_t>(pool_page);
                 ++r.mapped_pages;
             }
         }
@@ -283,8 +354,13 @@ PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> rang
 int64_t gpu_page_pool_index(uint64_t gpu_va) {
     State& s = state();
     std::shared_lock<std::shared_mutex> lock(s.mutex);
-    auto it = s.gpu_pages.find(gpu_va & ~(kWindowPageSize - 1));
-    return it == s.gpu_pages.end() ? -1 : static_cast<int64_t>(it->second);
+    const uint64_t page_va = gpu_va & ~(kWindowPageSize - 1);
+    auto cit = s.gpu_page_chunks.find(page_va >> kGpuPageChunkShift);
+    if (cit == s.gpu_page_chunks.end()) {
+        return -1;
+    }
+    const uint32_t idx = cit->second->pool_pages[static_cast<size_t>((page_va >> 16) & (kGpuPageChunkEntries - 1))];
+    return idx == kGpuPageUnmapped ? -1 : static_cast<int64_t>(idx);
 }
 
 void note_cpu_window_mapping(int64_t delta_bytes) {
@@ -311,7 +387,7 @@ Accounting accounting() {
     }
     a.alias_pairs = s.pairs.size();
     a.cpu_window_mapped = s.cpu_window_mapped > 0 ? static_cast<uint64_t>(s.cpu_window_mapped) : 0;
-    a.gpu_window_mapped = s.gpu_pages.size() * kWindowPageSize;
+    a.gpu_window_mapped = s.gpu_mapped_pages * kWindowPageSize;
     a.gpu_mapping_updates = s.gpu_mapping_updates;
     for (int k = 0; k < 4; ++k) {
         a.gpu_mapping_kind_entries[k] = s.gpu_mapping_kind_entries[k];
@@ -374,7 +450,8 @@ void reset_for_testing() {
     s.windows.clear();
     s.pairs.clear();
     s.listeners.clear();
-    s.gpu_pages.clear();
+    s.gpu_page_chunks.clear();
+    s.gpu_mapped_pages = 0;
     s.gpu_mapping_updates = 0;
     for (uint64_t& n : s.gpu_mapping_kind_entries) {
         n = 0;

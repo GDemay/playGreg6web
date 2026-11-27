@@ -13,10 +13,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <utility>
 #elif defined(__EMSCRIPTEN__)
 #include <emscripten/heap.h>
@@ -36,6 +39,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstring>
 #endif
 
 namespace playgta6::os::backing {
@@ -347,7 +351,288 @@ uint64_t tracked_view_faults() {
     return g_track_faults.load(std::memory_order_relaxed);
 }
 
+namespace {
+
+// #1077: Windows lazy commit (commit-on-first-touch via leaf-locked VEH).
+// Large MEM_COMMIT requests (>= kLazyCommitThreshold) register [lo, hi) here without calling
+// VirtualAlloc(..., MEM_COMMIT), avoiding OS PrivateUsage commit charge for untouched zero pages.
+// On first read or write fault, lazy_commit_fault commits a 64 KiB aligned granule clamped to the
+// contiguous unmaterialized sub-run and resumes execution.
+//
+// Lock order: VirtualMemoryArena::mutex_ -> g_lazy_mutex -> LazyRange::mutex (leaves: never calls
+// back into VirtualMemoryArena, never touches guest memory while holding locks, and never nests
+// with g_track_mutex / g_stamp_mutex). Thus a GuestRangeView / host_ptr_const_held reader holding
+// VirtualMemoryArena::mutex_ can safely fault into lazy_commit_fault without self-deadlock.
+constexpr uint64_t kLazyCommitThreshold = 64u << 10;  // 64 KiB
+constexpr uint64_t kLazyFaultGranule = 64u << 10;     // 64 KiB
+
+struct LazyRange {
+    uintptr_t lo = 0;
+    uintptr_t hi = 0;
+    PageProtect protect = PageProtect::NoAccess;
+    std::mutex mutex;
+    size_t total_pages = 0;
+    size_t materialized_pages = 0;
+    std::vector<uint64_t> committed_bits;  // 1 bit per 4 KiB page; cleared when fully_materialized
+    bool fully_materialized = false;
+};
+
+std::atomic<bool> g_lazy_commit{true};
+std::atomic<uint64_t> g_lazy_deferred_bytes{0};
+std::atomic<uint64_t> g_lazy_faults{0};
+std::atomic<size_t> g_lazy_range_count{0};
+std::shared_mutex g_lazy_mutex;
+std::map<uintptr_t, std::unique_ptr<LazyRange>> g_lazy_ranges;
+std::once_flag g_lazy_handler_once;
+
+inline bool lazy_bit_get(const LazyRange& r, size_t idx) {
+    return r.fully_materialized || ((r.committed_bits[idx >> 6] & (uint64_t{1} << (idx & 63u))) != 0);
+}
+
+inline void lazy_bit_set_run(LazyRange& r, size_t lo_idx, size_t hi_idx) {
+    for (size_t i = lo_idx; i < hi_idx; ++i) {
+        r.committed_bits[i >> 6] |= (uint64_t{1} << (i & 63u));
+    }
+}
+
+size_t lazy_count_unmaterialized(const LazyRange& r, size_t lo_idx, size_t hi_idx) {
+    if (r.fully_materialized || lo_idx >= hi_idx) {
+        return 0;
+    }
+    size_t unmat = 0;
+    for (size_t i = lo_idx; i < hi_idx; ++i) {
+        if ((r.committed_bits[i >> 6] & (uint64_t{1} << (i & 63u))) == 0) {
+            ++unmat;
+        }
+    }
+    return unmat;
+}
+
+std::unique_ptr<LazyRange> make_lazy_range(uintptr_t lo, uintptr_t hi, PageProtect prot) {
+    auto r = std::make_unique<LazyRange>();
+    r->lo = lo;
+    r->hi = hi;
+    r->protect = prot;
+    r->total_pages = static_cast<size_t>((hi - lo) / kPageSize);
+    r->committed_bits.assign((r->total_pages + 63u) / 64u, 0);
+    return r;
+}
+
+// Slices [sub_lo, sub_hi) out of `src` with protection `prot`. Returns nullptr if empty or if
+// every page in [sub_lo, sub_hi) is already materialized (fully materialized ranges need no entry).
+std::unique_ptr<LazyRange> slice_lazy_range(const LazyRange& src, uintptr_t sub_lo, uintptr_t sub_hi,
+                                            PageProtect prot) {
+    if (sub_lo >= sub_hi || src.fully_materialized) {
+        return nullptr;
+    }
+    const size_t src_off = static_cast<size_t>((sub_lo - src.lo) / kPageSize);
+    const size_t pages = static_cast<size_t>((sub_hi - sub_lo) / kPageSize);
+    const size_t unmat = lazy_count_unmaterialized(src, src_off, src_off + pages);
+    if (unmat == 0) {
+        return nullptr;
+    }
+    auto dst = make_lazy_range(sub_lo, sub_hi, prot);
+    dst->materialized_pages = pages - unmat;
+    if (dst->materialized_pages != 0) {
+        for (size_t i = 0; i < pages; ++i) {
+            if (lazy_bit_get(src, src_off + i)) {
+                dst->committed_bits[i >> 6] |= (uint64_t{1} << (i & 63u));
+            }
+        }
+    }
+    return dst;
+}
+
+// Commits all unmaterialized pages of `r` overlapping [req_lo, req_hi). Caller holds shared or
+// exclusive g_lazy_mutex AND r.mutex.
+bool materialize_subrange_locked(LazyRange& r, uintptr_t req_lo, uintptr_t req_hi) {
+    if (r.fully_materialized || r.protect == PageProtect::NoAccess || req_lo >= req_hi) {
+        return true;
+    }
+    const uintptr_t aligned_lo = std::max<uintptr_t>(r.lo, req_lo & ~(uintptr_t{kPageSize} - 1));
+    const uintptr_t aligned_hi =
+        std::min<uintptr_t>(r.hi, (req_hi + kPageSize - 1) & ~(uintptr_t{kPageSize} - 1));
+    if (aligned_lo >= aligned_hi) {
+        return true;
+    }
+    const size_t first = static_cast<size_t>((aligned_lo - r.lo) / kPageSize);
+    const size_t last = static_cast<size_t>((aligned_hi - r.lo) / kPageSize);
+    const DWORD prot = win_protect(r.protect);
+    for (size_t i = first; i < last;) {
+        if (lazy_bit_get(r, i)) {
+            ++i;
+            continue;
+        }
+        const size_t run_lo = i;
+        while (i < last && !lazy_bit_get(r, i)) {
+            ++i;
+        }
+        const uintptr_t run_addr = r.lo + run_lo * kPageSize;
+        const uint64_t run_bytes = static_cast<uint64_t>(i - run_lo) * kPageSize;
+        if (VirtualAlloc(reinterpret_cast<void*>(run_addr), static_cast<SIZE_T>(run_bytes), MEM_COMMIT, prot) ==
+            nullptr) {
+            return false;
+        }
+        lazy_bit_set_run(r, run_lo, i);
+        r.materialized_pages += (i - run_lo);
+        g_lazy_deferred_bytes.fetch_sub(run_bytes, std::memory_order_relaxed);
+    }
+    if (r.materialized_pages == r.total_pages) {
+        r.fully_materialized = true;
+        r.committed_bits.clear();
+        r.committed_bits.shrink_to_fit();
+    }
+    return true;
+}
+
+bool materialize_lazy_range(uintptr_t lo, uintptr_t hi) {
+    if (lo >= hi || g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        return true;
+    }
+    std::shared_lock<std::shared_mutex> lock(g_lazy_mutex);
+    auto it = g_lazy_ranges.upper_bound(lo);
+    if (it != g_lazy_ranges.begin() && std::prev(it)->second->hi > lo) {
+        --it;
+    }
+    for (; it != g_lazy_ranges.end() && it->first < hi; ++it) {
+        LazyRange& r = *it->second;
+        const uintptr_t ov_lo = std::max<uintptr_t>(lo, r.lo);
+        const uintptr_t ov_hi = std::min<uintptr_t>(hi, r.hi);
+        if (ov_lo < ov_hi) {
+            std::lock_guard<std::mutex> range_lock(r.mutex);
+            if (!materialize_subrange_locked(r, ov_lo, ov_hi)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Erases [lo, hi) from g_lazy_ranges (splitting boundary ranges as needed) and updates
+// g_lazy_deferred_bytes. Caller holds exclusive g_lazy_mutex.
+void erase_lazy_range_locked(uintptr_t lo, uintptr_t hi,
+                             std::vector<std::pair<uintptr_t, uintptr_t>>* materialized_runs) {
+    auto it = g_lazy_ranges.upper_bound(lo);
+    if (it != g_lazy_ranges.begin() && std::prev(it)->second->hi > lo) {
+        --it;
+    }
+    std::vector<std::unique_ptr<LazyRange>> keep;
+    while (it != g_lazy_ranges.end() && it->first < hi) {
+        std::unique_ptr<LazyRange> r = std::move(it->second);
+        it = g_lazy_ranges.erase(it);
+        const uintptr_t ov_lo = std::max<uintptr_t>(lo, r->lo);
+        const uintptr_t ov_hi = std::min<uintptr_t>(hi, r->hi);
+        const size_t ov_first = static_cast<size_t>((ov_lo - r->lo) / kPageSize);
+        const size_t ov_last = static_cast<size_t>((ov_hi - r->lo) / kPageSize);
+        const size_t unmat = lazy_count_unmaterialized(*r, ov_first, ov_last);
+        if (unmat != 0) {
+            g_lazy_deferred_bytes.fetch_sub(static_cast<uint64_t>(unmat) * kPageSize, std::memory_order_relaxed);
+        }
+        if (materialized_runs != nullptr && unmat < (ov_last - ov_first)) {
+            if (r->fully_materialized) {
+                materialized_runs->emplace_back(ov_lo, ov_hi);
+            } else {
+                for (size_t i = ov_first; i < ov_last;) {
+                    if (!lazy_bit_get(*r, i)) {
+                        ++i;
+                        continue;
+                    }
+                    const size_t run_lo = i;
+                    while (i < ov_last && lazy_bit_get(*r, i)) {
+                        ++i;
+                    }
+                    materialized_runs->emplace_back(r->lo + run_lo * kPageSize, r->lo + i * kPageSize);
+                }
+            }
+        }
+        if (auto pre = slice_lazy_range(*r, r->lo, ov_lo, r->protect)) {
+            keep.push_back(std::move(pre));
+        }
+        if (auto suf = slice_lazy_range(*r, ov_hi, r->hi, r->protect)) {
+            keep.push_back(std::move(suf));
+        }
+    }
+    for (auto& piece : keep) {
+        const uintptr_t key = piece->lo;
+        g_lazy_ranges.emplace(key, std::move(piece));
+    }
+    g_lazy_range_count.store(g_lazy_ranges.size(), std::memory_order_release);
+}
+
+LONG CALLBACK lazy_commit_fault(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* rec = info->ExceptionRecord;
+    if (rec->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || rec->NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const ULONG_PTR access = rec->ExceptionInformation[0];
+    if (access != 0 && access != 1) {  // read (0) or write (1) only; never DEP (8)
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const uintptr_t addr = static_cast<uintptr_t>(rec->ExceptionInformation[1]);
+    std::shared_lock<std::shared_mutex> table_lock(g_lazy_mutex);
+    auto it = g_lazy_ranges.upper_bound(addr);
+    if (it == g_lazy_ranges.begin()) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    --it;
+    LazyRange& r = *it->second;
+    if (addr < r.lo || addr >= r.hi) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // Enforce guest protection before committing: a write to ReadOnly or any access to NoAccess
+    // must remain a genuine access violation.
+    if (access == 1 ? !is_writable(r.protect) : !is_readable(r.protect)) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    std::lock_guard<std::mutex> range_lock(r.mutex);
+    const size_t page_idx = static_cast<size_t>((addr - r.lo) / kPageSize);
+    if (lazy_bit_get(r, page_idx)) {
+        // Another thread concurrently materialized this page first; retry the faulting access.
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    const uintptr_t page_addr = addr & ~(uintptr_t{kPageSize} - 1);
+    const uintptr_t gran_base = page_addr & ~(uintptr_t{kLazyFaultGranule} - 1);
+    const uintptr_t gran_lo = std::max<uintptr_t>(r.lo, gran_base);
+    const uintptr_t gran_hi = std::min<uintptr_t>(r.hi, gran_base + kLazyFaultGranule);
+    const size_t bound_lo = static_cast<size_t>((gran_lo - r.lo) / kPageSize);
+    const size_t bound_hi = static_cast<size_t>((gran_hi - r.lo) / kPageSize);
+    size_t run_lo = page_idx;
+    while (run_lo > bound_lo && !lazy_bit_get(r, run_lo - 1)) {
+        --run_lo;
+    }
+    size_t run_hi = page_idx + 1;
+    while (run_hi < bound_hi && !lazy_bit_get(r, run_hi)) {
+        ++run_hi;
+    }
+    const uintptr_t commit_lo = r.lo + run_lo * kPageSize;
+    const uint64_t commit_bytes = static_cast<uint64_t>(run_hi - run_lo) * kPageSize;
+    if (VirtualAlloc(reinterpret_cast<void*>(commit_lo), static_cast<SIZE_T>(commit_bytes), MEM_COMMIT,
+                     win_protect(r.protect)) == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    lazy_bit_set_run(r, run_lo, run_hi);
+    r.materialized_pages += (run_hi - run_lo);
+    if (r.materialized_pages == r.total_pages) {
+        r.fully_materialized = true;
+        r.committed_bits.clear();
+        r.committed_bits.shrink_to_fit();
+    }
+    g_lazy_deferred_bytes.fetch_sub(commit_bytes, std::memory_order_relaxed);
+    g_lazy_faults.fetch_add(1, std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+}  // namespace
+
 void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
+    // #1077: Kernel writes (ReadFile/fread/DStorage/Httpfs) cannot trigger user-mode VEH, so
+    // materialize any lazy-committed pages overlapping [lo, hi) before the kernel writes to them.
+    if (pin) {
+        materialize_lazy_range(lo, hi);
+    }
     std::shared_lock<std::shared_mutex> lock(g_track_mutex);
     if (g_views.empty()) {
         return;
@@ -377,9 +662,15 @@ void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
 
 namespace {
 void drop_stamps(uintptr_t lo, uintptr_t hi);  // O36 (below)
+void drop_stamps_covered(uintptr_t lo, uintptr_t hi);  // #1077 (below)
 }  // namespace
 
-void release(uint8_t* base, uint64_t /*size*/) {
+void release(uint8_t* base, uint64_t size) {
+    if (base != nullptr && size != 0 && g_lazy_range_count.load(std::memory_order_acquire) != 0) {
+        std::unique_lock<std::shared_mutex> lock(g_lazy_mutex);
+        const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+        erase_lazy_range_locked(lo, lo + static_cast<uintptr_t>(size), nullptr);
+    }
     {
         uintptr_t watched_end = 0;
         {
@@ -540,12 +831,71 @@ void unview_shared_page(uint8_t* view, uint64_t /*size*/) {
 }
 
 bool commit(uint8_t* p, uint64_t len, PageProtect protect) {
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t hi = lo + static_cast<uintptr_t>(len);
+    if (g_lazy_commit.load(std::memory_order_relaxed) && len >= kLazyCommitThreshold &&
+        protect != PageProtect::NoAccess) {
+        std::call_once(g_lazy_handler_once, [] { AddVectoredExceptionHandler(1, &lazy_commit_fault); });
+        auto r = make_lazy_range(lo, hi, protect);
+        std::unique_lock<std::shared_mutex> lock(g_lazy_mutex);
+        erase_lazy_range_locked(lo, hi, nullptr);
+        g_lazy_ranges.emplace(lo, std::move(r));
+        g_lazy_range_count.store(g_lazy_ranges.size(), std::memory_order_release);
+        g_lazy_deferred_bytes.fetch_add(len, std::memory_order_relaxed);
+        return true;
+    }
+    if (g_lazy_range_count.load(std::memory_order_acquire) != 0) {
+        std::unique_lock<std::shared_mutex> lock(g_lazy_mutex);
+        erase_lazy_range_locked(lo, hi, nullptr);
+    }
     // MEM_COMMIT of reserved (or decommitted) pages yields zero-filled pages.
     return VirtualAlloc(p, static_cast<SIZE_T>(len), MEM_COMMIT, win_protect(protect)) != nullptr;
 }
 
 bool decommit(uint8_t* p, uint64_t len) {
-    return VirtualFree(p, static_cast<SIZE_T>(len), MEM_DECOMMIT) != 0;
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t hi = lo + static_cast<uintptr_t>(len);
+    bool ok = true;
+    if (g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        ok = VirtualFree(p, static_cast<SIZE_T>(len), MEM_DECOMMIT) != 0;
+    } else {
+        std::unique_lock<std::shared_mutex> lock(g_lazy_mutex);
+        std::vector<std::pair<uintptr_t, uintptr_t>> to_free;
+        // Collect non-lazy gaps before erasing lazy ranges (which records materialized sub-runs).
+        uintptr_t cursor = lo;
+        auto it = g_lazy_ranges.upper_bound(lo);
+        if (it != g_lazy_ranges.begin() && std::prev(it)->second->hi > lo) {
+            --it;
+        }
+        for (; it != g_lazy_ranges.end() && it->first < hi; ++it) {
+            const uintptr_t ov_lo = std::max<uintptr_t>(cursor, it->second->lo);
+            const uintptr_t ov_hi = std::min<uintptr_t>(hi, it->second->hi);
+            if (cursor < ov_lo) {
+                to_free.emplace_back(cursor, ov_lo);
+            }
+            if (ov_hi > cursor) {
+                cursor = ov_hi;
+            }
+        }
+        if (cursor < hi) {
+            to_free.emplace_back(cursor, hi);
+        }
+        erase_lazy_range_locked(lo, hi, &to_free);
+        for (const auto& [run_lo, run_hi] : to_free) {
+            if (run_hi > run_lo &&
+                VirtualFree(reinterpret_cast<void*>(run_lo), static_cast<SIZE_T>(run_hi - run_lo), MEM_DECOMMIT) == 0) {
+                ok = false;
+            }
+        }
+    }
+    drop_stamps_covered(lo, hi);
+    return ok;
 }
 
 #ifndef MEM_RESET
@@ -555,28 +905,377 @@ bool decommit(uint8_t* p, uint64_t len) {
 #define MEM_RESET_UNDO 0x01000000
 #endif
 
-bool reset_pages(uint8_t* p, uint64_t len) {
+namespace {
+
+bool reset_os_run(uintptr_t lo, uintptr_t hi, bool undo) {
+    if (hi <= lo) {
+        return true;
+    }
+    void* ptr = reinterpret_cast<void*>(lo);
+    const SIZE_T bytes = static_cast<SIZE_T>(hi - lo);
+    if (VirtualAlloc(ptr, bytes, undo ? MEM_RESET_UNDO : MEM_RESET, PAGE_NOACCESS) == nullptr) {
+        return false;
+    }
+    if (!undo) {
+        // #1077: Evict reset pages from the process working set immediately (VirtualUnlock on
+        // unlocked pages trims WorkingSetSize while preserving MEM_COMMIT and MEM_RESET_UNDO).
+        (void)VirtualUnlock(ptr, bytes);
+    }
+    return true;
+}
+
+bool reset_pages_impl(uint8_t* p, uint64_t len, bool undo) {
     if (p == nullptr || len == 0) {
         return false;
     }
-    return VirtualAlloc(p, static_cast<SIZE_T>(len), MEM_RESET, PAGE_NOACCESS) != nullptr;
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t hi = lo + static_cast<uintptr_t>(len);
+    if (g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        return reset_os_run(lo, hi, undo);
+    }
+    std::unique_lock<std::shared_mutex> lock(g_lazy_mutex);
+    uintptr_t cursor = lo;
+    auto it = g_lazy_ranges.upper_bound(lo);
+    if (it != g_lazy_ranges.begin() && std::prev(it)->second->hi > lo) {
+        --it;
+    }
+    for (; it != g_lazy_ranges.end() && it->first < hi; ++it) {
+        const LazyRange& r = *it->second;
+        const uintptr_t ov_lo = std::max<uintptr_t>(cursor, r.lo);
+        const uintptr_t ov_hi = std::min<uintptr_t>(hi, r.hi);
+        if (cursor < ov_lo && !reset_os_run(cursor, ov_lo, undo)) {
+            return false;
+        }
+        if (ov_lo < ov_hi) {
+            if (r.fully_materialized) {
+                if (!reset_os_run(ov_lo, ov_hi, undo)) {
+                    return false;
+                }
+            } else {
+                const size_t first = static_cast<size_t>((ov_lo - r.lo) / kPageSize);
+                const size_t last = static_cast<size_t>((ov_hi - r.lo) / kPageSize);
+                for (size_t i = first; i < last;) {
+                    if (!lazy_bit_get(r, i)) {
+                        ++i;
+                        continue;
+                    }
+                    const size_t run_lo = i;
+                    while (i < last && lazy_bit_get(r, i)) {
+                        ++i;
+                    }
+                    if (!reset_os_run(r.lo + run_lo * kPageSize, r.lo + i * kPageSize, undo)) {
+                        return false;
+                    }
+                }
+            }
+            cursor = ov_hi;
+        }
+    }
+    return cursor < hi ? reset_os_run(cursor, hi, undo) : true;
+}
+
+}  // namespace
+
+bool reset_pages(uint8_t* p, uint64_t len) {
+    return reset_pages_impl(p, len, false);
 }
 
 bool reset_undo_pages(uint8_t* p, uint64_t len) {
-    if (p == nullptr || len == 0) {
-        return false;
-    }
-    return VirtualAlloc(p, static_cast<SIZE_T>(len), MEM_RESET_UNDO, PAGE_NOACCESS) != nullptr;
+    return reset_pages_impl(p, len, true);
 }
 
 bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
-    track_protect(p, len, win_protect(protect) == PAGE_READWRITE);
-    DWORD old = 0;
-    return VirtualProtect(p, static_cast<SIZE_T>(len), win_protect(protect), &old) != 0;
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+    const DWORD win_prot = win_protect(protect);
+    track_protect(p, len, win_prot == PAGE_READWRITE);
+    if (g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        DWORD old = 0;
+        return VirtualProtect(p, static_cast<SIZE_T>(len), win_prot, &old) != 0;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t hi = lo + static_cast<uintptr_t>(len);
+    std::unique_lock<std::shared_mutex> lock(g_lazy_mutex);
+    uintptr_t cursor = lo;
+    auto it = g_lazy_ranges.upper_bound(lo);
+    if (it != g_lazy_ranges.begin() && std::prev(it)->second->hi > lo) {
+        --it;
+    }
+    std::vector<std::unique_ptr<LazyRange>> keep;
+    bool ok = true;
+    while (it != g_lazy_ranges.end() && it->first < hi) {
+        std::unique_ptr<LazyRange> r = std::move(it->second);
+        it = g_lazy_ranges.erase(it);
+        const uintptr_t ov_lo = std::max<uintptr_t>(cursor, r->lo);
+        const uintptr_t ov_hi = std::min<uintptr_t>(hi, r->hi);
+        if (cursor < ov_lo) {
+            DWORD old = 0;
+            if (VirtualProtect(reinterpret_cast<void*>(cursor), static_cast<SIZE_T>(ov_lo - cursor), win_prot, &old) ==
+                0) {
+                ok = false;
+            }
+        }
+        if (ov_lo < ov_hi) {
+            bool range_ok = true;
+            if (r->fully_materialized) {
+                DWORD old = 0;
+                if (VirtualProtect(reinterpret_cast<void*>(ov_lo), static_cast<SIZE_T>(ov_hi - ov_lo), win_prot,
+                                   &old) == 0) {
+                    range_ok = false;
+                }
+            } else {
+                const size_t first = static_cast<size_t>((ov_lo - r->lo) / kPageSize);
+                const size_t last = static_cast<size_t>((ov_hi - r->lo) / kPageSize);
+                for (size_t i = first; i < last;) {
+                    if (!lazy_bit_get(*r, i)) {
+                        ++i;
+                        continue;
+                    }
+                    const size_t run_lo = i;
+                    while (i < last && lazy_bit_get(*r, i)) {
+                        ++i;
+                    }
+                    DWORD old = 0;
+                    if (VirtualProtect(reinterpret_cast<void*>(r->lo + run_lo * kPageSize),
+                                       static_cast<SIZE_T>((i - run_lo) * kPageSize), win_prot, &old) == 0) {
+                        range_ok = false;
+                    }
+                }
+            }
+            if (!range_ok) {
+                ok = false;
+                // Keep r->protect intact so lazy_commit_fault never disagrees with OS protection.
+                keep.push_back(std::move(r));
+            } else {
+                if (auto pre = slice_lazy_range(*r, r->lo, ov_lo, r->protect)) {
+                    keep.push_back(std::move(pre));
+                }
+                if (auto mid = slice_lazy_range(*r, ov_lo, ov_hi, protect)) {
+                    keep.push_back(std::move(mid));
+                }
+                if (auto suf = slice_lazy_range(*r, ov_hi, r->hi, r->protect)) {
+                    keep.push_back(std::move(suf));
+                }
+            }
+            cursor = ov_hi;
+        } else {
+            // No overlap (should not happen given loop condition); preserve whole range.
+            keep.push_back(std::move(r));
+        }
+    }
+    for (auto& piece : keep) {
+        const uintptr_t key = piece->lo;
+        g_lazy_ranges.emplace(key, std::move(piece));
+    }
+    g_lazy_range_count.store(g_lazy_ranges.size(), std::memory_order_release);
+    if (cursor < hi) {
+        DWORD old = 0;
+        if (VirtualProtect(reinterpret_cast<void*>(cursor), static_cast<SIZE_T>(hi - cursor), win_prot, &old) == 0) {
+            ok = false;
+        }
+    }
+    return ok;
 }
 
 bool enforces_protection() {
     return true;
+}
+
+void set_lazy_commit(bool on) {
+    g_lazy_commit.store(on, std::memory_order_relaxed);
+}
+
+bool lazy_commit_enabled() {
+    return g_lazy_commit.load(std::memory_order_relaxed);
+}
+
+uint64_t lazy_deferred_bytes() {
+    return g_lazy_deferred_bytes.load(std::memory_order_relaxed);
+}
+
+uint64_t lazy_deferred_bytes_in_range(const uint8_t* base, uint64_t size) {
+    if (base == nullptr || size == 0 || g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t hi = lo + static_cast<uintptr_t>(size);
+    uint64_t deferred = 0;
+    std::shared_lock<std::shared_mutex> lock(g_lazy_mutex);
+    auto it = g_lazy_ranges.upper_bound(lo);
+    if (it != g_lazy_ranges.begin() && std::prev(it)->second->hi > lo) {
+        --it;
+    }
+    for (; it != g_lazy_ranges.end() && it->first < hi; ++it) {
+        LazyRange& r = *it->second;
+        std::lock_guard<std::mutex> range_lock(r.mutex);
+        if (r.fully_materialized) {
+            continue;
+        }
+        const uintptr_t ov_lo = std::max<uintptr_t>(lo, r.lo);
+        const uintptr_t ov_hi = std::min<uintptr_t>(hi, r.hi);
+        if (ov_lo < ov_hi) {
+            if (ov_lo == r.lo && ov_hi == r.hi) {
+                deferred += static_cast<uint64_t>(r.total_pages - r.materialized_pages) * kPageSize;
+            } else {
+                const size_t first = static_cast<size_t>((ov_lo - r.lo) / kPageSize);
+                const size_t last = static_cast<size_t>((ov_hi - r.lo) / kPageSize);
+                deferred += static_cast<uint64_t>(lazy_count_unmaterialized(r, first, last)) * kPageSize;
+            }
+        }
+    }
+    return deferred;
+}
+
+uint64_t lazy_commit_faults() {
+    return g_lazy_faults.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+struct BackingSegment {
+    uintptr_t addr = 0;
+    size_t len = 0;
+    bool materialized = true;
+};
+
+template <typename Lock>
+bool try_lock_bounded_lazy(Lock& lock) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    do {
+        if (lock.try_lock()) {
+            return true;
+        }
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
+
+// Snapshots [lo, hi) into materialized vs unmaterialized segments while holding g_lazy_mutex
+// (shared) and per-range mutexes, then releases all locks BEFORE any guest/caller memory touch
+// (prevents VEH re-entrancy / SRWLOCK deadlock if dst or src faults into lazy_commit_fault or
+// track_fault).
+bool collect_backing_segments(uintptr_t lo, uintptr_t hi, bool try_lock_only,
+                              std::vector<BackingSegment>* segs) {
+    std::shared_lock<std::shared_mutex> lock(g_lazy_mutex, std::defer_lock);
+    if (try_lock_only) {
+        if (!try_lock_bounded_lazy(lock)) {
+            return false;
+        }
+    } else {
+        lock.lock();
+    }
+    uintptr_t cursor = lo;
+    auto it = g_lazy_ranges.upper_bound(lo);
+    if (it != g_lazy_ranges.begin() && std::prev(it)->second->hi > lo) {
+        --it;
+    }
+    for (; it != g_lazy_ranges.end() && it->first < hi; ++it) {
+        LazyRange& r = *it->second;
+        const uintptr_t ov_lo = std::max<uintptr_t>(cursor, r.lo);
+        const uintptr_t ov_hi = std::min<uintptr_t>(hi, r.hi);
+        if (cursor < ov_lo) {
+            segs->push_back({cursor, static_cast<size_t>(ov_lo - cursor), true});
+        }
+        if (ov_lo < ov_hi) {
+            std::unique_lock<std::mutex> range_lock(r.mutex, std::defer_lock);
+            if (try_lock_only) {
+                if (!try_lock_bounded_lazy(range_lock)) {
+                    return false;
+                }
+            } else {
+                range_lock.lock();
+            }
+            if (r.fully_materialized) {
+                segs->push_back({ov_lo, static_cast<size_t>(ov_hi - ov_lo), true});
+            } else {
+                uintptr_t p = ov_lo;
+                const size_t end_idx = static_cast<size_t>((ov_hi - 1 - r.lo) / kPageSize) + 1;
+                while (p < ov_hi) {
+                    const size_t idx = static_cast<size_t>((p - r.lo) / kPageSize);
+                    const bool mat = lazy_bit_get(r, idx);
+                    size_t next_idx = idx + 1;
+                    while (next_idx < end_idx && lazy_bit_get(r, next_idx) == mat) {
+                        ++next_idx;
+                    }
+                    const uintptr_t run_end = std::min<uintptr_t>(ov_hi, r.lo + next_idx * kPageSize);
+                    segs->push_back({p, static_cast<size_t>(run_end - p), mat});
+                    p = run_end;
+                }
+            }
+            cursor = ov_hi;
+        }
+    }
+    if (cursor < hi) {
+        segs->push_back({cursor, static_cast<size_t>(hi - cursor), true});
+    }
+    return true;
+}
+
+}  // namespace
+
+bool read_backing(const uint8_t* src, void* dst, size_t len, bool try_lock_only) {
+    if (len == 0) {
+        return true;
+    }
+    if (g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        std::memcpy(dst, src, len);
+        return true;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(src);
+    const uintptr_t hi = lo + len;
+    std::vector<BackingSegment> segs;
+    if (!collect_backing_segments(lo, hi, try_lock_only, &segs)) {
+        return false;
+    }
+    // All lazy locks are released before touching guest or caller memory.
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    for (const BackingSegment& s : segs) {
+        uint8_t* dst_seg = out + (s.addr - lo);
+        if (s.materialized) {
+            std::memcpy(dst_seg, reinterpret_cast<const void*>(s.addr), s.len);
+        } else {
+            std::memset(dst_seg, 0, s.len);
+        }
+    }
+    return true;
+}
+
+bool materialize_for_write(uint8_t* dst, size_t len) {
+    if (len == 0) {
+        return true;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(dst);
+    return materialize_lazy_range(lo, lo + len);
+}
+
+void zero_backing(uint8_t* dst, size_t len) {
+    if (len == 0) {
+        return;
+    }
+    if (g_lazy_range_count.load(std::memory_order_acquire) == 0) {
+        std::memset(dst, 0, len);
+        return;
+    }
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(dst);
+    const uintptr_t hi = lo + len;
+    std::vector<BackingSegment> segs;
+    (void)collect_backing_segments(lo, hi, false, &segs);
+    // All lazy locks are released before touching guest memory (safe if dst hits an armed shared view).
+    for (const BackingSegment& s : segs) {
+        if (s.materialized) {
+            std::memset(reinterpret_cast<void*>(s.addr), 0, s.len);
+        }
+    }
+}
+
+uint64_t shared_view_size(const uint8_t* at) {
+    if (at == nullptr) {
+        return 0;
+    }
+    std::shared_lock<std::shared_mutex> lock(g_track_mutex);
+    auto it = g_views.find(reinterpret_cast<uintptr_t>(at));
+    return it != g_views.end() ? it->second.size : 0;
 }
 
 void set_write_watch(bool on) {
@@ -606,6 +1305,23 @@ void drop_stamps(uintptr_t lo, uintptr_t hi) {
     std::lock_guard<std::mutex> lock(g_stamp_mutex);
     g_stamp_chunks.erase(g_stamp_chunks.lower_bound(lo >> kStampChunkShift),
                          g_stamp_chunks.lower_bound(((hi - 1) >> kStampChunkShift) + 1));
+}
+
+// #1077: Reclaim StampChunks wholly covered by a decommitted range (leaving partially covered
+// chunks intact so live sibling buffers sharing a 2 MiB chunk never lose their write stamps).
+void drop_stamps_covered(uintptr_t lo, uintptr_t hi) {
+    constexpr uintptr_t kChunkSize = uintptr_t{1} << kStampChunkShift;
+    const uintptr_t aligned_lo = (lo + kChunkSize - 1) & ~(kChunkSize - 1);
+    const uintptr_t aligned_hi = hi & ~(kChunkSize - 1);
+    if (aligned_lo >= aligned_hi) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_stamp_mutex);
+    if (g_stamp_chunks.empty()) {
+        return;
+    }
+    g_stamp_chunks.erase(g_stamp_chunks.lower_bound(aligned_lo >> kStampChunkShift),
+                         g_stamp_chunks.lower_bound(aligned_hi >> kStampChunkShift));
 }
 
 bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, uint64_t* epoch, bool peek,
@@ -1110,6 +1826,19 @@ bool enforces_protection() {
     return false;
 }
 
+void set_lazy_commit(bool) {}
+bool lazy_commit_enabled() { return false; }
+uint64_t lazy_deferred_bytes() { return 0; }
+uint64_t lazy_deferred_bytes_in_range(const uint8_t*, uint64_t) { return 0; }
+uint64_t lazy_commit_faults() { return 0; }
+bool read_backing(const uint8_t* src, void* dst, size_t len, bool) {
+    std::memcpy(dst, src, len);
+    return true;
+}
+bool materialize_for_write(uint8_t*, size_t) { return true; }
+void zero_backing(uint8_t* dst, size_t len) { std::memset(dst, 0, len); }
+uint64_t shared_view_size(const uint8_t*) { return 0; }
+
 void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>*) {}
 void precollect_end() {}
 
@@ -1225,6 +1954,19 @@ bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
 bool enforces_protection() {
     return true;
 }
+
+void set_lazy_commit(bool) {}
+bool lazy_commit_enabled() { return false; }
+uint64_t lazy_deferred_bytes() { return 0; }
+uint64_t lazy_deferred_bytes_in_range(const uint8_t*, uint64_t) { return 0; }
+uint64_t lazy_commit_faults() { return 0; }
+bool read_backing(const uint8_t* src, void* dst, size_t len, bool) {
+    std::memcpy(dst, src, len);
+    return true;
+}
+bool materialize_for_write(uint8_t*, size_t) { return true; }
+void zero_backing(uint8_t* dst, size_t len) { std::memset(dst, 0, len); }
+uint64_t shared_view_size(const uint8_t*) { return 0; }
 
 void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>*) {}
 void precollect_end() {}
