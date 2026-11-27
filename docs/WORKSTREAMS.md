@@ -324,6 +324,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 - [ ] **Web performance #2081 — Nonchunked shared texture sources** — `IN PROGRESS` (#2081, @GDemay). Native WebGPU shared-source writes avoid application snapshots when supported; cached legacy fallback and huge-upload chunking preserved. No game FPS claim.
 
+- [ ] **Performance #2185 — Dense expression visitation in live-local analysis** — `IN PROGRESS` (@GDemay; no game assets). Bitmap-only bookkeeping in `collect_live_locals`, preserving transformation/output semantics; matched public-optimizer evidence and sparse/dead/no-local controls pending. Coordinated distinct function scope on #2178.
+
 ## Track 5: Browser Shell, Streaming I/O & Audio (`web/`, `server/`, `tools/`, JS + Python + Rust)
 **Goal:** Fast, resilient browser loading, streaming, caching, and audio playback.
 
