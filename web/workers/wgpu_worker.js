@@ -2594,9 +2594,9 @@ const DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES = 2;
 // dependency order on the recovered device.
 const REPLAY_SHADOW_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
 const REPLAY_SHADOW_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
-const REPLAY_LOG_MAX_ENTRIES = 65536;
-const REPLAY_LOG_MAX_BYTES = 128 * 1024 * 1024;
-const REPLAY_LOG_MAX_BIND_GROUPS = 16384;
+const REPLAY_LOG_MAX_ENTRIES = 262144;
+const REPLAY_LOG_MAX_BYTES = 256 * 1024 * 1024;
+const REPLAY_LOG_MAX_BIND_GROUPS = 65536;
 const REPLAY_ASYNC_CHUNK_SIZE = 24;
 const REPLAY_PHASE_COUNT = 5;
 
@@ -3489,6 +3489,10 @@ class WgpuCommandProcessor {
         ? options.enableShadowBufferReplay !== false
         : true;
     this._replayingResources = false;
+    this._replayAsyncActive = false;
+    this._replayAsyncDeltaKeys = new Set();
+    this._replayAsyncDestroyedIds = new Set();
+    this._replayAsyncShadowIds = new Set();
     this._replayLog = new Map(); // '<kind>:<id>' -> { kind, id, opcode, phase, payload: Uint8Array }
     this._replayLogBytes = 0;
     this._replayLogMaxEntries = resolvePositiveIntOption(
@@ -3500,9 +3504,11 @@ class WgpuCommandProcessor {
       options.replayMaxBindGroups,
       REPLAY_LOG_MAX_BIND_GROUPS
     );
-    this._replayBindGroupKeys = new Set(); // insertion-ordered 'bindGroup:<id>' keys for LRU cap
+    this._replayBindGroupKeys = new Map(); // bindGroupId -> 'bindGroup:<id>' in LRU order (oldest first)
     this._replayLogOverflowCount = 0;
     this._replayBindGroupEvictions = 0;
+    this._replayEvictionWarnNext = 1;
+    this._replayOverflowWarnNext = 1;
     this._shadowBuffers = new Map(); // bufferId -> { data: Uint8Array, dirtyEnd } (LRU order)
     this._shadowBufferBytes = 0;
     this._shadowBufferMaxBytes = resolvePositiveIntOption(
@@ -7862,6 +7868,9 @@ class WgpuCommandProcessor {
       droppedWhileRecovering: this._droppedWhileRecoveringCount,
       replayedResourceCount: this._replayedResourceCount,
       replayedBufferWriteCount: this._replayedBufferWriteCount,
+      replayLogEntries: this._replayLog.size,
+      replayBindGroupEvictions: this._replayBindGroupEvictions,
+      replayLogOverflowCount: this._replayLogOverflowCount,
     };
   }
 
@@ -7916,6 +7925,9 @@ class WgpuCommandProcessor {
       this._replayLog.clear();
       this._replayBindGroupKeys.clear();
       this._replayLogBytes = 0;
+      this._replayAsyncDeltaKeys.clear();
+      this._replayAsyncDestroyedIds.clear();
+      this._replayAsyncShadowIds.clear();
       this._shadowBuffers.clear();
       this._shadowBufferBytes = 0;
     }
@@ -7948,6 +7960,45 @@ class WgpuCommandProcessor {
     return this._shadowBufferReplayEnabled;
   }
 
+  _touchReplayBindGroup(id) {
+    if (!this._resourceReplayEnabled || this._replayBindGroupKeys.size === 0) {
+      return;
+    }
+    const key = this._replayBindGroupKeys.get(id);
+    if (key !== undefined) {
+      this._replayBindGroupKeys.delete(id);
+      this._replayBindGroupKeys.set(id, key);
+    }
+  }
+
+  _evictOldestReplayBindGroup() {
+    const first = this._replayBindGroupKeys.entries().next();
+    if (first.done) {
+      return false;
+    }
+    const [oldestId, oldestKey] = first.value;
+    this._replayBindGroupKeys.delete(oldestId);
+    const evicted = this._replayLog.get(oldestKey);
+    if (evicted) {
+      this._replayLog.delete(oldestKey);
+      this._replayLogBytes = Math.max(0, this._replayLogBytes - evicted.payload.byteLength);
+      this._replayBindGroupEvictions += 1;
+      if (this._replayAsyncActive && !this._replayingResources) {
+        this._replayAsyncDeltaKeys.delete(oldestKey);
+      }
+      if (this._replayBindGroupEvictions >= this._replayEvictionWarnNext) {
+        this._replayEvictionWarnNext =
+          this._replayEvictionWarnNext === 1 ? 64 : this._replayEvictionWarnNext * 8;
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] replay log evicted oldest bindGroup (evictions=${this._replayBindGroupEvictions}, liveBindGroups=${this._replayBindGroupKeys.size}/${this._replayLogMaxBindGroups}, replayEntries=${this._replayLog.size}/${this._replayLogMaxEntries})`
+        );
+      }
+      return true;
+    }
+    return false;
+  }
+
   /**
    * W104: record one packet into the live-resource replay log. Creation packets are copied
    * (latest creation of an id wins), DestroyResource forgets every record of the id, and
@@ -7978,9 +8029,9 @@ class WgpuCommandProcessor {
     const previous = this._replayLog.get(key);
     if (previous) {
       this._replayLog.delete(key);
-      this._replayLogBytes -= previous.payload.byteLength;
+      this._replayLogBytes = Math.max(0, this._replayLogBytes - previous.payload.byteLength);
       if (kind === 'bindGroup') {
-        this._replayBindGroupKeys.delete(key);
+        this._replayBindGroupKeys.delete(id);
       }
     }
     if (kind === 'buffer') {
@@ -7989,13 +8040,19 @@ class WgpuCommandProcessor {
     }
     if (kind === 'bindGroup') {
       while (this._replayBindGroupKeys.size >= this._replayLogMaxBindGroups) {
-        const oldestKey = this._replayBindGroupKeys.values().next().value;
-        this._replayBindGroupKeys.delete(oldestKey);
-        const evicted = this._replayLog.get(oldestKey);
-        if (evicted) {
-          this._replayLog.delete(oldestKey);
-          this._replayLogBytes -= evicted.payload.byteLength;
-          this._replayBindGroupEvictions += 1;
+        if (!this._evictOldestReplayBindGroup()) {
+          break;
+        }
+      }
+    }
+    if (payloadBytes <= this._replayLogMaxBytes) {
+      while (
+        this._replayBindGroupKeys.size > 0 &&
+        (this._replayLog.size >= this._replayLogMaxEntries ||
+          this._replayLogBytes + payloadBytes > this._replayLogMaxBytes)
+      ) {
+        if (!this._evictOldestReplayBindGroup()) {
+          break;
         }
       }
     }
@@ -8004,13 +8061,25 @@ class WgpuCommandProcessor {
       this._replayLogBytes + payloadBytes > this._replayLogMaxBytes
     ) {
       this._replayLogOverflowCount += 1;
+      if (this._replayLogOverflowCount >= this._replayOverflowWarnNext) {
+        this._replayOverflowWarnNext =
+          this._replayOverflowWarnNext === 1 ? 64 : this._replayOverflowWarnNext * 8;
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] replay log overflow dropped ${kind}:${id} (overflows=${this._replayLogOverflowCount}, entries=${this._replayLog.size}/${this._replayLogMaxEntries}, bytes=${this._replayLogBytes}/${this._replayLogMaxBytes})`
+        );
+      }
       return;
     }
     const payload = new Uint8Array(view.buffer, view.byteOffset + payloadOffset, payloadBytes).slice();
     this._replayLog.set(key, { kind, id, opcode, phase, payload });
     this._replayLogBytes += payloadBytes;
     if (kind === 'bindGroup') {
-      this._replayBindGroupKeys.add(key);
+      this._replayBindGroupKeys.set(id, key);
+    }
+    if (this._replayAsyncActive && !this._replayingResources) {
+      this._replayAsyncDeltaKeys.add(key);
+      this._replayAsyncDestroyedIds.delete(id);
     }
   }
 
@@ -8042,13 +8111,18 @@ class WgpuCommandProcessor {
       const entry = this._replayLog.get(key);
       if (entry) {
         this._replayLog.delete(key);
-        this._replayLogBytes -= entry.payload.byteLength;
-        if (entry.kind === 'bindGroup') {
-          this._replayBindGroupKeys.delete(key);
-        }
+        this._replayLogBytes = Math.max(0, this._replayLogBytes - entry.payload.byteLength);
+      }
+      if (this._replayAsyncActive && !this._replayingResources) {
+        this._replayAsyncDeltaKeys.delete(key);
       }
     }
+    this._replayBindGroupKeys.delete(id);
     this._dropShadowBuffer(id);
+    if (this._replayAsyncActive && !this._replayingResources) {
+      this._replayAsyncDestroyedIds.add(id);
+      this._replayAsyncShadowIds.delete(id);
+    }
   }
 
   _dropShadowBuffer(id) {
@@ -8109,6 +8183,9 @@ class WgpuCommandProcessor {
       dstOffset
     );
     shadow.dirtyEnd = Math.max(shadow.dirtyEnd, dstOffset + copyLen);
+    if (this._replayAsyncActive && !this._replayingResources) {
+      this._replayAsyncShadowIds.add(id);
+    }
 
     while (this._shadowBufferBytes > this._shadowBufferTotalMaxBytes && this._shadowBuffers.size > 1) {
       const oldestId = this._shadowBuffers.keys().next().value;
@@ -8208,15 +8285,70 @@ class WgpuCommandProcessor {
     return summary;
   }
 
+  _collectOrderedReplayEntriesForKeys(keys) {
+    const phases = [];
+    for (let p = 0; p < REPLAY_PHASE_COUNT; p += 1) {
+      phases.push([]);
+    }
+    for (const key of keys) {
+      const entry = this._replayLog.get(key);
+      if (entry) {
+        phases[entry.phase - 1].push(entry);
+      }
+    }
+    const ordered = [];
+    for (let p = 0; p < phases.length; p += 1) {
+      for (const entry of phases[p]) {
+        ordered.push(entry);
+      }
+    }
+    return ordered;
+  }
+
+  _hasAnyLiveReplayEntryForId(id) {
+    for (let i = 0; i < REPLAY_RESOURCE_KINDS.length; i += 1) {
+      if (this._replayLog.has(`${REPLAY_RESOURCE_KINDS[i]}:${id}`)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  _runSyncReplayChunk(fn) {
+    const prevPendingHints = this._pendingCommandStreamShaderProfiles;
+    const prevPendingView = this._pendingCommandStreamView;
+    const prevPendingScanned = this._pendingCommandStreamScanned;
+    const prevPassCommands = this._passCommands;
+    this._replayingResources = true;
+    try {
+      this._pendingCommandStreamShaderProfiles = null;
+      this._pendingCommandStreamView = null;
+      this._pendingCommandStreamScanned = true;
+      this._passCommands = [];
+      fn();
+    } finally {
+      this._passCommands = prevPassCommands;
+      this._pendingCommandStreamShaderProfiles = prevPendingHints;
+      this._pendingCommandStreamView = prevPendingView;
+      this._pendingCommandStreamScanned = prevPendingScanned;
+      this._replayingResources = false;
+    }
+  }
+
   /**
    * W105: chunked async resource replay for live device recovery. Yields between small batches
    * so Chrome's GPU IPC drains cleanly without stalling the worker or re-triggering TDR.
+   *
+   * Only holds `_replayingResources = true` during each synchronous chunk (never across `await`)
+   * so incoming guest Create/Destroy/WriteBuffer packets that arrive during async yields are
+   * still recorded into `_replayLog` and replayed in dependency order before recovery finishes.
    */
   async replayRecordedResourcesAsync(opts = {}) {
     const summary = { replayedResources: 0, failedResources: 0, replayedBufferWrites: 0, aborted: false };
     if (
       this._destroyed ||
       this._replayingResources ||
+      this._replayAsyncActive ||
       !this.device ||
       (this._replayLog.size === 0 && this._shadowBuffers.size === 0)
     ) {
@@ -8230,47 +8362,142 @@ class WgpuCommandProcessor {
     const logMiB = (this._replayLogBytes / (1024 * 1024)).toFixed(1);
     this._logDiagnostic(
       'info',
-      `[wgpu_worker] starting GPU resource replay (${ordered.length} entries, ${logMiB} MiB, ${this._shadowBuffers.size} shadow buffers)`
+      `[wgpu_worker] starting GPU resource replay (${ordered.length} entries, ${logMiB} MiB, ${this._shadowBuffers.size} shadow buffers` +
+        (this._replayBindGroupEvictions > 0 ? `, bindGroupEvictions=${this._replayBindGroupEvictions}` : '') +
+        (this._replayLogOverflowCount > 0 ? `, overflows=${this._replayLogOverflowCount}` : '') +
+        ')'
     );
 
-    const prevPendingHints = this._pendingCommandStreamShaderProfiles;
-    const prevPendingView = this._pendingCommandStreamView;
-    const prevPendingScanned = this._pendingCommandStreamScanned;
-    const prevPassCommands = this._passCommands;
-    this._replayingResources = true;
+    this._replayAsyncActive = true;
+    this._replayAsyncDeltaKeys.clear();
+    this._replayAsyncDestroyedIds.clear();
+    this._replayAsyncShadowIds.clear();
+    let shadowWritesDone = false;
     try {
-      this._pendingCommandStreamShaderProfiles = null;
-      this._pendingCommandStreamView = null;
-      this._pendingCommandStreamScanned = true;
-      this._passCommands = [];
-      let shadowWritesDone = false;
-      for (let i = 0; i < ordered.length; i += 1) {
+      for (let chunkStart = 0; chunkStart < ordered.length; chunkStart += chunkSize) {
         if (this._destroyed || !this.device || this._deviceGeneration !== startGen) {
           summary.aborted = true;
           break;
         }
-        const entry = ordered[i];
-        if (!shadowWritesDone && entry.phase > 1) {
-          summary.replayedBufferWrites += this._replayShadowBufferWrites();
-          shadowWritesDone = true;
+        const chunkEnd = Math.min(ordered.length, chunkStart + chunkSize);
+        this._runSyncReplayChunk(() => {
+          for (let i = chunkStart; i < chunkEnd; i += 1) {
+            if (this._destroyed || !this.device || this._deviceGeneration !== startGen) {
+              summary.aborted = true;
+              break;
+            }
+            const entry = ordered[i];
+            if (this._replayLog.get(`${entry.kind}:${entry.id}`) !== entry) {
+              continue;
+            }
+            if (!shadowWritesDone && entry.phase > 1) {
+              summary.replayedBufferWrites += this._replayShadowBufferWrites();
+              shadowWritesDone = true;
+            }
+            if (this._replayOneEntry(entry)) {
+              summary.replayedResources += 1;
+            } else {
+              summary.failedResources += 1;
+            }
+          }
+        });
+        if (summary.aborted) {
+          break;
         }
-        if (this._replayOneEntry(entry)) {
-          summary.replayedResources += 1;
-        } else {
-          summary.failedResources += 1;
-        }
-        if ((i + 1) % chunkSize === 0 && i + 1 < ordered.length) {
+        if (chunkEnd < ordered.length) {
           await new Promise((resolve) => setTimeout(resolve, 0));
         }
       }
       if (!shadowWritesDone && !summary.aborted) {
-        summary.replayedBufferWrites += this._replayShadowBufferWrites();
+        this._runSyncReplayChunk(() => {
+          summary.replayedBufferWrites += this._replayShadowBufferWrites();
+        });
+        shadowWritesDone = true;
+      }
+
+      // Catch up any resource creations, destroys, or shadow writes that arrived from the guest
+      // while the async replay chunks above yielded. The final catch-up pass runs synchronously
+      // with zero trailing `await` so no macrotask can slip between catch-up and `endDeviceRecovery`.
+      const maxCatchUpPasses = 8;
+      for (let pass = 0; pass < maxCatchUpPasses && !summary.aborted; pass += 1) {
+        if (this._destroyed || !this.device || this._deviceGeneration !== startGen) {
+          summary.aborted = true;
+          break;
+        }
+        if (
+          this._replayAsyncDestroyedIds.size === 0 &&
+          this._replayAsyncDeltaKeys.size === 0 &&
+          this._replayAsyncShadowIds.size === 0
+        ) {
+          break;
+        }
+        const destroyedIds = Array.from(this._replayAsyncDestroyedIds);
+        const deltaKeys = Array.from(this._replayAsyncDeltaKeys);
+        const shadowIds =
+          this._replayAsyncShadowIds.size > 0 ? new Set(this._replayAsyncShadowIds) : null;
+        this._replayAsyncDestroyedIds.clear();
+        this._replayAsyncDeltaKeys.clear();
+        this._replayAsyncShadowIds.clear();
+
+        if (destroyedIds.length > 0) {
+          this._runSyncReplayChunk(() => {
+            for (let i = 0; i < destroyedIds.length; i += 1) {
+              const id = destroyedIds[i];
+              if (!this._hasAnyLiveReplayEntryForId(id)) {
+                this._handleDestroyResource(id);
+              }
+            }
+          });
+        }
+
+        const deltaOrdered = this._collectOrderedReplayEntriesForKeys(deltaKeys);
+        const allowYield = pass < maxCatchUpPasses - 1 && deltaOrdered.length > chunkSize;
+        let deltaShadowDone = !shadowIds || shadowIds.size === 0;
+        for (let start = 0; start < deltaOrdered.length; start += allowYield ? chunkSize : deltaOrdered.length) {
+          if (this._destroyed || !this.device || this._deviceGeneration !== startGen) {
+            summary.aborted = true;
+            break;
+          }
+          const end = allowYield ? Math.min(deltaOrdered.length, start + chunkSize) : deltaOrdered.length;
+          this._runSyncReplayChunk(() => {
+            for (let i = start; i < end; i += 1) {
+              if (this._destroyed || !this.device || this._deviceGeneration !== startGen) {
+                summary.aborted = true;
+                break;
+              }
+              const entry = deltaOrdered[i];
+              if (this._replayLog.get(`${entry.kind}:${entry.id}`) !== entry) {
+                continue;
+              }
+              if (!deltaShadowDone && entry.phase > 1) {
+                summary.replayedBufferWrites += this._replayShadowBufferWrites(shadowIds);
+                deltaShadowDone = true;
+              }
+              if (this._replayOneEntry(entry)) {
+                summary.replayedResources += 1;
+              } else {
+                summary.failedResources += 1;
+              }
+            }
+          });
+          if (summary.aborted) {
+            break;
+          }
+          if (allowYield && end < deltaOrdered.length) {
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+        }
+        if (!deltaShadowDone && !summary.aborted) {
+          this._runSyncReplayChunk(() => {
+            summary.replayedBufferWrites += this._replayShadowBufferWrites(shadowIds);
+          });
+        }
       }
     } finally {
-      this._passCommands = prevPassCommands;
-      this._pendingCommandStreamShaderProfiles = prevPendingHints;
-      this._pendingCommandStreamView = prevPendingView;
-      this._pendingCommandStreamScanned = prevPendingScanned;
+      this._replayAsyncActive = false;
+      this._replayAsyncDeltaKeys.clear();
+      this._replayAsyncDestroyedIds.clear();
+      this._replayAsyncShadowIds.clear();
       this._replayingResources = false;
     }
 
@@ -8283,6 +8510,8 @@ class WgpuCommandProcessor {
       'info',
       `[wgpu_worker] replayed ${summary.replayedResources} GPU resources and ${summary.replayedBufferWrites} buffer writes in ${elapsedMs}ms after device recovery` +
         (summary.failedResources > 0 ? ` (${summary.failedResources} failed)` : '') +
+        (this._replayBindGroupEvictions > 0 ? ` (bindGroupEvictions=${this._replayBindGroupEvictions})` : '') +
+        (this._replayLogOverflowCount > 0 ? ` (overflows=${this._replayLogOverflowCount})` : '') +
         (summary.aborted ? ' (aborted)' : '')
     );
     return summary;
@@ -8306,12 +8535,29 @@ class WgpuCommandProcessor {
     return this._validationErrorCount === errorsBefore;
   }
 
-  _replayShadowBufferWrites() {
+  _replayShadowBufferWrites(onlyIds = null) {
     const queue = this.device && this.device.queue;
     if (!queue || typeof queue.writeBuffer !== 'function') {
       return 0;
     }
     let written = 0;
+    if (onlyIds) {
+      for (const id of onlyIds) {
+        const shadow = this._shadowBuffers.get(id);
+        const buffer = this.buffers.get(id);
+        const writeLen = shadow ? this._shadowWriteLength(shadow) : 0;
+        if (!buffer || writeLen <= 0) {
+          continue;
+        }
+        try {
+          queue.writeBuffer(buffer, 0, shadow.data, 0, writeLen);
+          written += 1;
+        } catch (_) {
+          // A stale shadow never aborts the remaining replay.
+        }
+      }
+      return written;
+    }
     for (const [id, shadow] of this._shadowBuffers) {
       const buffer = this.buffers.get(id);
       const writeLen = this._shadowWriteLength(shadow);
@@ -14518,6 +14764,7 @@ class WgpuCommandProcessor {
         if (payloadBytes >= 8) {
           const groupIndex = view.getUint32(payloadOffset, true);
           const bindGroupId = view.getUint32(payloadOffset + 4, true);
+          this._touchReplayBindGroup(bindGroupId);
           const cmd = this._acquirePassCommand('setBindGroup');
           cmd.groupIndex = groupIndex;
           cmd.bindGroupId = bindGroupId;
@@ -15011,6 +15258,9 @@ class WgpuCommandProcessor {
       fallbackProfileScanCount: this._fallbackProfileScanCount,
       resourceReplayEnabled: this._resourceReplayEnabled,
       shadowBufferReplayEnabled: this._shadowBufferReplayEnabled,
+      replayLogEntries: this._replayLog.size,
+      replayBindGroupEvictions: this._replayBindGroupEvictions,
+      replayLogOverflowCount: this._replayLogOverflowCount,
     };
   }
 
@@ -15053,6 +15303,10 @@ class WgpuCommandProcessor {
     this._replayLog.clear();
     this._replayBindGroupKeys.clear();
     this._replayLogBytes = 0;
+    this._replayAsyncActive = false;
+    this._replayAsyncDeltaKeys.clear();
+    this._replayAsyncDestroyedIds.clear();
+    this._replayAsyncShadowIds.clear();
     this._shadowBuffers.clear();
     this._shadowBufferBytes = 0;
 
@@ -16575,6 +16829,10 @@ function resolveDeviceLossTelemetry(processor, stats) {
   if (src.replayedResourceCount !== undefined || src.replayedBufferWriteCount !== undefined) {
     deviceStats.replayedResourceCount = toNonNegativeInt(src.replayedResourceCount, 0);
     deviceStats.replayedBufferWriteCount = toNonNegativeInt(src.replayedBufferWriteCount, 0);
+  }
+  if (src.replayBindGroupEvictions !== undefined || src.replayLogOverflowCount !== undefined) {
+    deviceStats.replayBindGroupEvictions = toNonNegativeInt(src.replayBindGroupEvictions, 0);
+    deviceStats.replayLogOverflowCount = toNonNegativeInt(src.replayLogOverflowCount, 0);
   }
   return deviceStats;
 }
@@ -18782,6 +19040,8 @@ const exportedApi = {
   sanitizeMissingShaderSummary,
   DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
   DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
+  REPLAY_LOG_MAX_ENTRIES,
+  REPLAY_LOG_MAX_BYTES,
   REPLAY_LOG_MAX_BIND_GROUPS,
   SWAPCHAIN_PROBE_DEFAULT_TIMEOUT_MS,
   DEFAULT_GPU_STALL_WARN_MS,

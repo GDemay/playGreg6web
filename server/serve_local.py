@@ -75,7 +75,7 @@ PREFERRED_SHADER_PACK_NAMES = ("splash.wgsl.pack", "fallback.wgsl.pack")
 SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
 
 DUMP_URL_PREFIX = "/__pg6_dump/"
-DEFAULT_MAX_DUMP_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB default cap per dumped file
+DEFAULT_MAX_DUMP_FILE_BYTES = 256 * 1024 * 1024  # 256 MiB default cap per dumped file
 _DUMP_WRITE_LOCK = threading.Lock()
 _LOG_LOCK = threading.Lock()
 

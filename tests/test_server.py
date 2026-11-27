@@ -1164,6 +1164,34 @@ class TestServeLocalDumpEndpoint(unittest.TestCase):
                 max_dump_file_bytes=-1,
             )
 
+    def test_default_max_dump_file_bytes_is_256mib_and_keepalive_reuses_socket(self) -> None:
+        self.assertEqual(serve_local.DEFAULT_MAX_DUMP_FILE_BYTES, 256 * 1024 * 1024)
+        with self._running_server(dump_root=self.dump_root) as port:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                sock_ids: list[int] = []
+                for idx in range(5):
+                    payload = f"shader-{idx}".encode("utf-8")
+                    conn.request(
+                        "POST",
+                        f"/__pg6_dump/dxil/s_{idx:04d}.dxil",
+                        body=payload,
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Connection": "keep-alive",
+                        },
+                    )
+                    resp = conn.getresponse()
+                    body = resp.read()
+                    self.assertEqual(resp.status, 200)
+                    self.assertNotEqual(resp.getheader("Connection", "").lower(), "close")
+                    self.assertTrue(json.loads(body.decode("utf-8"))["ok"])
+                    self.assertIsNotNone(conn.sock)
+                    sock_ids.append(conn.sock.fileno())
+                self.assertEqual(len(set(sock_ids)), 1, "expected HTTP/1.1 keep-alive socket reuse")
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

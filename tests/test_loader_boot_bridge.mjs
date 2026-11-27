@@ -5001,3 +5001,99 @@ test('Orch-32 P2 #5 + P1 #4a: sanitizeFrameStats preserves gpuMemory and createW
   assert.equal(initPayloads.gpuInit.requireNonBlackFrame, false);
   assert.equal(initPayloads.ioInit.requireNonBlackFrame, undefined);
 });
+
+test('Wave-6 (#663, #1077): createMemfsPipelineDumpSyncer drains fetch response bodies so HTTP/1.1 keep-alive reuses TCP sockets', async () => {
+  const memfs = createFakeMemfs();
+  memfs.writeFile('/pg6_dump/dxil/s0001.dxil', new Uint8Array([1, 2, 3, 4]));
+  memfs.writeFile('/pg6_dump/dxil/s0002.dxil', new Uint8Array([5, 6, 7, 8]));
+  memfs.writeFile('/pg6_dump/dxil/s0003.dxil', new Uint8Array([9, 10, 11, 12]));
+  memfs.writeFile('/pg6_dump/dxil/s0004.dxil', new Uint8Array([13, 14, 15, 16]));
+  memfs.writeFile('/pg6_dump/manifest.json', new TextEncoder().encode('{"count":4}'));
+
+  let arrayBufferDrains = 0;
+  let textDrains = 0;
+  let bodyCancels = 0;
+  const syncer = createMemfsPipelineDumpSyncer({
+    dumpPipelines: true,
+    maxConcurrentUploads: 2,
+    fs: memfs.fs,
+    fetchFn: async (url) => {
+      if (url.endsWith('/s0001.dxil')) {
+        return {
+          ok: true,
+          status: 200,
+          bodyUsed: false,
+          async arrayBuffer() {
+            arrayBufferDrains += 1;
+            this.bodyUsed = true;
+            return new ArrayBuffer(16);
+          },
+          body: {
+            async cancel() {
+              bodyCancels += 1;
+            },
+          },
+        };
+      }
+      if (url.endsWith('/s0002.dxil')) {
+        return {
+          ok: true,
+          status: 200,
+          bodyUsed: false,
+          async text() {
+            textDrains += 1;
+            this.bodyUsed = true;
+            return '{"ok":true}';
+          },
+        };
+      }
+      if (url.endsWith('/s0003.dxil')) {
+        return {
+          ok: true,
+          status: 200,
+          bodyUsed: false,
+          body: {
+            async cancel() {
+              bodyCancels += 1;
+            },
+          },
+        };
+      }
+      if (url.endsWith('/s0004.dxil')) {
+        // Error response (e.g. HTTP 413) must also have its body drained without crashing.
+        return {
+          ok: false,
+          status: 413,
+          bodyUsed: false,
+          async arrayBuffer() {
+            arrayBufferDrains += 1;
+            this.bodyUsed = true;
+            return new ArrayBuffer(32);
+          },
+        };
+      }
+      // Throwing arrayBuffer() falls back to body.cancel() without failing a 200 OK upload.
+      return {
+        ok: true,
+        status: 200,
+        bodyUsed: false,
+        async arrayBuffer() {
+          arrayBufferDrains += 1;
+          throw new Error('stream read interrupted');
+        },
+        body: {
+          async cancel() {
+            bodyCancels += 1;
+          },
+        },
+      };
+    },
+  });
+
+  const stats = await syncer.flush();
+  assert.equal(stats.filesUploaded, 4);
+  assert.equal(stats.uploadErrors, 1);
+  assert.equal(arrayBufferDrains, 3, 'arrayBuffer() must drain 200 OK, 413 error, and throwing responses');
+  assert.equal(textDrains, 1, 'text() fallback must drain when arrayBuffer() is absent');
+  assert.equal(bodyCancels, 2, 'body.cancel() must run when only body exists or arrayBuffer() throws');
+});

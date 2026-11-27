@@ -15,6 +15,8 @@ const {
   OPCODES,
   BUFFER_USAGE,
   TEXTURE_USAGE,
+  REPLAY_LOG_MAX_ENTRIES,
+  REPLAY_LOG_MAX_BYTES,
   REPLAY_LOG_MAX_BIND_GROUPS,
   SWAPCHAIN_PROBE_DEFAULT_TIMEOUT_MS,
   DEFAULT_GPU_STALL_WARN_MS,
@@ -347,7 +349,9 @@ function createMockDevice(opts = {}) {
 }
 
 test('Wave-5 #1: enableShadowBufferReplay=false skips WriteBuffer shadow copies while replaying creation packets & >512 bind groups across device.lost with 0 unknown bind group errors', async () => {
-  assert.equal(REPLAY_LOG_MAX_BIND_GROUPS, 16384);
+  assert.equal(REPLAY_LOG_MAX_ENTRIES, 262144);
+  assert.equal(REPLAY_LOG_MAX_BYTES, 256 * 1024 * 1024);
+  assert.equal(REPLAY_LOG_MAX_BIND_GROUPS, 65536);
 
   // 1a. Standalone WgpuCommandProcessor defaults to shadowBufferReplayEnabled = true for unit tests.
   const standaloneEnv = createMockDevice();

@@ -843,3 +843,147 @@ test('W106 lazyShaderCompile skips unused shader compilation during async device
   assert.equal(processor.validationErrorCount, 0, JSON.stringify(processor.getValidationErrors()));
   assert.equal(second.passCalls.filter((c) => c.op === 'draw').length, 1);
 });
+
+test('Wave-6 (#663, #1077): bind groups created/destroyed during async replay yields are captured and replayed with zero unknown bind group errors', async () => {
+  const first = createMockDevice('first');
+  const processor = newProcessor(first.device);
+  const bglEntry = { binding: 0, visibility: 0x3, type: 0, subtype: 0, minBindingSize: 16 };
+  const bgEntry = { binding: 0, type: 0, id: IDS.buffer, offset: 0, size: 256 };
+
+  // Seed initial scene plus extra transient bind groups so replay yields across multiple chunks.
+  const initPackets = [sceneSetupPackets()];
+  for (let i = 0; i < 12; i += 1) {
+    initPackets.push(bindGroup2Packet(64000 + i, IDS.bgl, [bgEntry]));
+  }
+  processor.executeCommandBuffer(concat(...initPackets));
+
+  const second = createMockDevice('second');
+  processor.beginDeviceRecovery();
+  processor.rebindDevice(second.device, createMockContext());
+  installRenderStatePackets(processor);
+
+  // Start chunked async replay (chunkSize=2 forces multiple macrotask yields).
+  const replayPromise = processor.replayRecordedResourcesAsync({ chunkSize: 2 });
+
+  // While async replay is actively yielding, the guest submits new bind groups 64669..64680,
+  // a new layout 900, a buffer shadow write, and destroys transient bind group 64000.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const midReplayPackets = [
+    bindGroupLayoutPacket(900, [bglEntry]),
+    destroyPacket(64000),
+    writeBufferPacket(IDS.buffer, 0, new Uint8Array([0x55, 0x66, 0x77, 0x88])),
+  ];
+  for (let id = 64669; id <= 64680; id += 1) {
+    midReplayPackets.push(bindGroup2Packet(id, 900, [bgEntry]));
+  }
+  processor.executeCommandBuffer(concat(...midReplayPackets));
+
+  const summary = await replayPromise;
+  processor.endDeviceRecovery(true);
+
+  assert.equal(summary.aborted, false);
+  assert.equal(summary.failedResources, 0);
+  assert.equal(processor._replayingResources, false);
+  assert.equal(processor._replayAsyncActive, false);
+
+  // Destroyed bind group 64000 must stay absent; all mid-replay bind groups 64669..64680 must exist!
+  assert.equal(processor.bindGroups.has(64000), false, 'bind group destroyed during async replay must stay absent');
+  for (let id = 64669; id <= 64680; id += 1) {
+    assert.equal(processor.bindGroups.has(id), true, `mid-replay bind group ${id} must be replayed`);
+    assert.equal(processor.bindGroups.get(id).device, 'second');
+  }
+
+  // Binding every mid-replay bind group 64669..64680 in the very next frame must produce 0 errors!
+  const bindAll = [
+    packet(OPCODES.BEGIN_FRAME),
+    beginRenderPassPacket(IDS.rt),
+    u32Packet(OPCODES.SET_PIPELINE, [IDS.pipeline]),
+  ];
+  for (let id = 64669; id <= 64680; id += 1) {
+    bindAll.push(setBindGroup2Packet(0, id));
+  }
+  bindAll.push(
+    setBindGroup2Packet(0, IDS.bindGroup),
+    u32Packet(OPCODES.DRAW, [3, 1, 0, 0]),
+    packet(V2_OPCODES.END_RENDER_PASS),
+    packet(OPCODES.PRESENT)
+  );
+  processor.executeCommandBuffer(concat(...bindAll));
+  assert.equal(processor.validationErrorCount, 0, JSON.stringify(processor.getValidationErrors()));
+  assert.equal(processor.extension.getTelemetry().unknownBindGroupErrors, 0);
+});
+
+test('Wave-6 (#663, #1077): replay bind-group LRU protects active bind groups, evicts transient BGs before log overflow, cleans on DestroyResource, and logs eviction telemetry', () => {
+  const logs = [];
+  const logger = {
+    warn: (m) => logs.push({ level: 'warn', message: String(m) }),
+    info: (m) => logs.push({ level: 'info', message: String(m) }),
+    error: (m) => logs.push({ level: 'error', message: String(m) }),
+  };
+  const first = createMockDevice('first');
+  const processor = new WgpuCommandProcessor(first.device, createMockContext(), {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+    logger,
+    replayMaxBindGroups: 3,
+    replayLogMaxEntries: 6,
+  });
+  installRenderStatePackets(processor);
+
+  const bglEntry = { binding: 0, visibility: 0x3, type: 0, subtype: 0 };
+  const bgEntry = { binding: 0, type: 0, id: 10, offset: 0, size: 64 };
+  processor.executeCommandBuffer(
+    concat(
+      createBufferPacket(10, 0x48, 64),
+      bindGroupLayoutPacket(100, [bglEntry]),
+      bindGroup2Packet(5001, 100, [bgEntry]),
+      bindGroup2Packet(5002, 100, [bgEntry]),
+      bindGroup2Packet(5003, 100, [bgEntry]),
+      // Destroy 5003: frees slot cleanly so creating 5004 causes zero evictions!
+      destroyPacket(5003),
+      bindGroup2Packet(5004, 100, [bgEntry]),
+      // Touch 5001 via SetBindGroup2 so it becomes MRU; 5002 is now LRU.
+      setBindGroup2Packet(0, 5001),
+      // Creating 5005 exceeds replayMaxBindGroups=3 -> must evict LRU 5002, keeping active 5001!
+      bindGroup2Packet(5005, 100, [bgEntry]),
+      // Replay log now has 5 entries (buf 10, bgl 100, bg 5001, 5004, 5005).
+      // Adding 2 more persistent buffers hits replayLogMaxEntries=6 -> must evict oldest BG (5004)
+      // instead of dropping persistent buffer 12 via overflow!
+      createBufferPacket(11, 0x48, 64),
+      createBufferPacket(12, 0x48, 64)
+    )
+  );
+
+  const stats = processor.getResourceReplayStats();
+  assert.equal(stats.replayBindGroupEvictions, 2);
+  assert.equal(stats.replayLogOverflowCount, 0, 'evicting transient bind group prevented log overflow');
+  assert.equal(processor.getDeviceLossStats().replayBindGroupEvictions, 2);
+  assert.equal(processor.getDeviceLossStats().replayLogOverflowCount, 0);
+  const snap = buildGpuTelemetrySnapshot(processor, { timestamp: 1 });
+  assert.equal(snap.deviceStats.replayBindGroupEvictions, 2);
+  assert.equal(snap.deviceStats.replayLogOverflowCount, 0);
+  assert.ok(
+    logs.some((l) => l.level === 'warn' && /replay log evicted oldest bindGroup/.test(l.message)),
+    'expected sanitized warning when replay log evicts a bind group'
+  );
+
+  // Recover onto second device: persistent buffers 10, 11, 12 and active MRU bind group 5001 + 5005 survive!
+  const second = createMockDevice('second');
+  recoverOnto(processor, second.device);
+  assert.equal(processor.buffers.has(10), true);
+  assert.equal(processor.buffers.has(11), true);
+  assert.equal(processor.buffers.has(12), true);
+  assert.equal(processor.bindGroups.has(5001), true, 'actively used bind group 5001 must survive LRU eviction');
+  assert.equal(processor.bindGroups.has(5005), true);
+  assert.equal(processor.bindGroups.has(5002), false, 'least recently used bind group 5002 was evicted');
+
+  // Binding evicted bind group 5002 records unknownBindGroupErrors and replay-pressure warning.
+  processor.executeCommandBuffer(setBindGroup2Packet(0, 5002));
+  const rsTelem = processor.extension.getTelemetry();
+  assert.equal(rsTelem.unknownBindGroupErrors, 1);
+  assert.ok(
+    rsTelem.warnings.some((w) => /replay pressure \(bindGroupEvictions=2/.test(w)),
+    'expected sanitized replay-pressure telemetry warning on unknown bind group'
+  );
+  processor.destroy();
+});
