@@ -8,7 +8,7 @@ if a.environment_only:
  cpu=next((l.split(':',1)[1].strip() for l in Path('/proc/cpuinfo').read_text().splitlines() if l.startswith('model name')),'unknown')
  value={'os':platform.platform(),'cpu':cpu,'logical_cpus':os.cpu_count(),'memory_bytes':os.sysconf('SC_PAGE_SIZE')*os.sysconf('SC_PHYS_PAGES'),'compiler':subprocess.check_output(['c++','--version'],text=True).splitlines()[0],'cmake':subprocess.check_output(['cmake','--version'],text=True).splitlines()[0],'flags':a.flags,'baseline':a.base,'patch':a.patch}
 else:
- cases=[(n,64,m) for n in (8,32,64) for m in ('fragmented','contiguous')]+[(n,f,m) for n in (8,32,64) for f,m in ((1,'fragmented-dense'),(4,'fragmented-dense-resident'))]+[(2,4,'fragmented-unaligned')]
+ cases=[(n,64,m) for n in (8,32,64) for m in ('fragmented','contiguous')]+[(n,f,m) for n in (8,32,64) for f,m in ((1,'fragmented-dense'),(4,'fragmented-dense-resident'))]+[(n,4,m) for n in (8,32,64) for m in ('fragmented-quarter','fragmented-half','fragmented-nearly-dense')]+[(2,4,'fragmented-unaligned')]
  if a.case_filter=='bounded': cases=[(8,8,'fragmented-dense-resident'),(64,16,'fragmented'),(8,16,'contiguous')]
  samples=[];summary=[]
  for mib,frames,mode in cases:
