@@ -39,6 +39,8 @@
 #include <string>
 #include <vector>
 
+#include "os/host_sleep.h"
+
 namespace playgta6::guest::minidump {
 
 // User stream carrying the guest fault_record JSON (UTF-8, no terminator). Read by
@@ -154,8 +156,12 @@ private:
         copy_text(r.reason, sizeof(r.reason), reason);
         copy_text(r.path, sizeof(r.path), path);
         ResetEvent(s.done);
+        // The helper's MiniDumpWriteDump suspends every thread of this process; guest waits / sleeps that
+        // span the freeze must not be counted as latency outliers (host_sleep frozen window).
+        playgta6::os::host_sleep::frozen_window_begin();
         SetEvent(s.request);
         const bool finished = WaitForSingleObject(s.done, timeout_ms) == WAIT_OBJECT_0;
+        playgta6::os::host_sleep::frozen_window_end();
         // A helper that did not finish still owns the block: leave busy set.
         if (!finished) return false;
         const bool ok = r.ok != 0;
