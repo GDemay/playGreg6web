@@ -15,8 +15,8 @@ unimplemented-import report. "Offline HRESULT" means `0x800704CF` (`HRESULT_FROM
 |---|---|---|---|
 | 3 | XStoreCreateContext | Implemented: local dummy context handle | #235 (O16) |
 | 4 | XStoreCloseContextHandle | Implemented | #235 (O16) |
-| 28 | XStoreQueryGameLicenseAsync | Synchronous offline HRESULT `0x800704CF`, no argument touched, no completion queued (title runs as the full game). Decided 2026-11-27 by owner (7.3 A) | #2030 |
-| 65 | XStoreQueryPackageIdentifier | `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`, no argument touched (add-on unavailable). Decided 2026-11-27 by owner (7.3 A) | #2030 |
+| 28 | XStoreQueryGameLicenseAsync | Synchronous offline HRESULT `0x800704CF`, no argument touched, no completion queued (title runs as the full game). Decided 2026-11-27 by owner (7.3 A) | #2031 |
+| 65 | XStoreQueryPackageIdentifier | `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`, no argument touched (add-on unavailable). Decided 2026-11-27 by owner (7.3 A) | #2031 |
 | 66 / 67 | XStoreRegisterGameLicenseChanged / Unregister | Trapping stub (the C-ABI shim in `xbox_offline.cpp` has a silent version, but the title path does not use it) | #235 |
 | 68 / 69 | XStoreRegisterPackageLicenseLost / Unregister | Trapping stub | #235 |
 | other (about 40 used slots, e.g. 20/21 AcquireLicenseForPackage, 22 IsLicenseValid, 29 QueryGameLicenseResult) | various | Trapping stub, "nothing about licences is invented" (O8 offline policy); a tripwire per 7.3 A | #235 / #77 |
@@ -42,14 +42,14 @@ licence handle are entitlement claims and must not be used without an explicit d
 | Slot | Function | Today | Set by |
 |---|---|---|---|
 | 3 / 4 | XUserDuplicateHandle / CloseHandle | Implemented | #235 |
-| 5 | XUserCompare | Implemented: 0 when both handles are the local user (by XUID, so duplicates match), non-zero otherwise. Decided 2026-11-27 by owner (7.2) | #2030 |
+| 5 | XUserCompare | Implemented: 0 when both handles are the local user (by XUID, so duplicates match), non-zero otherwise. Decided 2026-11-27 by owner (7.2) | #2031 |
 | 7 / 8 | XUserAddAsync / AddResult | Implemented: one local offline user ("OFFLINEPLAYER"), no account picker, no real sign-in | #36 (O5), #235 |
 | 9 | XUserGetLocalId | Implemented | #235 |
-| 10 | XUserFindUserByLocalId | Implemented: a new handle when the id is our local id and the user was added, else `E_GAMEUSER_USER_NOT_FOUND`. Decided 2026-11-27 by owner (7.2) | #2030 |
+| 10 | XUserFindUserByLocalId | Implemented: a new handle when the id is our local id and the user was added, else `E_GAMEUSER_USER_NOT_FOUND`. Decided 2026-11-27 by owner (7.2) | #2031 |
 | 11 | XUserGetId (XUID) | Implemented (local value) | #235 |
-| 12 | XUserFindUserById | Implemented: same, by our local XUID. Decided 2026-11-27 by owner (7.2) | #2030 |
+| 12 | XUserFindUserById | Implemented: same, by our local XUID. Decided 2026-11-27 by owner (7.2) | #2031 |
 | 13 | XUserGetIsGuest | Implemented: not a guest | #487 (R23) |
-| 14 | XUserGetState | Implemented: SignedIn for the single local offline user, `E_INVALIDARG` for an invalid handle; no token, no online access. Decided 2026-11-27 by owner (7.2) | #2030 |
+| 14 | XUserGetState | Implemented: SignedIn for the single local offline user, `E_INVALIDARG` for an invalid handle; no token, no online access. Decided 2026-11-27 by owner (7.2) | #2031 |
 | 19 | XUserGetAgeGroup | Implemented: `--user-age-group`, default Unknown | #514 (R23) |
 | 20 | XUserCheckPrivilege | Implemented: no privilege, deny reason Unknown | #235 / #77 |
 | 21 / 22 | XUserResolvePrivilegeWithUiAsync / Result | Implemented: offline HRESULT | #235 / #77 |
@@ -67,7 +67,7 @@ Xbox Live (XSAPI, `XblContextCreateHandle` etc.) answers with the offline HRESUL
 |---|---|---|---|
 | XSystem 3 | XSystemGetConsoleId | Implemented | #235 |
 | XSystem 4 | XSystemGetXboxLiveSandboxId | Configured sandbox, else `E_NOTIMPL` | #235 |
-| XSystem 5 | XSystemGetAppSpecificDeviceId | `E_NOTIMPL`, nothing written (no device identity). Decided 2026-11-27 by owner (7.1 A) | #2030 |
+| XSystem 5 | XSystemGetAppSpecificDeviceId | `E_NOTIMPL`, nothing written (no device identity). Decided 2026-11-27 by owner (7.1 A) | #2031 |
 | XGame 3 | XGameGetXboxTitleId | Implemented | #235 |
 | XPackage 3/4 | GetCurrentProcessPackageIdentifier / IsPackagedProcess | Implemented: deterministic local id (32 zero digits), packaged | #235 |
 | XPackage 5/6/7/9 | Installation monitor and progress | Implemented: always complete and launchable | #235 |
@@ -104,9 +104,9 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
 ## 6. Owner decisions pending
 
 1. Whether XUserGetTokenAndSignatureResult (slot 25) should match the offline HRESULT of slots 23/24 rather than trap.
-2. ~~What XSystemGetAppSpecificDeviceId should return~~: decided 2026-11-27 by owner, implemented in #2030 (7.1).
+2. ~~What XSystemGetAppSpecificDeviceId should return~~: decided 2026-11-27 by owner, implemented in #2031 (7.1).
 3. Which HRESULT slot 71/72 should settle on long term (see section 2).
-4. XStore slots: 28 and 65 decided 2026-11-27 by owner, implemented in #2030 (7.3); 20/21/22/68 stay trapping tripwires.
+4. XStore slots: 28 and 65 decided 2026-11-27 by owner, implemented in #2031 (7.3); 20/21/22/68 stay trapping tripwires.
 5. S7: decided 2026-11-27, implemented in #2029: Media Foundation object-creating imports (MFCreateAttributes, MFCreateMediaType, MFCreateSourceResolver,
    MFCreateSourceReaderFromMediaSource) are `ok` failing shims in `runtime/os/shim_audit.h` (section 7.4).
 6. S8: CRT `fopen` / `_wfopen` / `remove` (and the msvcp140 `_fsopen` / `_wfsopen`) are `ok` since #1998; no owner
@@ -115,7 +115,7 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
 ## 7. Owner decisions: device id, XUser sign-in state and XStore licence
 
 Behaviour-only summary of a static analysis of the title's call sites. No addresses, bytes or extracted data
-are recorded. 7.1, 7.2 and 7.3 were decided 2026-11-27 by the owner (option A / the recommended rows) and implemented in #2030.
+are recorded. 7.1, 7.2 and 7.3 were decided 2026-11-27 by the owner (option A / the recommended rows) and implemented in #2031.
 
 ### 7.1 XSystemGetAppSpecificDeviceId (XSystem slot 5)
 
@@ -138,7 +138,7 @@ What the title does:
 
 Recommendation: **A**. The only caller ignores errors by design.
 
-**Decided 2026-11-27 by owner, implemented in #2030:** option A, `E_NOTIMPL`, nothing written.
+**Decided 2026-11-27 by owner, implemented in #2031:** option A, `E_NOTIMPL`, nothing written.
 
 #### 7.1 Evidence (static re-check of the real executable, read-only)
 
@@ -194,7 +194,7 @@ needs a token from slot 23, which already fails offline):
 Recommendation: slot 14 = signed in for the single local offline user, 10/12/5 as in the recommended rows;
 no tokens, no online services.
 
-**Decided 2026-11-27 by owner, implemented in #2030:** slot 14 SignedIn for the single local offline user; slots 10/12 find by our local id / XUID; slot 5 compares by XUID; no tokens (slot 24 keeps failing offline).
+**Decided 2026-11-27 by owner, implemented in #2031:** slot 14 SignedIn for the single local offline user; slots 10/12 find by our local id / XUID; slot 5 compares by XUID; no tokens (slot 24 keeps failing offline).
 
 Confidence: high for the call sites and error handling; medium for the exact meaning of the cleared list
 ("the built text is never read" is now high, see 7.1 evidence). No dynamic run backs this.
@@ -241,7 +241,7 @@ the XUser extension.
 ### 7.3 XStore licence slots (20, 22, 23, 28, 65, 67, 69)
 
 Store, licence and entitlement are owner hard stops. Behaviour only: no addresses or bytes are recorded.
-**Decided 2026-11-27 by owner, implemented in #2030:** option A. Slot 28 returns `0x800704CF`, slot 65 returns `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`; every other XStore slot keeps trapping as a tripwire.
+**Decided 2026-11-27 by owner, implemented in #2031:** option A. Slot 28 returns `0x800704CF`, slot 65 returns `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)`; every other XStore slot keeps trapping as a tripwire.
 
 Which slots the title reaches:
 - Game licence: slot 28 (query), with follow-ups 29, 66 and 67. The title only reads "is disc", "is trial",
