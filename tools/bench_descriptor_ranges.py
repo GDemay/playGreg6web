@@ -46,7 +46,7 @@ def main():
                     'alternate two distinct source streams so destinations change on every timed call; alias '
                     'controls repeat identical sources; complete descriptor checks and hashing outside timing',
         'unmeasured': 'game descriptor distributions/frequency, browser/Wasm, GPU work, game frame times, '
-                      'allocation latency of first-call interval scratch, retained metadata RSS',
+                      'first-call latency and process RSS',
         'cases': cases,
     }, indent=2))
 
