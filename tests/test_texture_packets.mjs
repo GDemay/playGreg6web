@@ -4320,3 +4320,101 @@ test('Console texture fidelity: 3D BC-sRGB fallback preserves sRGB and _create s
 
   assert.equal(handler.getStats().errors, 0, handler.lastError);
 });
+
+test('modern direct SAB writes avoid app snapshots and retain synchronous source bytes', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+  processor.executeCommandBuffer(createTexture2Packet({ id: 8801, width: 256, height: 2, usage: 0x06, format: 1 }));
+  const data = new Uint8Array(512).fill(37);
+  const pkt = writeTexturePacket({ textureId: 8801, width: 256, height: 2, bytesPerRow: 256, rowsPerImage: 2, data, useSab: true });
+  processor.executeCommandBuffer(pkt);
+  // The API's content-timeline copy must precede producer reuse of the ring bytes.
+  new Uint8Array(pkt.buffer, pkt.byteOffset + 56, 512).fill(91);
+  const call = gpu.calls.find((c) => c.op === 'writeTexture');
+  assert.equal(call.isSab, true);
+  assert.equal(call.bufferRef, pkt.buffer);
+  assert.ok(call.bytes.every((byte) => byte === 37));
+  assert.equal(handler.getStats().sabCopyCount, 0);
+  assert.equal(handler.getStats().scratchBufferAllocations, 0);
+  assert.equal(handler.getStats().directZeroCopyUploads, 1);
+  assert.equal(handler._reusablePreparedData.data, null);
+});
+
+test('legacy SAB TypeError is probed once per queue binding and fallback telemetry stays accurate', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const original = gpu.device.queue.writeTexture;
+  let sharedAttempts = 0;
+  gpu.device.queue.writeTexture = function (...args) {
+    if (args[1].buffer instanceof SharedArrayBuffer) sharedAttempts++;
+    return original.apply(this, args);
+  };
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+  processor.executeCommandBuffer(createTexture2Packet({ id: 8802, width: 256, height: 2, usage: 0x06, format: 1 }));
+  const pkt = writeTexturePacket({ textureId: 8802, width: 256, height: 2, bytesPerRow: 256, rowsPerImage: 2, data: new Uint8Array(512).fill(52), useSab: true });
+  for (let i = 0; i < 3; i++) processor.executeCommandBuffer(pkt);
+  assert.equal(sharedAttempts, 1);
+  const calls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(calls.length, 3);
+  assert.ok(calls.every((call) => !call.isSab && call.bytes[0] === 52));
+  assert.equal(handler.getStats().sabCopyCount, 3);
+  assert.equal(handler.getStats().scratchBufferAllocations, 1);
+  assert.equal(handler.getStats().scratchBufferReuses, 2);
+  // A replacement/recovered device queue gets its own capability probe.
+  const modern = createMockWebGpu();
+  processor.device = modern.device;
+  processor.executeCommandBuffer(pkt);
+  assert.equal(modern.calls.find((c) => c.op === 'writeTexture').isSab, true);
+  assert.equal(handler.getStats().sabCopyCount, 3);
+});
+
+test('direct SAB writes propagate non-TypeError failures without copying or retrying', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+  const texture = gpu.device.createTexture({ size: { width: 256, height: 2 }, format: 'r8unorm', usage: 6 });
+  let attempts = 0;
+  const failure = new RangeError('synthetic write failure');
+  gpu.device.queue.writeTexture = () => { attempts++; throw failure; };
+  const shared = new Uint8Array(new SharedArrayBuffer(512));
+  assert.throws(() => handler.writeTexture({ texture }, shared, { bytesPerRow: 256, rowsPerImage: 2 }, { width: 256, height: 2 }), (error) => error === failure);
+  assert.equal(attempts, 1);
+  assert.equal(handler.getStats().sabCopyCount, 0);
+  assert.equal(handler.getStats().scratchBufferAllocations, 0);
+});
+
+test('shared uploads above the chunk cap retain bounded snapshots on modern queues', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor, { maxWriteChunkBytes: 256 });
+  processor.executeCommandBuffer(createTexture2Packet({ id: 8803, width: 256, height: 2, usage: 0x06, format: 1 }));
+  const pkt = writeTexturePacket({ textureId: 8803, width: 256, height: 2, bytesPerRow: 256, rowsPerImage: 2, data: new Uint8Array(512).fill(63), useSab: true });
+  processor.executeCommandBuffer(pkt);
+  const calls = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(calls.length, 2);
+  assert.ok(calls.every((call) => !call.isSab && call.byteLength === 256 && call.bytes[0] === 63));
+  assert.equal(handler.getStats().sabCopyCount, 1);
+  assert.equal(handler.getStats().chunkedWrites, 1);
+});
+
+
+test('cross-realm TypeError selects legacy fallback and counts snapshots even when retry fails', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+  const texture = gpu.device.createTexture({ size: { width: 256, height: 2 }, format: 'r8unorm', usage: 6 });
+  const crossRealmTypeError = vm.runInNewContext('new TypeError("shared views unsupported")');
+  const retryError = new RangeError('retry failed');
+  let sharedAttempts = 0;
+  gpu.device.queue.writeTexture = (_destination, data) => {
+    if (data.buffer instanceof SharedArrayBuffer) { sharedAttempts++; throw crossRealmTypeError; }
+    throw retryError;
+  };
+  const shared = new Uint8Array(new SharedArrayBuffer(512));
+  for (let i = 0; i < 2; i++) {
+    assert.throws(() => handler.writeTexture({ texture }, shared, { bytesPerRow: 256, rowsPerImage: 2 }, { width: 256, height: 2 }), (error) => error === retryError);
+  }
+  assert.equal(sharedAttempts, 1);
+  assert.equal(handler.getStats().sabCopyCount, 2);
+});
