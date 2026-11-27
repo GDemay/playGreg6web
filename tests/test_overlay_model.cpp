@@ -158,6 +158,14 @@ int main() {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
     }
+    CHECK(!overlay_needs_intermediate(true, false, false));  // normal play: direct present, no extra copy
+    CHECK(overlay_needs_intermediate(true, true, false));
+    CHECK(overlay_needs_intermediate(true, false, true));
+    CHECK(!overlay_needs_intermediate(false, true, true));
+    // Direct frames: first frame snapshots (fault right after it still has a frame), then at most once a second.
+    CHECK(overlay_snapshot_due(5, 0));
+    CHECK(!overlay_snapshot_due(5 + kOverlaySnapshotIntervalNs - 1, 5));
+    CHECK(overlay_snapshot_due(5 + kOverlaySnapshotIntervalNs, 5));
     std::printf("test_overlay_model: ok\n");
     return 0;
 }
