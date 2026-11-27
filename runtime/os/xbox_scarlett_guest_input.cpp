@@ -1367,9 +1367,11 @@ private:
             return com::E_INVALIDARG_HR;
         }
         // The detiler owns `linear`, so overlapping guest source/destination ranges remain
-        // safe. On failure, replay row writes to retain the previous partial-output behavior;
-        // padded rows/slices always take that original path and leave padding untouched.
-        const bool tight = row_pitch == row_bytes && (d == 1 || slice_pitch == uint64_t{row_bytes} * rows);
+        // safe. Translated writes retain row granularity: even a failed write marks its whole
+        // requested range dirty, so a failed bulk attempt would mark slots beyond the failure.
+        // Padded rows/slices and failed arena writes also retain the original row path.
+        const bool tight = !guest_window::translated(dst) && row_pitch == row_bytes &&
+                           (d == 1 || slice_pitch == uint64_t{row_bytes} * rows);
         const size_t linear_bytes = size_t{row_bytes} * rows * d;
         if (!tight || !com::write_guest(dst, linear.data(), linear_bytes)) {
             for (uint32_t z = 0; z < d; ++z) {

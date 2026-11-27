@@ -2174,7 +2174,35 @@ void test_xg_tight_copy_failures_and_aliases() {
     CHECK(as_hr(fx.vcall(comp, 8, {I(surface), I(0), I(0), I(split), I(row), I(linear.size())})) ==
           com::E_INVALIDARG_HR);
     CHECK(guest_bytes(surface, chain) == expected);
+    // A failed translated destination must not dirty a mapped slot beyond an unmapped
+    // slot. com::write_guest marks its entire requested range even when its copy fails.
+    const uint64_t large_desc = xg_desc(3, 256, 256, 1, 1, 28);
+    CHECK(com::write_guest(large_desc + 0x2C, uint32_t{0x105}));
+    const uint64_t large_out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(large_desc), I(large_out)})) == 0);
+    const uint64_t large_comp = load64(large_out);
+    const gx::TextureLayoutDesc large_td{28, 256, 256, 1, 1, 0x105, 0};
+    const auto large_linear = pattern_data(256 * 256 * 4);
+    const uint64_t large_src = com::guest_alloc(large_linear.size());
+    const uint64_t large_surface = com::guest_alloc(gx::surface_bytes(large_td));
+    CHECK(com::write_guest(large_src, large_linear.data(), large_linear.size()));
+    CHECK(as_hr(fx.vcall(large_comp, 8, {I(large_surface), I(0), I(0), I(large_src), I(1024), I(large_linear.size())})) == 0);
+    CHECK(gw::map_slot(gw::kWindowBase + 2 * gw::kSlotBytes, fx.arena.translate(pages + 2 * gw::kSlotBytes)));
+    const std::vector<uint8_t> sentinel(gw::kSlotBytes, 0xCD);
+    CHECK(com::write_guest(gw::kWindowBase, sentinel.data(), sentinel.size()));
+    CHECK(com::write_guest(gw::kWindowBase + 2 * gw::kSlotBytes, sentinel.data(), sentinel.size()));
+    std::vector<uint64_t> marks;
+    CHECK(gw::take_written(gw::kWindowBase, 4 * gw::kSlotBytes, &marks));
+    CHECK(as_hr(fx.vcall(large_comp, 9, {I(gw::kWindowBase), I(0), I(0), I(0), I(large_surface), I(1024),
+                                             I(large_linear.size())})) == com::E_INVALIDARG_HR);
+    marks.clear();
+    CHECK(gw::take_written(gw::kWindowBase, 4 * gw::kSlotBytes, &marks));
+    CHECK((marks == std::vector<uint64_t>{0, gw::kSlotBytes}));
+    CHECK(guest_bytes(gw::kWindowBase, gw::kSlotBytes) ==
+          std::vector<uint8_t>(large_linear.begin(), large_linear.begin() + gw::kSlotBytes));
+    CHECK(guest_bytes(gw::kWindowBase + 2 * gw::kSlotBytes, gw::kSlotBytes) == sentinel);
     gw::reset_for_testing();
+    CHECK(fx.vcall(large_comp, 1) == 0);
     CHECK(fx.vcall(comp, 1) == 0);
 }
 
