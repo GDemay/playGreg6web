@@ -1456,7 +1456,9 @@ void test_registry_concurrent_lookups_and_mutations() {
             }
             uint64_t local_reads = 0;
             size_t idx = static_cast<size_t>(t) * 7;
-            while (!stop.load(std::memory_order_acquire)) {
+            // do/while: every reader completes at least one pass even when the writers finish before
+            // this thread is first scheduled (loaded CI runner), so per_reader_reads[t] > 0 is deterministic.
+            do {
                 const PinnedInfo& p = pinned[idx % kPinnedCount];
                 com::detail::Resolved r{};
                 if (!com::detail::lookup_interface(p.calc_va, &r) || r.iface != &kICalc.info ||
@@ -1495,7 +1497,7 @@ void test_registry_concurrent_lookups_and_mutations() {
                 }
                 local_reads += 4;
                 ++idx;
-            }
+            } while (!stop.load(std::memory_order_acquire));
             per_reader_reads[t].store(local_reads, std::memory_order_relaxed);
             total_reads.fetch_add(local_reads, std::memory_order_relaxed);
             destroy_guest_thread(fx.arena, gt);
