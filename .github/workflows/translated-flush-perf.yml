@@ -1,0 +1,56 @@
+name: Matched fragmented translated buffer flush
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: true
+        default: '52918dfa4d41e9f316990b06b713219dd9135aac'
+      patch_ref:
+        required: true
+permissions:
+  contents: read
+jobs:
+  linux-fragmented-flush:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: PlayGreg6Web/playGreg6web
+          ref: ${{ inputs.base_ref }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.patch_ref }}
+          path: patch
+      - name: Prepare identical benchmark and environment
+        run: |
+          cp patch/tests/bench_fragmented_buffer_flush.cpp baseline/tests/bench_fragmented_buffer_flush.cpp
+          cat >> baseline/runtime/CMakeLists.txt <<'CMAKE'
+          if(PLAYGTA6_PERFORMANCE_BENCHMARKS)
+            add_executable(bench_fragmented_buffer_flush ../tests/bench_fragmented_buffer_flush.cpp)
+            target_link_libraries(bench_fragmented_buffer_flush PRIVATE playgta6_core)
+          endif()
+          CMAKE
+          python3 runner/tools/perf_run_fragmented_flush.py --environment-only --output results/environment.json --base "${{ inputs.base_ref }}" --patch "${{ inputs.patch_ref }}"
+      - name: Separate Release builds and exact focused tests
+        run: |
+          cmake -S baseline/runtime -B baseline-build -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON
+          cmake --build baseline-build -j4 --target bench_fragmented_buffer_flush test_d3d12_xs_exports
+          cmake -S patch/runtime -B patch-build -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON
+          cmake --build patch-build -j4 --target bench_fragmented_buffer_flush test_d3d12_xs_exports
+          baseline-build/test_d3d12_xs_exports
+          patch-build/test_d3d12_xs_exports
+      - name: Alternating pairs without builds
+        run: |
+          python3 runner/tools/perf_run_fragmented_flush.py --baseline baseline-build/bench_fragmented_buffer_flush --candidate patch-build/bench_fragmented_buffer_flush --output results/fragmented-flush.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fragmented-buffer-flush
+          path: results/*.json
+          if-no-files-found: ignore
