@@ -478,6 +478,14 @@ else()
         add_test(NAME playgta6_minidump_hang_tests COMMAND test_minidump_fault --hang)
         set_tests_properties(playgta6_minidump_hang_tests PROPERTIES
             ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+
+        # End to end: host fault, watchdog hang and stuck report path (backstop) each leave a
+        # parseable non-empty minidump within a time bound.
+        add_executable(test_minidump_e2e ../tests/test_minidump_e2e.cpp)
+        target_include_directories(test_minidump_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME playgta6_minidump_e2e_tests COMMAND test_minidump_e2e)
+        set_tests_properties(playgta6_minidump_e2e_tests PROPERTIES
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
     endif()
 
     add_executable(test_host_marshallers ../tests/test_host_marshallers.cpp)
