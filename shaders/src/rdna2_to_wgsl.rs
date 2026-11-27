@@ -57,6 +57,11 @@ pub const MAX_CBV_VEC4_COUNT: u32 = 1024;
 /// Maximum inter-stage location count under WebGPU baseline limits.
 const MAX_WEBGPU_LOCATIONS: u8 = 16;
 
+/// Maximum user inter-stage `@location(N)` slots shared by VS/Mesh outputs and PS inputs
+/// (`0..=14`, reserving 1 slot under `MAX_WEBGPU_LOCATIONS` for `@builtin(position)` / fragment
+/// built-ins, matching `MAX_MESH_ATTRIBUTES = 15`).
+const MAX_INTER_STAGE_LOCATIONS: u8 = MAX_WEBGPU_LOCATIONS - 1;
+
 /// Maximum color attachment count under WebGPU baseline limits.
 const MAX_WEBGPU_MRTS: u8 = 8;
 
@@ -1175,6 +1180,9 @@ struct ProgramPlan {
     uses_lds: bool,
     frag_attrs: Vec<u8>,
     frag_attr_interp: BTreeMap<u8, FragAttrInterp>,
+    /// Fragment `(clamped_attr, attrchan)` channels read with `high = true` by `v_interp_*_f16`,
+    /// indicating the 32-bit attribute channel carries a packed `fp16x2` pair.
+    frag_attr_f16_high_channels: BTreeSet<(u8, u8)>,
     vs_params: Vec<u8>,
     ps_mrts: Vec<u8>,
     ps_exports_depth: bool,
@@ -9666,6 +9674,7 @@ fn plan_program(
     let mut vertex_buf_fetches: BTreeMap<(u32, u16), VertexFetchPlan> = BTreeMap::new();
     let mut frag_attr_set: BTreeSet<u8> = BTreeSet::new();
     let mut frag_attr_interp: BTreeMap<u8, FragAttrInterp> = BTreeMap::new();
+    let mut frag_attr_f16_high_channels: BTreeSet<(u8, u8)> = BTreeSet::new();
     let mut vs_param_set: BTreeSet<u8> = BTreeSet::new();
     let mut ps_mrt_set: BTreeSet<u8> = BTreeSet::new();
     let mut ps_exports_depth = false;
@@ -10090,10 +10099,13 @@ fn plan_program(
                 ..
             } => {
                 if vop3_is_interp_f16(*op) {
-                    let (attr, _, _) = decode_vop3_interp_attr(*src0);
+                    let (attr, attrchan, high) = decode_vop3_interp_attr(*src0);
                     if stage == ShaderStage::Fragment {
-                        let clamped_attr = attr % MAX_WEBGPU_LOCATIONS;
+                        let clamped_attr = attr % MAX_INTER_STAGE_LOCATIONS;
                         frag_attr_set.insert(clamped_attr);
+                        if high {
+                            frag_attr_f16_high_channels.insert((clamped_attr, attrchan & 0x3));
+                        }
                         let interp = if (256..512).contains(src1) {
                             let bary_vgpr = (*src1 - 256) as u8;
                             if !written_vgprs.contains(&bary_vgpr) {
@@ -10278,7 +10290,7 @@ fn plan_program(
                 ..
             } => {
                 if stage == ShaderStage::Fragment {
-                    let clamped_attr = *attr % MAX_WEBGPU_LOCATIONS;
+                    let clamped_attr = *attr % MAX_INTER_STAGE_LOCATIONS;
                     frag_attr_set.insert(clamped_attr);
                     let interp = if *op == 2 {
                         // v_interp_mov_f32 (p0/p10/p20) -> flat interpolation
@@ -10513,11 +10525,20 @@ fn plan_program(
                 } else if let Some(buf_op) = mubuf_storage_op(*op) {
                     let writable = buf_op.is_store() && stage != ShaderStage::Vertex;
                     if writable
-                        && let Some(StorageDispatch::TwoWayChoice { keys, .. }) =
+                        && let Some(dispatch) =
                             desc_analysis.inst_storage_buf_dispatches.get(&inst_idx)
                     {
-                        for &k in keys {
-                            storage_buf_usage.insert(k, true);
+                        match dispatch {
+                            StorageDispatch::TwoWayChoice { keys, .. } => {
+                                for &k in keys {
+                                    storage_buf_usage.insert(k, true);
+                                }
+                            }
+                            StorageDispatch::BoundedIndexed { keys, .. } => {
+                                for &k in keys {
+                                    storage_buf_usage.insert(k, true);
+                                }
+                            }
                         }
                     } else {
                         let key = desc_analysis
@@ -10570,11 +10591,20 @@ fn plan_program(
                         }
                     }
                 } else if mubuf_is_atomic(*op) && stage != ShaderStage::Vertex {
-                    if let Some(StorageDispatch::TwoWayChoice { keys, .. }) =
+                    if let Some(dispatch) =
                         desc_analysis.inst_storage_buf_dispatches.get(&inst_idx)
                     {
-                        for &k in keys {
-                            storage_buf_usage.insert(k, true);
+                        match dispatch {
+                            StorageDispatch::TwoWayChoice { keys, .. } => {
+                                for &k in keys {
+                                    storage_buf_usage.insert(k, true);
+                                }
+                            }
+                            StorageDispatch::BoundedIndexed { keys, .. } => {
+                                for &k in keys {
+                                    storage_buf_usage.insert(k, true);
+                                }
+                            }
                         }
                     } else {
                         let key = desc_analysis
@@ -10629,11 +10659,20 @@ fn plan_program(
                 } else if let Some(buf_op) = mtbuf_storage_op(*op) {
                     let writable = buf_op.is_store() && stage != ShaderStage::Vertex;
                     if writable
-                        && let Some(StorageDispatch::TwoWayChoice { keys, .. }) =
+                        && let Some(dispatch) =
                             desc_analysis.inst_storage_buf_dispatches.get(&inst_idx)
                     {
-                        for &k in keys {
-                            storage_buf_usage.insert(k, true);
+                        match dispatch {
+                            StorageDispatch::TwoWayChoice { keys, .. } => {
+                                for &k in keys {
+                                    storage_buf_usage.insert(k, true);
+                                }
+                            }
+                            StorageDispatch::BoundedIndexed { keys, .. } => {
+                                for &k in keys {
+                                    storage_buf_usage.insert(k, true);
+                                }
+                            }
                         }
                     } else {
                         let key = desc_analysis
@@ -10749,13 +10788,13 @@ fn plan_program(
                 ..
             } => {
                 if *compr {
-                    if (*en & 0b0011) != 0 {
+                    if (*en & 0b0001) != 0 {
                         vgprs.insert(vsrc[0]);
                         if !written_vgprs.contains(&vsrc[0]) {
                             read_before_write_vgprs.insert(vsrc[0]);
                         }
                     }
-                    if (*en & 0b1100) != 0 {
+                    if (*en & 0b0100) != 0 {
                         vgprs.insert(vsrc[1]);
                         if !written_vgprs.contains(&vsrc[1]) {
                             read_before_write_vgprs.insert(vsrc[1]);
@@ -10774,7 +10813,7 @@ fn plan_program(
                 match target {
                     Rdna2ExportTarget::Param(n) if stage == ShaderStage::Vertex || is_mesh => {
                         // Reserve @builtin(position) + up to 15 param locations.
-                        vs_param_set.insert(*n % (MAX_WEBGPU_LOCATIONS - 1));
+                        vs_param_set.insert(*n % MAX_INTER_STAGE_LOCATIONS);
                     }
                     Rdna2ExportTarget::Mrt(n) if stage == ShaderStage::Fragment => {
                         if *n < MAX_WEBGPU_MRTS {
@@ -11159,6 +11198,7 @@ fn plan_program(
         } else {
             BTreeMap::new()
         },
+        frag_attr_f16_high_channels,
         vs_params: vs_param_set.into_iter().collect(),
         ps_mrts,
         ps_exports_depth,
@@ -11231,6 +11271,7 @@ struct IrEmitter {
     helper_u32_to_f32: Option<Handle<Function>>,
     helper_unpack2x16float: Option<Handle<Function>>,
     helper_pack2x16float: Option<Handle<Function>>,
+    helper_perm_b32: Option<Handle<Function>>,
     helper_rt_f32: Option<Handle<Function>>,
     helper_rt_u32: Option<Handle<Function>>,
     helper_rt_i32: Option<Handle<Function>>,
@@ -11258,6 +11299,10 @@ struct IrEmitter {
     cf_nonuniform_return: bool,
     /// Counter for unique structured-loop / dispatcher local names.
     cf_local_counter: usize,
+    /// `true` when a fragment shader executed an `EXP MRT*/MRTZ` with `vm = true` and `done = false`
+    /// along the current control-flow path and still owes an `if (exec_mask == 0u) { discard; }`
+    /// check before returning (or on a subsequent `done = true` export).
+    ps_pending_vm_discard: bool,
     vs_out_local: Option<Handle<LocalVariable>>,
     vs_param_member_index: BTreeMap<u8, u32>,
     ps_out_local: Option<Handle<LocalVariable>>,
@@ -11265,6 +11310,7 @@ struct IrEmitter {
     ps_depth_member_index: Option<u32>,
     frag_in_arg: Option<u32>,
     frag_attr_member_index: BTreeMap<u8, u32>,
+    frag_attr_f16_high_channels: BTreeSet<(u8, u8)>,
     vs_in_arg: Option<u32>,
     /// Map from `(vb_slot, vertex buffer byte offset)` -> `(VsIn member_index, attr_components, scalar_kind)`.
     vs_attr_by_offset: BTreeMap<(u32, u16), (u32, u8, ScalarKind)>,
@@ -12416,6 +12462,7 @@ impl IrEmitter {
             helper_u32_to_f32: None,
             helper_unpack2x16float: None,
             helper_pack2x16float: None,
+            helper_perm_b32: None,
             helper_rt_f32: None,
             helper_rt_u32: None,
             helper_rt_i32: None,
@@ -12434,6 +12481,7 @@ impl IrEmitter {
             cf_depth: 0,
             cf_nonuniform_return: false,
             cf_local_counter: 0,
+            ps_pending_vm_discard: false,
             vs_out_local,
             vs_param_member_index,
             ps_out_local,
@@ -12441,6 +12489,7 @@ impl IrEmitter {
             ps_depth_member_index,
             frag_in_arg,
             frag_attr_member_index,
+            frag_attr_f16_high_channels: plan.frag_attr_f16_high_channels.clone(),
             vs_in_arg,
             vs_attr_by_offset,
             has_buffer_fetch: plan.has_buffer_fetch,
@@ -12725,6 +12774,465 @@ impl IrEmitter {
     fn call_pg6_pack2x16float(&mut self, arg: Handle<Expression>) -> Handle<Expression> {
         let f = self.ensure_helper_pack2x16float();
         self.call_helper_1(f, arg)
+    }
+
+    /// Lazily emit a compact WGSL helper `fn pg6_byte_perm(s0: u32, s1: u32, s2: u32) -> u32`
+    /// implementing GFX10.3 `v_perm_b32` with a 4-iteration loop instead of unrolling 101 Naga
+    /// expressions at every call site.
+    fn ensure_helper_perm_b32(&mut self) -> Handle<Function> {
+        if let Some(h) = self.helper_perm_b32 {
+            return h;
+        }
+        let u32_ty = self.types.u32_ty;
+        let mut f = Function {
+            name: Some("pg6_byte_perm".to_string()),
+            arguments: vec![
+                FunctionArgument {
+                    name: Some("s0".to_string()),
+                    ty: u32_ty,
+                    binding: None,
+                },
+                FunctionArgument {
+                    name: Some("s1".to_string()),
+                    ty: u32_ty,
+                    binding: None,
+                },
+                FunctionArgument {
+                    name: Some("s2".to_string()),
+                    ty: u32_ty,
+                    binding: None,
+                },
+            ],
+            result: Some(FunctionResult {
+                ty: u32_ty,
+                binding: None,
+            }),
+            ..Function::default()
+        };
+        let res_local = f.local_variables.append(
+            LocalVariable {
+                name: Some("res".to_string()),
+                ty: u32_ty,
+                init: None,
+            },
+            Span::UNDEFINED,
+        );
+        let k_local = f.local_variables.append(
+            LocalVariable {
+                name: Some("k".to_string()),
+                ty: u32_ty,
+                init: None,
+            },
+            Span::UNDEFINED,
+        );
+
+        let s0 = f
+            .expressions
+            .append(Expression::FunctionArgument(0), Span::UNDEFINED);
+        let s1 = f
+            .expressions
+            .append(Expression::FunctionArgument(1), Span::UNDEFINED);
+        let s2 = f
+            .expressions
+            .append(Expression::FunctionArgument(2), Span::UNDEFINED);
+        let res_ptr = f
+            .expressions
+            .append(Expression::LocalVariable(res_local), Span::UNDEFINED);
+        let k_ptr = f
+            .expressions
+            .append(Expression::LocalVariable(k_local), Span::UNDEFINED);
+
+        let lit_u32 = |f: &mut Function, v: u32| {
+            f.expressions
+                .append(Expression::Literal(Literal::U32(v)), Span::UNDEFINED)
+        };
+        let emit_in = |f: &mut Function, block: &mut naga::Block, expr: Expression| {
+            let h = f.expressions.append(expr, Span::UNDEFINED);
+            block.push(Statement::Emit(Range::new_from_bounds(h, h)), Span::UNDEFINED);
+            h
+        };
+
+        let c0 = lit_u32(&mut f, 0);
+        let c1 = lit_u32(&mut f, 1);
+        let c2 = lit_u32(&mut f, 2);
+        let c3 = lit_u32(&mut f, 3);
+        let c4 = lit_u32(&mut f, 4);
+        let c8 = lit_u32(&mut f, 8);
+        let c12 = lit_u32(&mut f, 12);
+        let c15 = lit_u32(&mut f, 15);
+        let c31 = lit_u32(&mut f, 31);
+        let mask_ff = lit_u32(&mut f, 0xFF);
+
+        // res = 0u; k = 0u;
+        f.body.push(
+            Statement::Store {
+                pointer: res_ptr,
+                value: c0,
+            },
+            Span::UNDEFINED,
+        );
+        f.body.push(
+            Statement::Store {
+                pointer: k_ptr,
+                value: c0,
+            },
+            Span::UNDEFINED,
+        );
+
+        let mut loop_body = naga::Block::new();
+        let k_val = emit_in(&mut f, &mut loop_body, Expression::Load { pointer: k_ptr });
+        let done = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::GreaterEqual,
+                left: k_val,
+                right: c4,
+            },
+        );
+        let mut brk = naga::Block::new();
+        brk.push(Statement::Break, Span::UNDEFINED);
+        loop_body.push(
+            Statement::If {
+                condition: done,
+                accept: brk,
+                reject: naga::Block::new(),
+            },
+            Span::UNDEFINED,
+        );
+
+        let k_sh = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::Multiply,
+                left: k_val,
+                right: c8,
+            },
+        );
+        let s2_sh = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::ShiftRight,
+                left: s2,
+                right: k_sh,
+            },
+        );
+        let sel = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::And,
+                left: s2_sh,
+                right: mask_ff,
+            },
+        );
+
+        // 0..7: byte from s1 (0..3) or s0 (4..7)
+        let bit2 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::And,
+                left: sel,
+                right: c4,
+            },
+        );
+        let from_s0 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::NotEqual,
+                left: bit2,
+                right: c0,
+            },
+        );
+        let src_word = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Select {
+                condition: from_s0,
+                accept: s0,
+                reject: s1,
+            },
+        );
+        let lane = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::And,
+                left: sel,
+                right: c3,
+            },
+        );
+        let lane_sh = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::ShiftLeft,
+                left: lane,
+                right: c3,
+            },
+        );
+        let b_sh = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::ShiftRight,
+                left: src_word,
+                right: lane_sh,
+            },
+        );
+        let b_in = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::And,
+                left: b_sh,
+                right: mask_ff,
+            },
+        );
+
+        // 8..11: sign extension of s1[15], s1[31], s0[15], s0[31]
+        let sbit1 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::And,
+                left: sel,
+                right: c2,
+            },
+        );
+        let sign_from_s0 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::NotEqual,
+                left: sbit1,
+                right: c0,
+            },
+        );
+        let sign_word = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Select {
+                condition: sign_from_s0,
+                accept: s0,
+                reject: s1,
+            },
+        );
+        let sbit0 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::And,
+                left: sel,
+                right: c1,
+            },
+        );
+        let sign_hi = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::NotEqual,
+                left: sbit0,
+                right: c0,
+            },
+        );
+        let sign_pos = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Select {
+                condition: sign_hi,
+                accept: c31,
+                reject: c15,
+            },
+        );
+        let sign_sh = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::ShiftRight,
+                left: sign_word,
+                right: sign_pos,
+            },
+        );
+        let sign_lsb = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::And,
+                left: sign_sh,
+                right: c1,
+            },
+        );
+        let is_neg = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::NotEqual,
+                left: sign_lsb,
+                right: c0,
+            },
+        );
+        let b_sign = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Select {
+                condition: is_neg,
+                accept: mask_ff,
+                reject: c0,
+            },
+        );
+
+        // 12 -> 0x00, >=13 -> 0xFF
+        let is_12 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::Equal,
+                left: sel,
+                right: c12,
+            },
+        );
+        let b_const = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Select {
+                condition: is_12,
+                accept: c0,
+                reject: mask_ff,
+            },
+        );
+
+        let lt8 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::Less,
+                left: sel,
+                right: c8,
+            },
+        );
+        let lt12 = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::Less,
+                left: sel,
+                right: c12,
+            },
+        );
+        let b_hi = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Select {
+                condition: lt12,
+                accept: b_sign,
+                reject: b_const,
+            },
+        );
+        let byte_v = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Select {
+                condition: lt8,
+                accept: b_in,
+                reject: b_hi,
+            },
+        );
+        let placed = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::ShiftLeft,
+                left: byte_v,
+                right: k_sh,
+            },
+        );
+        let cur_res = emit_in(&mut f, &mut loop_body, Expression::Load { pointer: res_ptr });
+        let next_res = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::InclusiveOr,
+                left: cur_res,
+                right: placed,
+            },
+        );
+        loop_body.push(
+            Statement::Store {
+                pointer: res_ptr,
+                value: next_res,
+            },
+            Span::UNDEFINED,
+        );
+        let next_k = emit_in(
+            &mut f,
+            &mut loop_body,
+            Expression::Binary {
+                op: BinaryOperator::Add,
+                left: k_val,
+                right: c1,
+            },
+        );
+        loop_body.push(
+            Statement::Store {
+                pointer: k_ptr,
+                value: next_k,
+            },
+            Span::UNDEFINED,
+        );
+
+        f.body.push(
+            Statement::Loop {
+                body: loop_body,
+                continuing: naga::Block::new(),
+                break_if: None,
+            },
+            Span::UNDEFINED,
+        );
+
+        let final_res = f
+            .expressions
+            .append(Expression::Load { pointer: res_ptr }, Span::UNDEFINED);
+        f.body.push(
+            Statement::Emit(Range::new_from_bounds(final_res, final_res)),
+            Span::UNDEFINED,
+        );
+        f.body.push(
+            Statement::Return {
+                value: Some(final_res),
+            },
+            Span::UNDEFINED,
+        );
+
+        let h = self.module.functions.append(f, Span::UNDEFINED);
+        self.helper_perm_b32 = Some(h);
+        h
+    }
+
+    fn call_pg6_byte_perm(
+        &mut self,
+        s0: Handle<Expression>,
+        s1: Handle<Expression>,
+        s2: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let f = self.ensure_helper_perm_b32();
+        let res = self
+            .func
+            .expressions
+            .append(Expression::CallResult(f), Span::UNDEFINED);
+        self.func.body.push(
+            Statement::Call {
+                function: f,
+                arguments: vec![s0, s1, s2],
+                result: Some(res),
+            },
+            Span::UNDEFINED,
+        );
+        res
     }
 
     fn ensure_identity_helper(
@@ -13554,6 +14062,8 @@ impl IrEmitter {
             self.load_local(local)
         } else if reg == 124 {
             self.load_m0()
+        } else if reg == 126 {
+            self.load_exec()
         } else {
             self.lit_u32(0)
         }
@@ -14795,9 +15305,10 @@ impl IrEmitter {
                 target,
                 en,
                 compr,
+                done,
+                vm,
                 vsrc,
-                ..
-            } => self.translate_exp(*target, *en, *compr, *vsrc),
+            } => self.translate_exp(*target, *en, *compr, *done, *vm, *vsrc),
             Rdna2Detail::Flat {
                 seg,
                 op,
@@ -16070,11 +16581,7 @@ impl IrEmitter {
                 cbv_indexed_heap: None,
                 lane_indexed_heap: None,
             });
-        let Some(&(cb_global, cb_vec4_count)) = self
-            .cb_globals
-            .get(&cbv_key)
-            .or_else(|| self.cb_globals.values().next())
-        else {
+        let Some(&(cb_global, cb_vec4_count)) = self.cb_globals.get(&cbv_key) else {
             return false;
         };
         let total_dwords = cb_vec4_count.max(1).saturating_mul(4);
@@ -18749,8 +19256,9 @@ impl IrEmitter {
                 let Some(arg_idx) = self.frag_in_arg else {
                     return false;
                 };
-                let (attr, attrchan, _high) = decode_vop3_interp_attr(src0);
-                let clamped_attr = attr % MAX_WEBGPU_LOCATIONS;
+                let (attr, attrchan, high) = decode_vop3_interp_attr(src0);
+                let clamped_attr = attr % MAX_INTER_STAGE_LOCATIONS;
+                let chan = attrchan & 0x3;
                 let Some(&member_idx) = self.frag_attr_member_index.get(&clamped_attr) else {
                     return false;
                 };
@@ -18761,9 +19269,41 @@ impl IrEmitter {
                 });
                 let comp = self.emit_expr(Expression::AccessIndex {
                     base: attr_vec,
-                    index: u32::from(attrchan & 0x3),
+                    index: u32::from(chan),
                 });
-                let out = self.apply_float_out_mods(comp, omod, clamp);
+                let val = if high {
+                    let bits = self.bitcast_f32_to_u32(comp);
+                    let pair = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Unpack2x16float,
+                        arg: bits,
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    });
+                    self.emit_expr(Expression::AccessIndex {
+                        base: pair,
+                        index: 1,
+                    })
+                } else if self
+                    .frag_attr_f16_high_channels
+                    .contains(&(clamped_attr, chan))
+                {
+                    let bits = self.bitcast_f32_to_u32(comp);
+                    let pair = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Unpack2x16float,
+                        arg: bits,
+                        arg1: None,
+                        arg2: None,
+                        arg3: None,
+                    });
+                    self.emit_expr(Expression::AccessIndex {
+                        base: pair,
+                        index: 0,
+                    })
+                } else {
+                    comp
+                };
+                let out = self.apply_float_out_mods(val, omod, clamp);
                 if op == 0x35A {
                     if (op_sel & 0x8) != 0 {
                         self.store_vgpr_f16_hi(vdst, out);
@@ -18780,66 +19320,40 @@ impl IrEmitter {
                 let s0 = self.read_src_u32(src0, literal);
                 let s1 = self.read_src_u32(src1, literal);
                 let s2 = self.read_src_u32(src2, literal);
-                let mask_ff = self.lit_u32(0xFF);
-                let mask3 = self.lit_u32(3);
-                let c0 = self.lit_u32(0);
-                let c1 = self.lit_u32(1);
-                let c2 = self.lit_u32(2);
-                let c3 = self.lit_u32(3);
-                let c4 = self.lit_u32(4);
-                let c8 = self.lit_u32(8);
-                let c12 = self.lit_u32(12);
-                let c15 = self.lit_u32(15);
-                let c31 = self.lit_u32(31);
-                let mut res = c0;
-                for k in 0..4u32 {
-                    let k_sh = self.lit_u32(k * 8);
-                    let sel = if k == 0 {
-                        self.emit_bin(BinaryOperator::And, s2, mask_ff)
-                    } else {
-                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, s2, k_sh);
-                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
-                    };
-                    // 0..7: byte from s1 (0..3) or s0 (4..7)
-                    let bit2 = self.emit_bin(BinaryOperator::And, sel, c4);
-                    let from_s0 = self.emit_bin(BinaryOperator::NotEqual, bit2, c0);
-                    let src_word = self.emit_select(from_s0, s0, s1);
-                    let lane = self.emit_bin(BinaryOperator::And, sel, mask3);
-                    let lane_sh = self.emit_bin(BinaryOperator::ShiftLeft, lane, c3);
-                    let b_sh = self.emit_bin(BinaryOperator::ShiftRight, src_word, lane_sh);
-                    let b_in = self.emit_bin(BinaryOperator::And, b_sh, mask_ff);
-
-                    // 8..11: sign extension of s1[15], s1[31], s0[15], s0[31]
-                    let sbit1 = self.emit_bin(BinaryOperator::And, sel, c2);
-                    let sign_from_s0 = self.emit_bin(BinaryOperator::NotEqual, sbit1, c0);
-                    let sign_word = self.emit_select(sign_from_s0, s0, s1);
-                    let sbit0 = self.emit_bin(BinaryOperator::And, sel, c1);
-                    let sign_hi = self.emit_bin(BinaryOperator::NotEqual, sbit0, c0);
-                    let sign_pos = self.emit_select(sign_hi, c31, c15);
-                    let sign_sh = self.emit_bin(BinaryOperator::ShiftRight, sign_word, sign_pos);
-                    let sign_lsb = self.emit_bin(BinaryOperator::And, sign_sh, c1);
-                    let is_neg = self.emit_bin(BinaryOperator::NotEqual, sign_lsb, c0);
-                    let b_sign = self.emit_select(is_neg, mask_ff, c0);
-
-                    // 12 -> 0x00, >=13 -> 0xFF
-                    let is_12 = self.emit_bin(BinaryOperator::Equal, sel, c12);
-                    let b_const = self.emit_select(is_12, c0, mask_ff);
-
-                    let lt8 = self.emit_bin(BinaryOperator::Less, sel, c8);
-                    let lt12 = self.emit_bin(BinaryOperator::Less, sel, c12);
-                    let b_hi = self.emit_select(lt12, b_sign, b_const);
-                    let byte_v = self.emit_select(lt8, b_in, b_hi);
-                    let placed = if k == 0 {
-                        byte_v
-                    } else {
-                        self.emit_bin(BinaryOperator::ShiftLeft, byte_v, k_sh)
-                    };
-                    res = if k == 0 {
-                        placed
-                    } else {
-                        self.emit_bin(BinaryOperator::InclusiveOr, res, placed)
-                    };
-                }
+                let res = if let (
+                    Expression::Literal(Literal::U32(v0)),
+                    Expression::Literal(Literal::U32(v1)),
+                    Expression::Literal(Literal::U32(v2)),
+                ) = (
+                    &self.func.expressions[s0],
+                    &self.func.expressions[s1],
+                    &self.func.expressions[s2],
+                ) {
+                    let mut folded = 0u32;
+                    for k in 0..4u32 {
+                        let sel = (*v2 >> (k * 8)) & 0xFF;
+                        let byte_v = if sel < 8 {
+                            let src_word = if (sel & 4) != 0 { *v0 } else { *v1 };
+                            (src_word >> ((sel & 3) * 8)) & 0xFF
+                        } else if sel < 12 {
+                            let sign_word = if (sel & 2) != 0 { *v0 } else { *v1 };
+                            let sign_pos = if (sel & 1) != 0 { 31 } else { 15 };
+                            if ((sign_word >> sign_pos) & 1) != 0 {
+                                0xFF
+                            } else {
+                                0
+                            }
+                        } else if sel == 12 {
+                            0
+                        } else {
+                            0xFF
+                        };
+                        folded |= byte_v << (k * 8);
+                    }
+                    self.lit_u32(folded)
+                } else {
+                    self.call_pg6_byte_perm(s0, s1, s2)
+                };
                 self.store_vgpr_u32(vdst, res);
                 true
             }
@@ -19883,7 +20397,7 @@ impl IrEmitter {
         let Some(arg_idx) = self.frag_in_arg else {
             return false;
         };
-        let clamped_attr = attr % MAX_WEBGPU_LOCATIONS;
+        let clamped_attr = attr % MAX_INTER_STAGE_LOCATIONS;
         let Some(&member_idx) = self.frag_attr_member_index.get(&clamped_attr) else {
             return false;
         };
@@ -19966,11 +20480,7 @@ impl IrEmitter {
                     .copied()
                     .unwrap_or(ResourceKey::RawSlot(srsrc)),
             };
-            let Some(&(uav_tex_global, tex_dim)) = self
-                .storage_tex_globals
-                .get(&first_key)
-                .or_else(|| self.storage_tex_globals.values().next())
-            else {
+            let Some(&(uav_tex_global, tex_dim)) = self.storage_tex_globals.get(&first_key) else {
                 return false;
             };
             let ux = load_addr_f32(self, layout.uv_off, 0);
@@ -20111,22 +20621,19 @@ impl IrEmitter {
                     let selector = self.load_local(sel_local);
                     let mut cases = Vec::with_capacity(keys.len() + 1);
                     for (k, key) in keys.iter().enumerate() {
-                        let g = self
-                            .storage_tex_globals
-                            .get(key)
-                            .map(|&(g, _)| g)
-                            .unwrap_or(uav_tex_global);
-                        let img = self.raw_expr(Expression::GlobalVariable(g));
                         let mut case_body = naga::Block::new();
-                        case_body.push(
-                            Statement::ImageStore {
-                                image: img,
-                                coordinate: coord,
-                                array_index,
-                                value: val,
-                            },
-                            Span::UNDEFINED,
-                        );
+                        if let Some(&(g, _)) = self.storage_tex_globals.get(key) {
+                            let img = self.raw_expr(Expression::GlobalVariable(g));
+                            case_body.push(
+                                Statement::ImageStore {
+                                    image: img,
+                                    coordinate: coord,
+                                    array_index,
+                                    value: val,
+                                },
+                                Span::UNDEFINED,
+                            );
+                        }
                         cases.push(SwitchCase {
                             value: SwitchValue::U32(k as u32),
                             body: case_body,
@@ -20164,11 +20671,7 @@ impl IrEmitter {
             .get(&inst_idx)
             .copied()
             .unwrap_or(ResourceKey::RawSlot(srsrc));
-        let Some(&(tex_global, tex_dim, tex_is_depth)) = self
-            .tex_globals
-            .get(&key)
-            .or_else(|| self.tex_globals.values().next())
-        else {
+        let Some(&(tex_global, tex_dim, tex_is_depth)) = self.tex_globals.get(&key) else {
             return false;
         };
         let image = self.raw_expr(Expression::GlobalVariable(tex_global));
@@ -20253,11 +20756,7 @@ impl IrEmitter {
                 .get(&inst_idx)
                 .copied()
                 .unwrap_or(ResourceKey::RawSlot(ssamp));
-            let Some(&(samp_global, samp_is_cmp)) = self
-                .samp_globals
-                .get(&skey)
-                .or_else(|| self.samp_globals.values().next())
-            else {
+            let Some(&(samp_global, samp_is_cmp)) = self.samp_globals.get(&skey) else {
                 return false;
             };
             let sampler = self.raw_expr(Expression::GlobalVariable(samp_global));
@@ -20808,11 +21307,7 @@ impl IrEmitter {
                 .copied()
                 .unwrap_or(ResourceKey::RawSlot(srsrc)),
         };
-        let Some(&(buf_global, writable)) = self
-            .storage_buf_globals
-            .get(&key)
-            .or_else(|| self.storage_buf_globals.values().next())
-        else {
+        let Some(&(buf_global, writable)) = self.storage_buf_globals.get(&key) else {
             return false;
         };
         if buf_op.is_store() && !writable {
@@ -21464,74 +21959,52 @@ impl IrEmitter {
         default_w: f32,
     ) -> Handle<Expression> {
         if compr {
-            let lo_vec = if (en & 0b0011) != 0 {
+            // GFX10.3 compressed EXP (`compr = 1`): `en[0]` enables both R and G packed as fp16x2
+            // in `vsrc[0]`; `en[2]` enables both B and A packed as fp16x2 in `vsrc[1]`.
+            // `en[1]` and `en[3]` are ignored by hardware (standard RGBA export uses `en = 0x5`).
+            let (c0, c1) = if (en & 0b0001) != 0 {
                 let vf = self.load_vgpr_f32(vsrc[0]);
                 let vu = self.bitcast_f32_to_u32(vf);
-                self.emit_expr(Expression::Math {
+                let lo_vec = self.emit_expr(Expression::Math {
                     fun: MathFunction::Unpack2x16float,
                     arg: vu,
                     arg1: None,
                     arg2: None,
                     arg3: None,
-                })
+                });
+                let c0 = self.emit_expr(Expression::AccessIndex {
+                    base: lo_vec,
+                    index: 0,
+                });
+                let c1 = self.emit_expr(Expression::AccessIndex {
+                    base: lo_vec,
+                    index: 1,
+                });
+                (c0, c1)
             } else {
-                let z0 = self.lit_f32(0.0);
-                let z1 = self.lit_f32(0.0);
-                self.emit_expr(Expression::Compose {
-                    ty: self.types.vec2_f32_ty,
-                    components: vec![z0, z1],
-                })
+                (self.lit_f32(0.0), self.lit_f32(0.0))
             };
-            let hi_vec = if (en & 0b1100) != 0 {
+            let (c2, c3) = if (en & 0b0100) != 0 {
                 let vf = self.load_vgpr_f32(vsrc[1]);
                 let vu = self.bitcast_f32_to_u32(vf);
-                self.emit_expr(Expression::Math {
+                let hi_vec = self.emit_expr(Expression::Math {
                     fun: MathFunction::Unpack2x16float,
                     arg: vu,
                     arg1: None,
                     arg2: None,
                     arg3: None,
-                })
-            } else {
-                let z2 = self.lit_f32(0.0);
-                let w3 = self.lit_f32(default_w);
-                self.emit_expr(Expression::Compose {
-                    ty: self.types.vec2_f32_ty,
-                    components: vec![z2, w3],
-                })
-            };
-
-            let c0 = if (en & 0b0001) != 0 {
-                self.emit_expr(Expression::AccessIndex {
-                    base: lo_vec,
-                    index: 0,
-                })
-            } else {
-                self.lit_f32(0.0)
-            };
-            let c1 = if (en & 0b0010) != 0 {
-                self.emit_expr(Expression::AccessIndex {
-                    base: lo_vec,
-                    index: 1,
-                })
-            } else {
-                self.lit_f32(0.0)
-            };
-            let c2 = if (en & 0b0100) != 0 {
-                self.emit_expr(Expression::AccessIndex {
+                });
+                let c2 = self.emit_expr(Expression::AccessIndex {
                     base: hi_vec,
                     index: 0,
-                })
-            } else {
-                self.lit_f32(0.0)
-            };
-            let c3 = if (en & 0b1000) != 0 {
-                self.emit_expr(Expression::AccessIndex {
+                });
+                let c3 = self.emit_expr(Expression::AccessIndex {
                     base: hi_vec,
                     index: 1,
-                })
+                });
+                (c2, c3)
             } else {
-                self.lit_f32(default_w)
+                (self.lit_f32(0.0), self.lit_f32(default_w))
             };
             self.emit_expr(Expression::Compose {
                 ty: self.types.vec4_f32_ty,
@@ -21607,11 +22080,33 @@ impl IrEmitter {
         (local_idx, guard)
     }
 
+    /// Emit `if (exec_mask == 0u) { discard; }` in fragment shaders that track `exec_mask`,
+    /// marking subsequent control flow non-uniform per WGSL §16.4 so any later texture sample
+    /// avoids implicit derivatives.
+    fn emit_fragment_exec_discard(&mut self) {
+        if self.stage != ShaderStage::Fragment || self.exec_local.is_none() {
+            return;
+        }
+        let exec = self.load_exec();
+        let zero = self.lit_u32(0);
+        let killed = self.emit_bin(BinaryOperator::Equal, exec, zero);
+        let mut accept = naga::Block::new();
+        accept.push(Statement::Kill, Span::UNDEFINED);
+        self.push_stmt(Statement::If {
+            condition: killed,
+            accept,
+            reject: naga::Block::new(),
+        });
+        self.cf_nonuniform_return = true;
+    }
+
     fn translate_exp(
         &mut self,
         target: Rdna2ExportTarget,
         en: u8,
         compr: bool,
+        done: bool,
+        vm: bool,
         vsrc: [u8; 4],
     ) -> bool {
         if let (Some(layout), Some(ms_global)) = (self.mesh_output, self.mesh_out_global) {
@@ -21647,7 +22142,7 @@ impl IrEmitter {
                     true
                 }
                 Rdna2ExportTarget::Param(n) => {
-                    let attr_idx = u32::from(n % (MAX_MESH_ATTRIBUTES as u8));
+                    let attr_idx = u32::from(n % MAX_INTER_STAGE_LOCATIONS);
                     if attr_idx >= layout.attribute_count() {
                         return true;
                     }
@@ -21723,6 +22218,13 @@ impl IrEmitter {
             };
         }
         match (self.stage, target) {
+            (ShaderStage::Fragment, Rdna2ExportTarget::Null) => {
+                if vm {
+                    self.emit_fragment_exec_discard();
+                    self.ps_pending_vm_discard = false;
+                }
+                true
+            }
             (_, Rdna2ExportTarget::Null) => true,
             (ShaderStage::Vertex, Rdna2ExportTarget::Pos(0)) => {
                 let Some(out_local) = self.vs_out_local else {
@@ -21747,7 +22249,7 @@ impl IrEmitter {
                 let Some(out_local) = self.vs_out_local else {
                     return false;
                 };
-                let clamped = n % (MAX_WEBGPU_LOCATIONS - 1);
+                let clamped = n % MAX_INTER_STAGE_LOCATIONS;
                 let Some(&member_idx) = self.vs_param_member_index.get(&clamped) else {
                     return false;
                 };
@@ -21786,6 +22288,14 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
+                if vm || (done && self.ps_pending_vm_discard) {
+                    if done {
+                        self.emit_fragment_exec_discard();
+                        self.ps_pending_vm_discard = false;
+                    } else {
+                        self.ps_pending_vm_discard = true;
+                    }
+                }
                 true
             }
             (ShaderStage::Fragment, Rdna2ExportTarget::MrtZ) => {
@@ -21828,6 +22338,14 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
+                if vm || (done && self.ps_pending_vm_discard) {
+                    if done {
+                        self.emit_fragment_exec_discard();
+                        self.ps_pending_vm_discard = false;
+                    } else {
+                        self.ps_pending_vm_discard = true;
+                    }
+                }
                 true
             }
             _ => false,
@@ -22345,19 +22863,19 @@ impl IrEmitter {
     // -- Structured control flow (rdna2_cfg) --
 
     /// `true` while lowering code that WGSL uniformity analysis treats as non-uniform:
-    /// any nested structured body, or top-level code after a nested `return`.
+    /// any nested structured body, or code following a nested `return`, loop/dispatch exit,
+    /// or non-uniform conditional `discard`.
     fn in_nonuniform_cf(&self) -> bool {
-        self.structured_cf && (self.cf_depth > 0 || self.cf_nonuniform_return)
+        (self.structured_cf && self.cf_depth > 0) || self.cf_nonuniform_return
     }
 
     /// `true` when the current block already ends in a control transfer, so further
-    /// statements would be unreachable.
+    /// statements would be unreachable. Note: `Statement::Kill` (`discard;`) is NOT
+    /// function-terminating in WGSL — a non-void fragment entry point must still `return`.
     fn body_terminated(&self) -> bool {
         matches!(
             self.func.body.last(),
-            Some(
-                Statement::Return { .. } | Statement::Break | Statement::Continue | Statement::Kill
-            )
+            Some(Statement::Return { .. } | Statement::Break | Statement::Continue)
         )
     }
 
@@ -22366,8 +22884,12 @@ impl IrEmitter {
     }
 
     /// Emit the stage-correct `return` (`return out;` for vertex/fragment, `return;` for
-    /// compute).
+    /// compute), flushing any pending fragment `vm` export discard check beforehand.
     fn emit_stage_return(&mut self) {
+        if self.stage == ShaderStage::Fragment && self.ps_pending_vm_discard {
+            self.emit_fragment_exec_discard();
+            self.ps_pending_vm_discard = false;
+        }
         let out_local = match self.stage {
             ShaderStage::Vertex => self.vs_out_local,
             ShaderStage::Fragment => self.ps_out_local,
@@ -22383,9 +22905,11 @@ impl IrEmitter {
     /// Lower `f` into a fresh nested block (one structured nesting level deeper).
     fn lower_nested(&mut self, f: impl FnOnce(&mut Self)) -> naga::Block {
         let saved = std::mem::replace(&mut self.func.body, naga::Block::new());
+        let saved_pending_vm = self.ps_pending_vm_discard;
         self.cf_depth += 1;
         f(self);
         self.cf_depth -= 1;
+        self.ps_pending_vm_discard = saved_pending_vm;
         std::mem::replace(&mut self.func.body, saved)
     }
 
@@ -22723,25 +23247,29 @@ impl IrEmitter {
     }
 }
 
-/// Normalize line endings to LF (`\n`) and guarantee a trailing LF on non-empty WGSL text.
-fn normalize_wgsl_newlines(raw: &str) -> String {
+/// Semantic-preserving post-Naga WGSL whitespace compaction:
+/// - Normalizes `\r\n` / `\r` line endings to LF (`\n`).
+/// - Strips leading and trailing horizontal whitespace (`' '` / `'\t'`) on every line
+///   (removing Naga's 4-space-per-nesting-level indentation that accounts for ~40% of pack size).
+/// - Drops empty/blank lines while preserving all `//` comments, intra-line token spacing
+///   (`@group(0) @binding(N) var<...>`, `@compute @workgroup_size(...) fn`, etc.), and line
+///   boundaries so every downstream C++/JS/Python parser and Dawn/Tint/Naga parses identically.
+/// - Guarantees a single trailing LF on non-empty WGSL text.
+pub fn compact_wgsl_whitespace(raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
-    let mut out = String::with_capacity(raw.len() + 1);
-    let mut chars = raw.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        // Handle lone '\r' line breaks if any exist inside a chunk.
+        for sub in line.split('\r') {
+            let trimmed = sub.trim_matches(|c| c == ' ' || c == '\t');
+            if !trimmed.is_empty() {
+                out.push_str(trimmed);
+                out.push('\n');
             }
-            out.push('\n');
-        } else {
-            out.push(ch);
         }
-    }
-    if !out.ends_with('\n') {
-        out.push('\n');
     }
     out
 }
@@ -23448,8 +23976,9 @@ pub fn translate_rdna2_to_wgsl(
     raw_wgsl.push('\n');
     raw_wgsl.push_str(&wgsl_body);
 
-    // Normalize line endings to LF and enforce unconditional post-emit WGSL structural checks.
-    let wgsl = normalize_wgsl_newlines(&raw_wgsl);
+    // Compact post-Naga indentation/blank lines, normalize line endings to LF, and enforce
+    // unconditional post-emit WGSL structural checks.
+    let wgsl = compact_wgsl_whitespace(&raw_wgsl);
     validate_emitted_wgsl_structure(&wgsl, &entry_point)?;
 
     // When `naga/wgsl-in` is active (unit tests), additionally round-trip parse & validate the
@@ -30437,13 +30966,17 @@ mod tests {
 
     #[test]
     fn s60_lf_newline_normalization_and_post_emit_structural_validator() {
-        // LF newline normalization.
-        assert_eq!(normalize_wgsl_newlines(""), "");
+        // LF newline normalization & leading/blank-line compaction.
+        assert_eq!(compact_wgsl_whitespace(""), "");
         assert_eq!(
-            normalize_wgsl_newlines("line1\r\nline2\rline3"),
+            compact_wgsl_whitespace("line1\r\nline2\rline3"),
             "line1\nline2\nline3\n"
         );
-        assert_eq!(normalize_wgsl_newlines("already_lf\n"), "already_lf\n");
+        assert_eq!(compact_wgsl_whitespace("already_lf\n"), "already_lf\n");
+        assert_eq!(
+            compact_wgsl_whitespace("    fn f() {\r\n\r\n        return;\t  \n    }\n"),
+            "fn f() {\nreturn;\n}\n"
+        );
 
         // Positive structural case: nested comments & function-scope `let` are allowed.
         let good = "// let ignored_in_line_comment = 1;\n\

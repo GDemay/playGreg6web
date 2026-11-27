@@ -3345,12 +3345,12 @@ fn decode_exp(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let mut operands = target.name();
     if !truncated {
         if compr {
-            let s0 = if (en & 0b0011) != 0 {
+            let s0 = if (en & 0b0001) != 0 {
                 format!("v{}", vsrc[0])
             } else {
                 "off".to_string()
             };
-            let s1 = if (en & 0b1100) != 0 {
+            let s1 = if (en & 0b0100) != 0 {
                 format!("v{}", vsrc[1])
             } else {
                 "off".to_string()
@@ -4273,10 +4273,10 @@ pub fn analyze_instructions(
                 }
                 if !inst.truncated {
                     if *compr {
-                        if (*en & 0b0011) != 0 {
+                        if (*en & 0b0001) != 0 {
                             record_vgpr(&mut max_vgpr, vsrc[0]);
                         }
-                        if (*en & 0b1100) != 0 {
+                        if (*en & 0b0100) != 0 {
                             record_vgpr(&mut max_vgpr, vsrc[1]);
                         }
                     } else {

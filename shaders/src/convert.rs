@@ -372,24 +372,10 @@ pub fn audit_spirv_file(
     }
 }
 
-/// Normalize emitted WGSL line endings to `\n` for deterministic cross-platform byte output.
+/// Normalize emitted WGSL line endings to `\n`, strip Naga's leading/trailing horizontal
+/// indentation, and drop blank lines while preserving intra-line spacing and comments.
 fn normalize_wgsl_newlines(wgsl: String) -> String {
-    if !wgsl.contains('\r') {
-        return wgsl;
-    }
-    let mut out = String::with_capacity(wgsl.len());
-    let mut chars = wgsl.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                let _ = chars.next();
-            }
-            out.push('\n');
-        } else {
-            out.push(ch);
-        }
-    }
-    out
+    crate::rdna2_to_wgsl::compact_wgsl_whitespace(&wgsl)
 }
 
 /// Validate that emitted WGSL is non-empty, lexically well-formed (balanced braces and closed
