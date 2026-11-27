@@ -7,6 +7,9 @@ on:
         default: '52918dfa4d41e9f316990b06b713219dd9135aac'
       patch_ref:
         required: true
+      profile:
+        type: boolean
+        default: false
 permissions:
   contents: read
 jobs:
@@ -36,6 +39,10 @@ jobs:
             target_link_libraries(bench_fragmented_buffer_flush PRIVATE playgta6_core)
           endif()
           CMAKE
+          if [ '${{ inputs.profile }}' = 'true' ]; then
+            python3 runner/tools/instrument_fragmented_flush.py baseline
+            python3 runner/tools/instrument_fragmented_flush.py patch
+          fi
           python3 runner/tools/perf_run_fragmented_flush.py --environment-only --output results/environment.json --base "${{ inputs.base_ref }}" --patch "${{ inputs.patch_ref }}"
       - name: Separate Release builds and exact focused tests
         run: |
@@ -48,7 +55,11 @@ jobs:
           ctest --test-dir patch-build -R fragmented_buffer --output-on-failure
       - name: Alternating pairs without builds
         run: |
-          python3 runner/tools/perf_run_fragmented_flush.py --baseline baseline-build/bench_fragmented_buffer_flush --candidate patch-build/bench_fragmented_buffer_flush --output results/fragmented-flush.json
+          if [ '${{ inputs.profile }}' = 'true' ]; then
+            python3 runner/tools/perf_profile_fragmented_flush.py baseline-build/bench_fragmented_buffer_flush patch-build/bench_fragmented_buffer_flush --output results/fragmented-profile.json
+          else
+            python3 runner/tools/perf_run_fragmented_flush.py --baseline baseline-build/bench_fragmented_buffer_flush --candidate patch-build/bench_fragmented_buffer_flush --output results/fragmented-flush.json
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
