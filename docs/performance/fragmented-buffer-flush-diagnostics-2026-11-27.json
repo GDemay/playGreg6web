@@ -1,0 +1,155 @@
+{
+  "kind": "Rejected candidate controls and temporary phase attribution; not final performance claims",
+  "reason": "An early candidate bitmap allocation changed heap behavior. Destruction-order restoration alone failed. Allocation-free eligibility now retains original bulk ordering above half marked bytes.",
+  "runs": [
+    {
+      "run_url": "https://github.com/GDemay/playGreg6web/actions/runs/46066140217",
+      "selection": "Every sample of the material rejected 8 MiB control; remaining full matrix retained in the linked run and campaign working evidence.",
+      "environment": {
+        "os": "Linux-7.0.0-1020-azure-x86_64-with-glibc2.43",
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "logical_cpus": 4,
+        "memory_bytes": 16759431168,
+        "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+        "cmake": "cmake version 4.5.1",
+        "flags": "Release; PLAYGTA6_OPUS=OFF; PLAYGTA6_PERFORMANCE_BENCHMARKS=ON; -j4 builds only",
+        "baseline": "52918dfa4d41e9f316990b06b713219dd9135aac",
+        "patch": "ce461e8c10448ec36effc24f04cdba30bc8dd3d0"
+      },
+      "samples": [
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":13.029155,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"baseline","pair":0},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":29.746732,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"patch","pair":0},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":29.144558,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"patch","pair":1},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":14.091635,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"baseline","pair":1},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":14.048491,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"baseline","pair":2},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":29.434423,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"patch","pair":2},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":30.623149,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"patch","pair":3},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":13.538543,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"baseline","pair":3},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":12.958571,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"baseline","pair":4},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":30.494139,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"patch","pair":4},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":32.485403,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"patch","pair":5},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":13.855878,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"baseline","pair":5},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":13.207876,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"baseline","pair":6},
+        {"bytes":8388608,"flushes":4,"mapping":"fragmented-dense-resident","wall_ms":29.890863,"compared_bytes":33554432,"digest":"32a7aee86c46a125","correct":true,"implementation":"patch","pair":6}
+      ],
+      "summary": [
+        {"mib":8,"frames":4,"mode":"fragmented-dense-resident","baseline":{"median_ms_per_flush":3.38463575,"min_ms_per_flush":3.23964275,"max_ms_per_flush":3.52290875},"patch":{"median_ms_per_flush":7.47271575,"min_ms_per_flush":7.2861395,"max_ms_per_flush":8.12135075}}
+      ]
+    },
+    {
+      "run_url": "https://github.com/GDemay/playGreg6web/actions/runs/46067743629",
+      "selection": "Every sample of the material rejected 8 MiB control; remaining full matrix retained in the linked run and campaign working evidence.",
+      "environment": {
+        "os": "Linux-7.0.0-1020-azure-x86_64-with-glibc2.43",
+        "cpu": "AMD EPYC 9V74 80-Core Processor",
+        "logical_cpus": 4,
+        "memory_bytes": 16759435264,
+        "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+        "cmake": "cmake version 4.5.0",
+        "flags": "Release; PLAYGTA6_OPUS=OFF; PLAYGTA6_PERFORMANCE_BENCHMARKS=ON; -j4 builds only",
+        "baseline": "52918dfa4d41e9f316990b06b713219dd9135aac",
+        "patch": "99589c9071209f603e7dff6a2c55ab4b3876adbb"
+      },
+      "samples": [
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":23.267568,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"baseline","pair":0},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":64.382926,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"patch","pair":0},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":65.237226,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"patch","pair":1},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":23.982096,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"baseline","pair":1},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":22.294271,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"baseline","pair":2},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":62.360604,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"patch","pair":2},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":63.988487,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"patch","pair":3},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":23.108636,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"baseline","pair":3},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":22.436361,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"baseline","pair":4},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":66.042717,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"patch","pair":4},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":66.073191,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"patch","pair":5},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":23.520109,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"baseline","pair":5},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":21.751575,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"baseline","pair":6},
+        {"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":61.613664,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true,"implementation":"patch","pair":6}
+      ],
+      "summary": [
+        {"mib":8,"frames":8,"mode":"fragmented-dense-resident","baseline":{"median_ms_per_flush":2.8885795,"min_ms_per_flush":2.718946875,"max_ms_per_flush":2.997762},"patch":{"median_ms_per_flush":8.04786575,"min_ms_per_flush":7.701708,"max_ms_per_flush":8.259148875}}
+      ]
+    },
+    {
+      "run_url": "https://github.com/GDemay/playGreg6web/actions/runs/46069150121",
+      "selection": "Every sample of the material rejected 8 MiB control; remaining full matrix retained in the linked run and campaign working evidence.",
+      "environment": {
+        "os": "Linux-7.0.0-1020-azure-x86_64-with-glibc2.43",
+        "cpu": "AMD EPYC 9V45 96-Core Processor",
+        "logical_cpus": 4,
+        "memory_bytes": 16759427072,
+        "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+        "cmake": "cmake version 4.5.1",
+        "flags": "Release; PLAYGTA6_OPUS=OFF; PLAYGTA6_PERFORMANCE_BENCHMARKS=ON; -j4 builds only",
+        "baseline": "52918dfa4d41e9f316990b06b713219dd9135aac",
+        "patch": "a18756449d503333705a168e37d48a4c5853630a"
+      },
+      "samples": [
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":10.512702,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"baseline","pair":0},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":11.445032,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"patch","pair":0},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":11.231107,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"patch","pair":1},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":9.963023,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"baseline","pair":1},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":11.340513,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"baseline","pair":2},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":12.960569,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"patch","pair":2},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":12.951696,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"patch","pair":3},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":10.521925,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"baseline","pair":3},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":10.040629,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"baseline","pair":4},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":11.20613,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"patch","pair":4},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":11.337188,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"patch","pair":5},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":10.148192,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"baseline","pair":5},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":9.949221,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"baseline","pair":6},
+        {"bytes":8388608,"written_bytes_per_flush":8323072,"flushes":4,"mapping":"fragmented-nearly-dense","wall_ms":11.892817,"compared_bytes":33292288,"digest":"f81786537f3a7165","correct":true,"implementation":"patch","pair":6}
+      ],
+      "summary": [
+        {"mib":8,"frames":4,"mode":"fragmented-nearly-dense","baseline":{"median_ms_per_flush":2.537048,"min_ms_per_flush":2.48730525,"max_ms_per_flush":2.83512825},"patch":{"median_ms_per_flush":2.861258,"min_ms_per_flush":2.8015325,"max_ms_per_flush":3.24014225}}
+      ]
+    },
+    {
+      "run_url": "https://github.com/GDemay/playGreg6web/actions/runs/46067099362",
+      "environment": {
+        "os": "Linux-7.0.0-1018-aws-x86_64-with-glibc2.43",
+        "cpu": "Intel(R) Xeon(R) 6975P-C",
+        "logical_cpus": 4,
+        "memory_bytes": 16463388672,
+        "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+        "cmake": "cmake version 4.5.1",
+        "flags": "Release; PLAYGTA6_OPUS=OFF; PLAYGTA6_PERFORMANCE_BENCHMARKS=ON; -j4 builds only",
+        "baseline": "52918dfa4d41e9f316990b06b713219dd9135aac",
+        "patch": "ce461e8c10448ec36effc24f04cdba30bc8dd3d0"
+      },
+      "profile": {
+        "diagnosticOnly": true,
+        "phaseIndices": [
+          "mark_prepare",
+          "staging_alloc_zero",
+          "full_shadow_restore",
+          "guest_read",
+          "compare_emit",
+          "resource_total",
+          "sparse_restore_plus_guest_read"
+        ],
+        "note": "phase6 includes phase3; total includes phases. Temporary instrumentation excluded from final performance evidence. Counters cover measured invocations after initial warm flush. Minor faults include untimed verification between flushes.",
+        "samples": [
+          {"implementation":"baseline","pair":0,"result":{"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":26.695485,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true},"profile":{"flushes":8,"sparse":0,"bulk":8,"candidates":16384,"ns":[36874,5065164,4922398,4705926,11711515,26463540,0],"calls":[8,8,8,8,8,8,0],"minor_faults":4100}},
+          {"implementation":"patch","pair":0,"result":{"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":51.573796,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true},"profile":{"flushes":8,"sparse":0,"bulk":8,"candidates":16384,"ns":[30421,17757620,4768723,4761178,23991879,51343844,0],"calls":[8,8,8,8,8,8,0],"minor_faults":32569}},
+          {"implementation":"patch","pair":1,"result":{"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":50.747614,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true},"profile":{"flushes":8,"sparse":0,"bulk":8,"candidates":16384,"ns":[46496,17517687,4790167,4767110,23347155,50518058,0],"calls":[8,8,8,8,8,8,0],"minor_faults":32569}},
+          {"implementation":"baseline","pair":1,"result":{"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":25.560503,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true},"profile":{"flushes":8,"sparse":0,"bulk":8,"candidates":16384,"ns":[33117,4681102,4862035,4825358,10915657,25337111,0],"calls":[8,8,8,8,8,8,0],"minor_faults":4100}},
+          {"implementation":"baseline","pair":2,"result":{"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":25.36632,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true},"profile":{"flushes":8,"sparse":0,"bulk":8,"candidates":16384,"ns":[33336,4706964,4758206,4616455,10980168,25115238,0],"calls":[8,8,8,8,8,8,0],"minor_faults":4100}},
+          {"implementation":"patch","pair":2,"result":{"bytes":8388608,"flushes":8,"mapping":"fragmented-dense-resident","wall_ms":50.333847,"compared_bytes":67108864,"digest":"e6538bb2dc531f25","correct":true},"profile":{"flushes":8,"sparse":0,"bulk":8,"candidates":16384,"ns":[26106,17275999,4788167,4530334,23482690,50134377,0],"calls":[8,8,8,8,8,8,0],"minor_faults":32569}},
+          {"implementation":"baseline","pair":0,"result":{"bytes":67108864,"flushes":16,"mapping":"fragmented","wall_ms":386.379957,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":16,"candidates":256,"ns":[40006,284635273,257064,75959662,327468,385765382,0],"calls":[16,16,16,16,16,16,0],"minor_faults":262177}},
+          {"implementation":"patch","pair":0,"result":{"bytes":67108864,"flushes":16,"mapping":"fragmented","wall_ms":1.367952,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":16,"bulk":0,"candidates":256,"ns":[10644,32284,0,73189,224365,1055489,356905],"calls":[16,16,0,256,16,16,256],"minor_faults":304}},
+          {"implementation":"patch","pair":1,"result":{"bytes":67108864,"flushes":16,"mapping":"fragmented","wall_ms":1.312859,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":16,"bulk":0,"candidates":256,"ns":[10120,47755,0,81268,215640,1023928,328374],"calls":[16,16,0,256,16,16,256],"minor_faults":304}},
+          {"implementation":"baseline","pair":1,"result":{"bytes":67108864,"flushes":16,"mapping":"fragmented","wall_ms":383.863495,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":16,"candidates":256,"ns":[36128,281224483,255856,77119179,311692,383194951,0],"calls":[16,16,16,16,16,16,0],"minor_faults":262177}},
+          {"implementation":"baseline","pair":2,"result":{"bytes":67108864,"flushes":16,"mapping":"fragmented","wall_ms":383.188029,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":16,"candidates":256,"ns":[39270,279228964,258289,76795197,318004,382493443,0],"calls":[16,16,16,16,16,16,0],"minor_faults":262177}},
+          {"implementation":"patch","pair":2,"result":{"bytes":67108864,"flushes":16,"mapping":"fragmented","wall_ms":1.330716,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":16,"bulk":0,"candidates":256,"ns":[10824,29588,0,87401,233905,1044452,335094],"calls":[16,16,0,256,16,16,256],"minor_faults":304}},
+          {"implementation":"baseline","pair":0,"result":{"bytes":8388608,"flushes":16,"mapping":"contiguous","wall_ms":0.486979,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":0,"candidates":256,"ns":[4286,0,0,0,142583,175869,0],"calls":[16,0,0,0,16,16,0],"minor_faults":19}},
+          {"implementation":"patch","pair":0,"result":{"bytes":8388608,"flushes":16,"mapping":"contiguous","wall_ms":0.456503,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":0,"candidates":256,"ns":[3875,0,0,0,93959,127199,0],"calls":[16,0,0,0,16,16,0],"minor_faults":19}},
+          {"implementation":"patch","pair":1,"result":{"bytes":8388608,"flushes":16,"mapping":"contiguous","wall_ms":0.431391,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":0,"candidates":256,"ns":[3942,0,0,0,94251,127178,0],"calls":[16,0,0,0,16,16,0],"minor_faults":19}},
+          {"implementation":"baseline","pair":1,"result":{"bytes":8388608,"flushes":16,"mapping":"contiguous","wall_ms":0.444185,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":0,"candidates":256,"ns":[3895,0,0,0,92212,125991,0],"calls":[16,0,0,0,16,16,0],"minor_faults":19}},
+          {"implementation":"baseline","pair":2,"result":{"bytes":8388608,"flushes":16,"mapping":"contiguous","wall_ms":0.717443,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":0,"candidates":256,"ns":[5967,0,0,0,129279,176608,0],"calls":[16,0,0,0,16,16,0],"minor_faults":19}},
+          {"implementation":"patch","pair":2,"result":{"bytes":8388608,"flushes":16,"mapping":"contiguous","wall_ms":0.456618,"compared_bytes":1048576,"digest":"315dbdbe561c7635","correct":true},"profile":{"flushes":16,"sparse":0,"bulk":0,"candidates":256,"ns":[3931,0,0,0,95250,128354,0],"calls":[16,0,0,0,16,16,0],"minor_faults":19}}
+        ]
+      }
+    }
+  ]
+}
