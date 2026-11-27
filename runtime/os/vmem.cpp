@@ -175,8 +175,17 @@ void take_written_pages_ranges(const std::vector<std::pair<uintptr_t, uintptr_t>
     if (cursor->watch_epoch == ~uint64_t{0}) {
         watch_epoch = ~uint64_t{0};  // the consumed-only form stays so
     }
+    // The ranges a WriteBatch already collected are served in one pass; the rest one take each.
+    std::vector<uint8_t> batched;
+    if (cursor->watch_epoch != ~uint64_t{0} && !cursor->peek_watch) {
+        backing::take_precollected_pages(ranges, cursor->watch_epoch, &batched, pages);
+    }
     std::vector<uint64_t> offsets;
     for (size_t i = 0; i < ranges.size(); ++i) {
+        if (!batched.empty() && batched[i] != 0) {
+            (*ok)[i] = 1;
+            continue;
+        }
         const auto& [lo, hi] = ranges[i];
         uint64_t vc = cursor->view_clock;
         uint64_t ep = cursor->watch_epoch;
