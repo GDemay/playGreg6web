@@ -68,21 +68,21 @@
 //     Close, Compare, GetMaxUsers, AddAsync, AddResult, GetLocalId, FindUserByLocalId, GetId,
 //     FindUserById, ...); the executable keeps {handle, s11 XUID, s9 8-byte value} per user and
 //     rebuilds that record from the value through s10 (value, &handle), i.e. FindUserByLocalId.
-//     s3 DuplicateHandle(2) h. Stubs: s5 Compare, s10 FindUserByLocalId, s12 FindUserById,
-//     s25 GetTokenAndSignatureResult. s13 GetIsGuest(2) h: the executable passes a one-byte
+//     s3 DuplicateHandle(2) h. s5 Compare, s10 FindUserByLocalId, s12 FindUserById, s14 GetState:
+//     the single local offline user (owner decision 2026-11-27). Stub: s25 GetTokenAndSignatureResult. s13 GetIsGuest(2) h: the executable passes a one-byte
 //     local and stores it as a flag (header order: FindUserById, GetIsGuest, ...); the local
 //     offline user is not a guest. s19 GetAgeGroup(2) h (a 4-byte result the caller keeps only
-//     when 1..3): the configured age group (--user-age-group, default Unknown); s14 is
-//     unidentified.
+//     when 1..3): the configured age group (--user-age-group, default Unknown).
 //   {01acd177-...}/{cef4fac0-...} XUser extension: s3 XUserGetGamertag(5) m.
 //   {8836fe87-...} s3 XGameRuntimeIsFeatureAvailable(1)->bool h.
 //   {e349bd1a-...}/{1861cf2e-...} XSystem: s3 GetConsoleId(3) h, s4 GetXboxLiveSandboxId(3) h
-//     (the configured console sandbox; none: E_NOTIMPL), s5 GetAppSpecificDeviceId stub. XSystemGetDeviceType /
+//     (the configured console sandbox; none: E_NOTIMPL), s5 GetAppSpecificDeviceId E_NOTIMPL (owner decision). XSystemGetDeviceType /
 //     GetAnalyticsInfo are never called.
 //   {973a344e-...}/{2549f142-...} XGame: s3 XGameGetXboxTitleId(1) h, s4 XLaunchNewGame(3) h (self: relaunch
 //     via kRelaunchSelfExitCode; another title: E_NOTIMPL).
-//   {0dd112ac-...}/{b09d803c-...} XStore: s3 CreateContext h, s4 CloseContextHandle h; the
-//     other 40 used slots stay stubs (O8 offline policy: nothing about licences is invented).
+//   {0dd112ac-...}/{b09d803c-...} XStore: s3 CreateContext h, s4 CloseContextHandle h, s28/s65 truthful
+//     offline failures (owner decision 2026-11-27); the other used slots stay trapping stubs (O8 offline
+//     policy: nothing about licences is invented).
 //   {0dd112ac-...}/{2d42fea5-...} XStore extension: s71 AcquireLicenseForDurablesAsync, s72
 //     AcquireLicenseForDurablesResult (O37: truthful synchronous E_NOTIMPL, claiming zero
 //     ownership/entitlement; all other slots stay trapping stubs).
@@ -179,7 +179,6 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         return counts_.size();
     }
-
 private:
     mutable std::mutex mutex_;
     std::unordered_map<const void*, uint64_t> counts_;
@@ -907,6 +906,46 @@ public:
         return S_OK_HR;
     }
 
+    // Owner decision 2026-11-27 (docs/HARD_STOPS.md 7.2): XUserCompare, XUserFindUserByLocalId,
+    // XUserFindUserById and XUserGetState answer for the single local offline user only. They claim
+    // a local session, never a token or online access (slots 23/24 keep failing offline).
+
+    // s5 XUserCompare(user1, user2) -> int: 0 when both handles refer to the same local user
+    // (compared by XUID, so duplicate handles match), non-zero otherwise or for an invalid handle.
+    int32_t Compare(uint64_t user1, uint64_t user2) {
+        if (!check_handle(users(), user1, "XUserHandle") || !check_handle(users(), user2, "XUserHandle")) {
+            return -1;
+        }
+        uint64_t a = 0;
+        uint64_t b = 0;
+        if (pg6_gdk_xuser_get_id(from_guest<Pg6XUser>(user1), &a) < 0 ||
+            pg6_gdk_xuser_get_id(from_guest<Pg6XUser>(user2), &b) < 0) {
+            return -1;
+        }
+        return a == b ? 0 : (a < b ? -1 : 1);
+    }
+
+    // s10 XUserFindUserByLocalId(XUserLocalId, XUserHandle*) / s12 XUserFindUserById(xuid,
+    // XUserHandle*): a new handle when the id is our local user's and that user has been added
+    // (a handle is open); otherwise E_GAMEUSER_USER_NOT_FOUND and a null handle.
+    int32_t FindUserByLocalId(uint64_t local_id, OutPtr handle) {
+        return find_local_user(local_id == kOfflineUserLocalId, handle);
+    }
+    int32_t FindUserById(uint64_t xuid, OutPtr handle) {
+        return find_local_user(xuid == kOfflineUserXuid, handle);
+    }
+
+    // s14 XUserGetState(user, XUserState*): SignedIn (0) for a handle to the local offline user;
+    // an invalid handle is E_INVALIDARG and leaves the state untouched.
+    int32_t GetState(uint64_t user, GuestPtr<uint32_t> state) {
+        if (!check_handle(users(), user, "XUserHandle") || state.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        constexpr uint32_t kXUserStateSignedIn = 0;
+        state.write(kXUserStateSignedIn);
+        return S_OK_HR;
+    }
+
     // s9 XUserGetLocalId(user, XUserLocalId* localId): the local (per-console) identifier of the
     // runtime's one local user: stable for the user's lifetime, non-zero, distinct from the XUID.
     // It claims nothing about sign-in, privileges or ownership.
@@ -1037,6 +1076,27 @@ public:
         auto& tokens = user_change_tokens();
         std::lock_guard<std::mutex> lock(tokens.mutex);
         return tokens.active.erase(token) != 0;
+    }
+
+private:
+    // E_GAMEUSER_USER_NOT_FOUND (public XGameErr.h).
+    static constexpr int32_t kUserNotFound = static_cast<int32_t>(0x89245104u);
+
+    int32_t find_local_user(bool id_matches, OutPtr handle) {
+        if (handle.is_null() || !handle.write(0)) {
+            return E_INVALIDARG_HR;
+        }
+        if (!id_matches || users().size() == 0) {
+            return kUserNotFound;
+        }
+        Pg6XUserHandle found = nullptr;
+        const int32_t hr = gdk::XUserOpenLocalUser(&found);
+        if (hr < 0 || found == nullptr) {
+            return hr < 0 ? hr : E_INVALIDARG_HR;
+        }
+        users().add(found);
+        handle.write(to_guest(found));
+        return S_OK_HR;
     }
 };
 
@@ -1182,8 +1242,18 @@ public:
         return com::write_guest(buffer, sandbox.c_str(), static_cast<size_t>(needed)) ? S_OK_HR : E_INVALIDARG_HR;
     }
 
+    // s5 XSystemGetAppSpecificDeviceId(size, buffer, used). Owner decision 2026-11-27 (docs/HARD_STOPS.md
+    // 7.1, option A): no device identity is claimed. E_NOTIMPL, and no argument is written.
+    int32_t GetAppSpecificDeviceId() {
+        if (!device_id_logged_.exchange(true)) {
+            os::log("xgameruntime: XSystemGetAppSpecificDeviceId: no device identity; returning E_NOTIMPL");
+        }
+        return com::E_NOTIMPL_HR;
+    }
+
 private:
     std::atomic<bool> sandbox_logged_{false};
+    std::atomic<bool> device_id_logged_{false};
 };
 
 std::atomic<uint32_t> g_title_id{0};
@@ -1253,6 +1323,33 @@ public:
             pg6_gdk_xstore_close_context_handle(from_guest<Pg6XStoreContext>(context));
         }
     }
+
+    // Owner decision 2026-11-27 (docs/HARD_STOPS.md 7.3, option A, truthful offline). Neither slot
+    // touches an argument, queues a completion or hands out a licence; every other XStore slot keeps
+    // trapping as a tripwire (a hit there means something claimed a success).
+    // s28 XStoreQueryGameLicenseAsync(context, XAsyncBlock*): synchronous
+    // HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE); the title then runs as the full game.
+    int32_t QueryGameLicenseAsync() {
+        if (!game_license_logged_.exchange(true)) {
+            os::log("xgameruntime: XStoreQueryGameLicenseAsync: offline mode (no store); "
+                    "returning HRESULT_FROM_WIN32(ERROR_NETWORK_UNREACHABLE)");
+        }
+        return static_cast<int32_t>(0x800704CFu);
+    }
+
+    // s65 XStoreQueryPackageIdentifier(storeId, size, packageIdentifier): HRESULT_FROM_WIN32(
+    // ERROR_NOT_FOUND); the title marks the add-on unavailable.
+    int32_t QueryPackageIdentifier() {
+        if (!package_id_logged_.exchange(true)) {
+            os::log("xgameruntime: XStoreQueryPackageIdentifier: offline mode (no store); "
+                    "returning HRESULT_FROM_WIN32(ERROR_NOT_FOUND)");
+        }
+        return static_cast<int32_t>(0x80070490u);
+    }
+
+private:
+    std::atomic<bool> game_license_logged_{false};
+    std::atomic<bool> package_id_logged_{false};
 };
 
 // {0dd112ac-...}/{2d42fea5-...}: XStore extension (O37: offline-truthful synchronous failure on
@@ -2951,15 +3048,15 @@ using US = M<UserApi>;
 constexpr auto kUserTable = slot_table<32>({
     {3, US::method<&UserApi::DuplicateHandle>("XUserDuplicateHandle")},
     {4, US::method<&UserApi::CloseHandle>("XUserCloseHandle")},
-    {5, US::stub("XUserCompare")},
+    {5, US::method<&UserApi::Compare>("XUserCompare")},
     {7, US::method<&UserApi::AddAsync>("XUserAddAsync")},
     {8, US::method<&UserApi::AddResult>("XUserAddResult")},
     {9, US::method<&UserApi::GetLocalId>("XUserGetLocalId")},
-    {10, US::stub("XUserFindUserByLocalId")},
+    {10, US::method<&UserApi::FindUserByLocalId>("XUserFindUserByLocalId")},
     {11, US::method<&UserApi::GetId>("XUserGetId")},
-    {12, US::stub("XUserFindUserById")},
+    {12, US::method<&UserApi::FindUserById>("XUserFindUserById")},
     {13, US::method<&UserApi::GetIsGuest>("XUserGetIsGuest")},
-    {14, US::stub("XUser slot 14 (unidentified)")},
+    {14, US::method<&UserApi::GetState>("XUserGetState")},
     {19, US::method<&UserApi::GetAgeGroup>("XUserGetAgeGroup")},
     {20, US::method<&UserApi::CheckPrivilege>("XUserCheckPrivilege")},
     {21, US::method<&UserApi::ResolvePrivilegeWithUiAsync>("XUserResolvePrivilegeWithUiAsync")},
@@ -2988,7 +3085,7 @@ using SY = M<SystemApi>;
 constexpr com::MethodDesc kSystemMethods[] = {
     SY::method<&SystemApi::GetConsoleId>("XSystemGetConsoleId"),
     SY::method<&SystemApi::GetXboxLiveSandboxId>("XSystemGetXboxLiveSandboxId"),
-    SY::stub("XSystemGetAppSpecificDeviceId"),
+    SY::method<&SystemApi::GetAppSpecificDeviceId>("XSystemGetAppSpecificDeviceId"),
 };
 constexpr auto kISystem =
     com::declare_interface<SystemApi>("xgameruntime.XSystem", kSystemIid, kSystemMethods, {.slot_count = 24});
@@ -3005,6 +3102,8 @@ using ST = M<StoreApi>;
 constexpr auto kStoreTable = slot_table<67>({
     {3, ST::method<&StoreApi::CreateContext>("XStoreCreateContext")},
     {4, ST::method<&StoreApi::CloseContextHandle>("XStoreCloseContextHandle")},
+    {28, ST::method<&StoreApi::QueryGameLicenseAsync>("XStoreQueryGameLicenseAsync")},
+    {65, ST::method<&StoreApi::QueryPackageIdentifier>("XStoreQueryPackageIdentifier")},
     {66, ST::stub("XStoreRegisterGameLicenseChanged")},
     {67, ST::stub("XStoreUnregisterGameLicenseChanged")},
     {68, ST::stub("XStoreRegisterPackageLicenseLost")},

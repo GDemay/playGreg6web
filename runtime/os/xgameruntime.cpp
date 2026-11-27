@@ -472,6 +472,14 @@ HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated) {
     return S_OK_HR;
 }
 
+HResult XUserOpenLocalUser(XUserHandle* user) {
+    if (user == nullptr) {
+        return E_INVALIDARG_HR;
+    }
+    *user = new Pg6XUser();
+    return S_OK_HR;
+}
+
 size_t open_xtask_queue_count() {
     return g_open_task_queues.load(std::memory_order_relaxed);
 }

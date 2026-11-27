@@ -192,6 +192,8 @@ HResult XUserGetGamertag(XUserHandle user,
 void XUserCloseHandle(XUserHandle user);
 // A second, independently closed handle to the same (local) user.
 HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated);
+// A new handle to the runtime's single local offline user (what a find by its local id / XUID yields).
+HResult XUserOpenLocalUser(XUserHandle* user);
 
 // Diagnostics / leak accounting (live host handle allocations).
 size_t open_xtask_queue_count();

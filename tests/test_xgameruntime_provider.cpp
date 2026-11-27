@@ -966,6 +966,13 @@ void test_query_api() {
     CHECK(hr32(fx.vcall(system, 4, {0x20, 0, used})) == com::E_INVALIDARG_HR);
     prov::set_xbox_live_sandbox_id("");
     CHECK(hr32(fx.vcall(system, 4, {0x20, buffer, used})) == com::E_NOTIMPL_HR);
+    // XSystemGetAppSpecificDeviceId (s5), owner decision 7.1 A: E_NOTIMPL, nothing written.
+    CHECK(com::write_guest(buffer, uint64_t{0x1122334455667788ull}));
+    CHECK(com::write_guest(used, uint64_t{77}));
+    CHECK(hr32(fx.vcall(system, 5, {0x20, buffer, used})) == com::E_NOTIMPL_HR);
+    CHECK(load64(buffer) == 0x1122334455667788ull);
+    CHECK(load64(used) == 77);
+    CHECK(hr32(fx.vcall(system, 5, {0, 0, 0})) == com::E_NOTIMPL_HR);
 }
 
 void test_task_queue_slots() {
@@ -1153,6 +1160,36 @@ void test_user_slots() {
     CHECK(dup != 0 && dup != user);
     CHECK(hr32(fx.vcall(user_api, 11, {dup, out})) == 0 && load64(out) == playgta6::os::gdk::kOfflineUserXuid);
     CHECK(hr32(fx.vcall(user_api, 9, {dup, out})) == 0 && load64(out) == local_id);
+    // Owner decision 7.2: XUserCompare (s5) compares the underlying user, so a duplicate is "same".
+    CHECK(hr32(fx.vcall(user_api, 5, {user, dup})) == 0);
+    CHECK(hr32(fx.vcall(user_api, 5, {user, user})) == 0);
+    CHECK(hr32(fx.vcall(user_api, 5, {user, 0x1234})) != 0);
+    CHECK(hr32(fx.vcall(user_api, 5, {0, dup})) != 0);
+    // XUserGetState (s14): SignedIn (0) for the local user; an invalid handle or null out pointer is invalid.
+    const uint64_t state = fx.alloc(8);
+    CHECK(com::write_guest(state, uint64_t{2}));
+    CHECK(hr32(fx.vcall(user_api, 14, {dup, state})) == 0);
+    CHECK((load64(state) & 0xffffffffull) == 0);
+    CHECK(com::write_guest(state, uint64_t{2}));
+    CHECK(hr32(fx.vcall(user_api, 14, {0x1234, state})) == com::E_INVALIDARG_HR);
+    CHECK(load64(state) == 2);
+    CHECK(hr32(fx.vcall(user_api, 14, {user, 0})) == com::E_INVALIDARG_HR);
+    // XUserFindUserByLocalId (s10) / XUserFindUserById (s12): a new handle to the same user on a match,
+    // E_GAMEUSER_USER_NOT_FOUND and a null handle otherwise.
+    constexpr int32_t kUserNotFound = static_cast<int32_t>(0x89245104u);
+    for (const auto& [slot, id] : {std::pair<uint32_t, uint64_t>{10, local_id},
+                                   std::pair<uint32_t, uint64_t>{12, playgta6::os::gdk::kOfflineUserXuid}}) {
+        CHECK(hr32(fx.vcall(user_api, slot, {id, dup_out})) == 0);
+        const uint64_t found = load64(dup_out);
+        CHECK(found != 0 && found != user);
+        CHECK(hr32(fx.vcall(user_api, 5, {user, found})) == 0);
+        CHECK(hr32(fx.vcall(user_api, 11, {found, out})) == 0 && load64(out) == playgta6::os::gdk::kOfflineUserXuid);
+        fx.vcall(user_api, 4, {found});
+        CHECK(com::write_guest(dup_out, uint64_t{0xdead}));
+        CHECK(hr32(fx.vcall(user_api, slot, {id + 7, dup_out})) == kUserNotFound);
+        CHECK(load64(dup_out) == 0);
+        CHECK(hr32(fx.vcall(user_api, slot, {id, 0})) == com::E_INVALIDARG_HR);
+    }
     fx.vcall(user_api, 4, {dup});  // XUserCloseHandle on the duplicate only
     CHECK(hr32(fx.vcall(user_api, 11, {user, out})) == 0);
     CHECK(hr32(fx.vcall(user_api, 3, {0x1234, dup_out})) == com::E_INVALIDARG_HR);
@@ -1457,6 +1494,31 @@ void test_store_ext_slots() {
         }
     }
     CHECK(hit70 && hit73);
+
+    // XStore (owner decision 7.3 A): s28 QueryGameLicenseAsync is the offline HRESULT and s65
+    // QueryPackageIdentifier is "not found"; neither writes an argument or completes the block.
+    const uint64_t pkg_buf = fx.alloc(16);
+    CHECK(com::write_guest(pkg_buf, uint64_t{0x1122334455667788ull}));
+    CHECK(hr32(fx.vcall(store, 28, {ctx, block})) == static_cast<int32_t>(0x800704CFu));
+    CHECK(hr32(fx.vcall(store, 65, {store_id, 16, pkg_buf})) == static_cast<int32_t>(0x80070490u));
+    CHECK(load64(pkg_buf) == 0x1122334455667788ull);
+    CHECK(cbk::live_async_shadows() == 0);
+    CHECK(g_done_block == 0);
+    // Every other XStore licence slot stays a trapping tripwire.
+    for (uint32_t slot : {20u, 22u, 29u}) {
+        GuestFault fault{};
+        bool trapped = false;
+        try {
+            fx.vcall(store, slot, {ctx, store_id, block});
+        } catch (const GuestFault& f) {
+            fault = f;
+            trapped = true;
+        }
+        fx.restore_stack();
+        CHECK(trapped);
+        CHECK(fault.info.kind == static_cast<uint32_t>(FaultKind::UnimplementedSlot));
+        CHECK(fault.info.detail == slot);
+    }
 
     // Closing the context makes subsequent slot 71 calls reject the stale handle.
     fx.vcall(store, 4, {ctx});
