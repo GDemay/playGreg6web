@@ -110,7 +110,10 @@ int main(int argc, char** argv) {
     CHECK(body.rfind("# my note\n0x99 hangs it https://example.invalid/1\n", 0) == 0 &&
           count(body, "0x0000000000000030") == 1 && !has(body, "0000000000000099"));
     const std::string killed = (dir / "killed.txt").string();  // flushed before the process is killed right after
-    const std::string cmd = "\"\"" + std::string(argv[0]) + "\" --persist-child \"" + killed + "\" 1a 2b\"";
+    std::string cmd = "\"" + std::string(argv[0]) + "\" --persist-child \"" + killed + "\" 1a 2b";
+#ifdef _WIN32
+    cmd = "\"" + cmd + "\"";  // cmd.exe /c strips one outer pair of quotes
+#endif
     CHECK(std::system(cmd.c_str()) == 0);
     body = slurp(killed);
     CHECK(has(body.c_str(), "0x000000000000001a pipeline_failed auto\n") && has(body.c_str(), "0x000000000000002b pipeline_failed auto\n"));

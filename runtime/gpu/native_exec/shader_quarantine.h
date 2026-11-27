@@ -134,9 +134,11 @@ public:
     // nothing to add (or the file is unparsable and left alone), -1 when it could not be written (the caller logs).
     static int persist_auto_file(const std::string& path, const std::vector<uint64_t>& failed) {
         std::string existing;
-        {
+        try {
             std::ifstream f(path, std::ios::binary);
             if (f) existing.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        } catch (...) {
+            return -1;  // e.g. the path is a directory (libstdc++ throws on read)
         }
         const std::string out = merge_auto_file(existing, failed);
         if (out.empty()) return 0;
