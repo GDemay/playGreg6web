@@ -148,10 +148,15 @@ public:
             return false;
         }
         uint32_t v = 0u;
-        for (uint32_t i = 0u; i < n; ++i) {
+        // The guards above prove the whole request is available. Consume at most
+        // five byte fragments for a 32-bit field, without reading beyond its last byte.
+        for (uint32_t left = n; left != 0;) {
+            const uint32_t available = 8u - (pos_ & 7u);
+            const uint32_t take = std::min(left, available);
             const uint8_t byte = data_[pos_ >> 3u];
-            v = (v << 1u) | ((byte >> (7u - (pos_ & 7u))) & 1u);
-            ++pos_;
+            v = (v << take) | ((byte >> (available - take)) & ((1u << take) - 1u));
+            pos_ += take;
+            left -= take;
         }
         out = v;
         return true;
@@ -328,15 +333,30 @@ void imdct_fast(const float* in, float* out, uint32_t n) {
     const uint32_t m = n >> 1u;  // N / 2 <= 256
     float re[kMaxSubframeLen / 2u];
     float im[kMaxSubframeLen / 2u];
-    const double step = kPi / static_cast<double>(n);
+    // The angles depend only on the four supported lengths. Preserve the original
+    // double expressions and float rounding, once per process (thread-safe initialization).
+    static const auto tables = [] {
+        std::array<std::array<std::array<float, 2>, kMaxSubframeLen>, 4> result{};
+        for (uint32_t index = 0; index < 4; ++index) {
+            const uint32_t size = 64u << index;
+            const double step = kPi / static_cast<double>(size);
+            for (uint32_t p = 0; p < size / 2; ++p) {
+                const double pre = step * static_cast<double>(p);
+                const double post = step * (static_cast<double>(p) + 0.25);
+                result[index][p] = {static_cast<float>(std::cos(pre)), static_cast<float>(std::sin(pre))};
+                result[index][size / 2 + p] = {static_cast<float>(std::cos(post)), static_cast<float>(std::sin(post))};
+            }
+        }
+        return result;
+    }();
+    const auto& twiddles = tables[n == 64 ? 0 : n == 128 ? 1 : n == 256 ? 2 : 3];
 
     // Pre-twiddle: u[p] = (X[2p] - i * X[N-1-2p]) * exp(+i * pi * p / N).
     for (uint32_t p = 0u; p < m; ++p) {
         const float xr = in[2u * p];
         const float xi = -in[n - 1u - 2u * p];
-        const double ang = step * static_cast<double>(p);
-        const float c = static_cast<float>(std::cos(ang));
-        const float s = static_cast<float>(std::sin(ang));
+        const float c = twiddles[p][0];
+        const float s = twiddles[p][1];
         re[p] = xr * c - xi * s;
         im[p] = xr * s + xi * c;
     }
@@ -349,9 +369,8 @@ void imdct_fast(const float* in, float* out, uint32_t n) {
     float dct[kMaxSubframeLen];
     const float scale = 2.0f / static_cast<float>(n);
     for (uint32_t k = 0u; k < m; ++k) {
-        const double ang = step * (static_cast<double>(k) + 0.25);
-        const float c = static_cast<float>(std::cos(ang));
-        const float s = static_cast<float>(std::sin(ang));
+        const float c = twiddles[m + k][0];
+        const float s = twiddles[m + k][1];
         const float vr = (re[k] * c - im[k] * s) * scale;
         const float vi = (re[k] * s + im[k] * c) * scale;
         dct[2u * k] = vr;

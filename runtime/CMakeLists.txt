@@ -540,6 +540,10 @@ else()
     target_link_libraries(test_xma_decoder PRIVATE playgta6_core)
     add_test(NAME playgta6_xma_decoder_tests COMMAND test_xma_decoder)
 
+    add_executable(test_xma_bitreader ../tests/test_xma_bitreader.cpp os/xapu_opus.cpp)
+    target_include_directories(test_xma_bitreader PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME playgta6_xma_bitreader_tests COMMAND test_xma_bitreader)
+
     add_executable(test_audio_wav_dump ../tests/test_audio_wav_dump.cpp)
     target_link_libraries(test_audio_wav_dump PRIVATE playgta6_core)
     add_test(NAME playgta6_audio_wav_dump_tests COMMAND test_audio_wav_dump)
