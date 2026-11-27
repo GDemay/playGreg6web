@@ -162,7 +162,7 @@ fn before_transfer(ir: &str, caller: u64, callee: u64) -> String {
 
 fn stored_flags(text: &str) -> Vec<usize> {
     (0..6)
-        .filter(|i| text.contains(&format!("ptr %state.flag{i}\n")))
+        .filter(|i| text.contains(&format!("ptr %state.flag{i}, !tbaa !9002\n")))
         .collect()
 }
 
