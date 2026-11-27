@@ -245,10 +245,13 @@ const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 // right, and bottom-right bands so it reliably detects full-screen video, center 6-star
 // loading animation, sparse menus, AND the bottom-right OFFLINEPLAYER [A] bar.
 const SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS = 250;
+const SWAPCHAIN_PROBE_DEFAULT_TIMEOUT_MS = 5000;
 const SWAPCHAIN_PROBE_STRIP_MAX_WIDTH = 64;
 const SWAPCHAIN_PROBE_BYTES_PER_ROW = 256;
 const SWAPCHAIN_PROBE_DEFAULT_LUMA_THRESHOLD = 8;
 const SWAPCHAIN_PROBE_MAX_CONSECUTIVE_ERRORS = 3;
+const DEFAULT_GPU_STALL_WARN_MS = 1000;
+const DEFAULT_GPU_STALL_WARN_MIN_INTERVAL_MS = 1000;
 const SWAPCHAIN_PROBE_STRIPS = Object.freeze([
   Object.freeze({ yFraction: 0.15, xFraction: 0.5 }),
   Object.freeze({ yFraction: 0.35, xFraction: 0.25 }),
@@ -2589,7 +2592,7 @@ const REPLAY_SHADOW_BUFFER_MAX_BYTES = 2 * 1024 * 1024;
 const REPLAY_SHADOW_TOTAL_MAX_BYTES = 64 * 1024 * 1024;
 const REPLAY_LOG_MAX_ENTRIES = 65536;
 const REPLAY_LOG_MAX_BYTES = 128 * 1024 * 1024;
-const REPLAY_LOG_MAX_BIND_GROUPS = 512;
+const REPLAY_LOG_MAX_BIND_GROUPS = 16384;
 const REPLAY_ASYNC_CHUNK_SIZE = 24;
 const REPLAY_PHASE_COUNT = 5;
 
@@ -3213,6 +3216,16 @@ class WgpuCommandProcessor {
       options.swapchainProbeIntervalMs >= 0
         ? options.swapchainProbeIntervalMs
         : SWAPCHAIN_PROBE_DEFAULT_INTERVAL_MS;
+    this._swapchainProbeTimeoutMs =
+      options.swapchainProbeTimeoutMs === 0
+        ? 0
+        : typeof options.swapchainProbeTimeoutMs === 'number' &&
+            Number.isFinite(options.swapchainProbeTimeoutMs) &&
+            options.swapchainProbeTimeoutMs > 0
+          ? Math.floor(options.swapchainProbeTimeoutMs)
+          : SWAPCHAIN_PROBE_DEFAULT_TIMEOUT_MS;
+    this._swapchainProbeTimeoutTimer = null;
+    this._swapchainProbeTimeoutCount = 0;
     this._swapchainProbeBuffer = null;
     this._swapchainProbeBufferDevice = null;
     this._swapchainProbeSupported = null;
@@ -3467,6 +3480,10 @@ class WgpuCommandProcessor {
 
     // W104: live-resource replay log + bounded buffer shadow cache for device-loss recovery.
     this._resourceReplayEnabled = options.enableResourceReplay !== false;
+    this._shadowBufferReplayEnabled =
+      options.enableShadowBufferReplay !== undefined
+        ? options.enableShadowBufferReplay !== false
+        : true;
     this._replayingResources = false;
     this._replayLog = new Map(); // '<kind>:<id>' -> { kind, id, opcode, phase, payload: Uint8Array }
     this._replayLogBytes = 0;
@@ -3543,6 +3560,25 @@ class WgpuCommandProcessor {
     this._coalescePresentsEnabled = options.coalescePresents !== false;
     this._coalescedPresents = 0;
     this._presentScanScratch = { count: 0, lastOffset: -1 };
+    // Wave-5 (#663, #1077): Rate-limited GPU stall / hang attribution warnings.
+    this._gpuStallWarnMs =
+      options.gpuStallWarnMs === 0
+        ? 0
+        : typeof options.gpuStallWarnMs === 'number' &&
+            Number.isFinite(options.gpuStallWarnMs) &&
+            options.gpuStallWarnMs > 0
+          ? options.gpuStallWarnMs
+          : DEFAULT_GPU_STALL_WARN_MS;
+    this._gpuStallWarnMinIntervalMs =
+      options.gpuStallWarnMinIntervalMs === 0
+        ? 0
+        : typeof options.gpuStallWarnMinIntervalMs === 'number' &&
+            Number.isFinite(options.gpuStallWarnMinIntervalMs) &&
+            options.gpuStallWarnMinIntervalMs > 0
+          ? options.gpuStallWarnMinIntervalMs
+          : DEFAULT_GPU_STALL_WARN_MIN_INTERVAL_MS;
+    this._gpuStallWarnCount = 0;
+    this._gpuStallWarnLastByOp = new Map();
 
     // W136 / W159: on-demand HTTP 206 Range shader resolution + deferred/upgradable pipelines.
     this._nextShaderModuleGen = 0;
@@ -4125,6 +4161,14 @@ class WgpuCommandProcessor {
 
   get swapchainProbeConsecutiveErrors() {
     return this._swapchainProbeConsecutiveErrors;
+  }
+
+  get swapchainProbeTimeoutCount() {
+    return this._swapchainProbeTimeoutCount;
+  }
+
+  get gpuStallWarnCount() {
+    return this._gpuStallWarnCount;
   }
 
   setFrameLuminanceMeta(meta) {
@@ -4880,7 +4924,11 @@ class WgpuCommandProcessor {
       if (cachedMod && cachedMod.code === code) {
         return cachedMod.module;
       }
+      const stallStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
       const mod = this.device.createShaderModule({ code });
+      if (this._gpuStallWarnMs > 0) {
+        this._maybeWarnGpuStall('createShaderModule', stallStartMs, modKey);
+      }
       this._specializedFallbackShaderModules.set(modKey, { code, module: mod });
       return mod;
     };
@@ -4991,6 +5039,7 @@ class WgpuCommandProcessor {
       ? `spec:${canonicalProfile}:${topology}:${fsOrig ? targetFormat : 'none'}`
       : `spec:${pipeMeta.id}:${canonicalProfile}:${topology}:${fsOrig ? targetFormat : 'none'}`;
     let pipeline;
+    const pipeStallStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
     if (this.pipelineCache && typeof this.pipelineCache.getFastRenderPipeline === 'function') {
       pipeline = this.pipelineCache.getFastRenderPipeline(specFastKey, descriptor);
     } else if (
@@ -5000,6 +5049,10 @@ class WgpuCommandProcessor {
       pipeline = this.pipelineCache.getOrCreateRenderPipeline(descriptor, specFastKey);
     } else {
       pipeline = this.device.createRenderPipeline(descriptor);
+    }
+    if (this._gpuStallWarnMs > 0) {
+      const shaderTag = vsOrig.requestedHash || vsOrig.hashHex || specFastKey;
+      this._maybeWarnGpuStall('createRenderPipeline', pipeStallStartMs, shaderTag);
     }
     if (!pipeline) {
       return null;
@@ -6040,7 +6093,11 @@ class WgpuCommandProcessor {
         : presenter.presentFrame(encoder, targetView, targetWidth, targetHeight);
       if (this.device.queue && typeof this.device.queue.submit === 'function') {
         const cmdBuf = encoder && typeof encoder.finish === 'function' ? encoder.finish() : encoder;
+        const submitStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
         this.device.queue.submit([cmdBuf]);
+        if (this._gpuStallWarnMs > 0) {
+          this._maybeWarnGpuStall('queue.submit', submitStartMs, null, 1, 0);
+        }
       }
 
       if (presentResult && presentResult.presented) {
@@ -6436,7 +6493,11 @@ class WgpuCommandProcessor {
     ) {
       this.stagingPool.prepareSubmit();
     }
+    const uploadSubmitStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
     this.device.queue.submit([encoder.finish()]);
+    if (this._gpuStallWarnMs > 0) {
+      this._maybeWarnGpuStall('queue.submit', uploadSubmitStartMs, null, 0, 0);
+    }
     this._drainDeferredGpuDestroys();
     if (
       retireStaging &&
@@ -6691,12 +6752,24 @@ class WgpuCommandProcessor {
     return { evaluated: false, visible: false, maxLuma: 0 };
   }
 
+  _clearSwapchainProbeTimeout() {
+    if (this._swapchainProbeTimeoutTimer !== null) {
+      try {
+        clearTimeout(this._swapchainProbeTimeoutTimer);
+      } catch (_) {
+        // Ignore timer cleanup errors.
+      }
+      this._swapchainProbeTimeoutTimer = null;
+    }
+  }
+
   /**
    * W338: Destroy the pre-allocated staging GPUBuffer used by the throttled async
    * swapchain non-black luminance probe. Called automatically as soon as
    * `first-visible-frame` fires, on device reset, and on `destroy()`.
    */
   _destroySwapchainProbeBuffer() {
+    this._clearSwapchainProbeTimeout();
     this._swapchainProbeGeneration += 1;
     this._swapchainProbeInFlight = false;
     const buf = this._swapchainProbeBuffer;
@@ -7053,9 +7126,63 @@ class WgpuCommandProcessor {
     const threshold = this._minVisibleLuma;
     const stripWidth = probeTarget.stripWidth;
     const stripCount = probeTarget.stripCount;
+    let settled = false;
+    const clearWatchdog = () => {
+      if (gen === this._swapchainProbeGeneration) {
+        this._clearSwapchainProbeTimeout();
+      }
+    };
+    const timeoutMs = this._swapchainProbeTimeoutMs;
+    if (timeoutMs > 0 && typeof setTimeout === 'function') {
+      this._clearSwapchainProbeTimeout();
+      const timer = setTimeout(() => {
+        if (this._swapchainProbeTimeoutTimer === timer) {
+          this._swapchainProbeTimeoutTimer = null;
+        }
+        if (
+          settled ||
+          this._destroyed ||
+          this._firstVisibleFrameNotified ||
+          gen !== this._swapchainProbeGeneration
+        ) {
+          return;
+        }
+        settled = true;
+        this._swapchainProbeTimeoutCount += 1;
+        try {
+          if (buf && !buf.destroyed && typeof buf.unmap === 'function') {
+            buf.unmap();
+          }
+        } catch (_) {
+          // Ignore unmap errors on a stalled/lost GPUBuffer.
+        }
+        this._destroySwapchainProbeBuffer();
+        this._recordSwapchainProbeError(
+          'mapAsync-timeout',
+          `mapAsync timed out after ${timeoutMs}ms`,
+          probeTarget
+        );
+      }, timeoutMs);
+      if (timer && typeof timer.unref === 'function') {
+        timer.unref();
+      }
+      this._swapchainProbeTimeoutTimer = timer;
+    }
 
     mapPromise.then(
       () => {
+        if (settled) {
+          try {
+            if (!buf.destroyed && typeof buf.unmap === 'function') {
+              buf.unmap();
+            }
+          } catch (_) {
+            // Ignore late unmap on an already-timed-out/destroyed buffer.
+          }
+          return;
+        }
+        settled = true;
+        clearWatchdog();
         if (
           this._destroyed ||
           gen !== this._swapchainProbeGeneration ||
@@ -7182,6 +7309,11 @@ class WgpuCommandProcessor {
         }
       },
       (err) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearWatchdog();
         if (gen === this._swapchainProbeGeneration) {
           this._swapchainProbeInFlight = false;
           if (!this._destroyed && !this._firstVisibleFrameNotified) {
@@ -7437,6 +7569,51 @@ class WgpuCommandProcessor {
   }
 
   /**
+   * Wave-5 (#663, #1077): Emit a rate-limited sanitized warning whenever a single GPU
+   * operation (`executeCommandBuffer`, `queue.submit`, `createShaderModule`,
+   * `createRenderPipeline`) exceeds `_gpuStallWarnMs` (default 1000ms).
+   */
+  _maybeWarnGpuStall(opName, startMs, shaderHash = null, drawsCount = null, dispatchesCount = null) {
+    if (this._gpuStallWarnMs <= 0 || typeof startMs !== 'number') {
+      return false;
+    }
+    const endMs = this._getNowMs();
+    const durationMs = endMs - startMs;
+    if (!Number.isFinite(durationMs) || durationMs <= this._gpuStallWarnMs) {
+      return false;
+    }
+    const op = typeof opName === 'string' && opName.length > 0 ? opName : 'gpu';
+    const lastWarnMs = this._gpuStallWarnLastByOp.get(op);
+    if (
+      lastWarnMs !== undefined &&
+      this._gpuStallWarnMinIntervalMs > 0 &&
+      endMs - lastWarnMs < this._gpuStallWarnMinIntervalMs
+    ) {
+      return false;
+    }
+    this._gpuStallWarnLastByOp.set(op, endMs);
+    this._gpuStallWarnCount += 1;
+    const cleanShader =
+      shaderHash !== null && shaderHash !== undefined && String(shaderHash).length > 0
+        ? sanitizeValidationErrorMessage(String(shaderHash))
+        : null;
+    const draws =
+      typeof drawsCount === 'number' && Number.isFinite(drawsCount)
+        ? Math.max(0, Math.floor(drawsCount))
+        : this._frameDrawsThisFrame;
+    const dispatches =
+      typeof dispatchesCount === 'number' && Number.isFinite(dispatchesCount)
+        ? Math.max(0, Math.floor(dispatchesCount))
+        : this._computeDispatchCount;
+    const shaderPart = cleanShader ? ` shader=${cleanShader}` : '';
+    this._logDiagnostic(
+      'warn',
+      `[wgpu_worker] GPU stall: op=${op} durationMs=${Math.round(durationMs)} frame=${this.frameCount}${shaderPart} draws=${draws} dispatches=${dispatches}`
+    );
+    return true;
+  }
+
+  /**
    * W100: attach a `device.lost` observer to `device` once. Losses of a device that is no longer
    * current (replaced by recovery) and intentional `device.destroy()` (`reason: 'destroyed'`) or
    * processor teardown are ignored.
@@ -7529,7 +7706,7 @@ class WgpuCommandProcessor {
       this._lastDeviceLostReason = typeof reason === 'string' && reason.length > 0 ? reason : null;
       this._logDiagnostic(
         'warn',
-        `[wgpu_worker] WebGPU device lost (${source}): ${this._lastDeviceLostReason || 'unknown'}`
+        `[wgpu_worker] WebGPU device lost (${source}, gen=${this._deviceGeneration}, replayEntries=${this._replayLog.size}): ${this._lastDeviceLostReason || 'unknown'}`
       );
     }
     const listener = this._deviceLossListener;
@@ -7744,17 +7921,41 @@ class WgpuCommandProcessor {
   }
 
   /**
+   * Wave-5 (#663, #1077): toggle WriteBuffer shadow-copying independently from lightweight
+   * resource creation-packet replay. Passing `{ clear: true }` while disabling releases
+   * previously buffered shadow copies immediately.
+   *
+   * @param {boolean} enabled
+   * @param {{ clear?: boolean } | null} [opts]
+   * @returns {boolean}
+   */
+  setEnableShadowBufferReplay(enabled, opts = null) {
+    this._shadowBufferReplayEnabled = enabled !== false;
+    if (!this._shadowBufferReplayEnabled && opts && opts.clear === true) {
+      this._shadowBuffers.clear();
+      this._shadowBufferBytes = 0;
+    }
+    return this._shadowBufferReplayEnabled;
+  }
+
+  get shadowBufferReplayEnabled() {
+    return this._shadowBufferReplayEnabled;
+  }
+
+  /**
    * W104: record one packet into the live-resource replay log. Creation packets are copied
    * (latest creation of an id wins), DestroyResource forgets every record of the id, and
-   * WriteBuffer updates the bounded shadow copy of the buffer contents. Never records while
-   * `replayRecordedResources()` runs.
+   * WriteBuffer updates the bounded shadow copy of the buffer contents when
+   * `_shadowBufferReplayEnabled` is true. Never records while `replayRecordedResources()` runs.
    */
   _recordReplayPacket(opcode, view, payloadOffset, payloadBytes) {
     if (!this._resourceReplayEnabled || this._replayingResources || payloadBytes < 4) {
       return;
     }
     if (opcode === OPCODES.WRITE_BUFFER) {
-      this._recordShadowBufferWrite(view, payloadOffset, payloadBytes);
+      if (this._shadowBufferReplayEnabled) {
+        this._recordShadowBufferWrite(view, payloadOffset, payloadBytes);
+      }
       return;
     }
     if (opcode === OPCODES.DESTROY_RESOURCE) {
@@ -7853,7 +8054,12 @@ class WgpuCommandProcessor {
   }
 
   _recordShadowBufferWrite(view, payloadOffset, payloadBytes) {
-    if (!this._resourceReplayEnabled || this._replayingResources || payloadBytes < 16) {
+    if (
+      !this._resourceReplayEnabled ||
+      !this._shadowBufferReplayEnabled ||
+      this._replayingResources ||
+      payloadBytes < 16
+    ) {
       return;
     }
     const id = view.getUint32(payloadOffset, true);
@@ -10476,18 +10682,26 @@ class WgpuCommandProcessor {
     }
 
     let module;
+    const shaderStallStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
+    const shaderStallHash = entry.requestedHash || entry.hashHex || null;
     if (allowDirectThrowOnEmpty && !entry.oversizedFallback) {
       module = this.device.createShaderModule({ code });
     } else {
       try {
         module = this.device.createShaderModule({ code });
       } catch (err) {
+        if (this._gpuStallWarnMs > 0) {
+          this._maybeWarnGpuStall('createShaderModule', shaderStallStartMs, shaderStallHash);
+        }
         recordCompileFailure();
         if (!entry.oversizedFallback) {
           this._recordOpValidationError('CreateShaderModule', err);
         }
         return null;
       }
+    }
+    if (this._gpuStallWarnMs > 0) {
+      this._maybeWarnGpuStall('createShaderModule', shaderStallStartMs, shaderStallHash);
     }
     let compilationInfoPromise = null;
     if (module && typeof module.getCompilationInfo === 'function') {
@@ -11177,6 +11391,11 @@ class WgpuCommandProcessor {
     const renderFastKey = `v1r:${vsGen}:${fsGen}:${vertexStride}:${topology}:${rtFormat}:${reflected ? 'r' : 'a'}:${effectiveFallbackProfile || ''}`;
 
     let pipeline;
+    const pipeStallStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
+    const pipeStallShaderHash =
+      (vsEntry && (vsEntry.requestedHash || vsEntry.hashHex)) ||
+      (fsEntry && (fsEntry.requestedHash || fsEntry.hashHex)) ||
+      null;
     try {
       if (this.pipelineCache && typeof this.pipelineCache.getFastRenderPipeline === 'function') {
         pipeline = this.pipelineCache.getFastRenderPipeline(renderFastKey, descriptor);
@@ -11189,10 +11408,16 @@ class WgpuCommandProcessor {
         pipeline = this.device.createRenderPipeline(descriptor);
       }
     } catch (err) {
+      if (this._gpuStallWarnMs > 0) {
+        this._maybeWarnGpuStall('createRenderPipeline', pipeStallStartMs, pipeStallShaderHash);
+      }
       if (!pendingRanged.pending) {
         this._recordOpValidationError('CreateRenderPipeline', err);
       }
       return;
+    }
+    if (this._gpuStallWarnMs > 0) {
+      this._maybeWarnGpuStall('createRenderPipeline', pipeStallStartMs, pipeStallShaderHash);
     }
     if (!pipeline) {
       // W268 negative-cached (quarantined) or failed pipeline compile — skip cleanly.
@@ -13019,11 +13244,21 @@ class WgpuCommandProcessor {
       this._notePresentSubmitFailure(err);
     }
     if (commandBuffer !== null) {
+      const submitStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
       try {
         this.device.queue.submit([commandBuffer]);
         submitted = true;
       } catch (err) {
         this._notePresentSubmitFailure(err);
+      }
+      if (this._gpuStallWarnMs > 0) {
+        this._maybeWarnGpuStall(
+          'queue.submit',
+          submitStartMs,
+          null,
+          this._frameDrawsThisFrame,
+          this._computeDispatchCount
+        );
       }
     }
     this._startRecordedReadbacks(submitted);
@@ -13557,7 +13792,11 @@ class WgpuCommandProcessor {
         }
         const cb = encoder.finish();
         if (cb && this.device.queue && typeof this.device.queue.submit === 'function') {
+          const submitStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
           this.device.queue.submit([cb]);
+          if (this._gpuStallWarnMs > 0) {
+            this._maybeWarnGpuStall('queue.submit', submitStartMs, null, 0, this._computeDispatchCount);
+          }
         }
       } catch (err) {
         this._notePresentSubmitFailure(err);
@@ -13744,6 +13983,9 @@ class WgpuCommandProcessor {
       }
     }
 
+    const execStartMs = this._gpuStallWarnMs > 0 ? this._getNowMs() : 0;
+    const drawsBefore = this._drawCallCount;
+    const dispatchesBefore = this._computeDispatchCount;
     const presents = this._executeCommandView(
       view,
       startOffset,
@@ -13751,6 +13993,15 @@ class WgpuCommandProcessor {
       coalescePresents,
       deferFinalPresent
     );
+    if (this._gpuStallWarnMs > 0) {
+      this._maybeWarnGpuStall(
+        'executeCommandBuffer',
+        execStartMs,
+        null,
+        this._drawCallCount - drawsBefore,
+        this._computeDispatchCount - dispatchesBefore
+      );
+    }
     if (reuseResult) {
       const out = this._executeResultScratch;
       out.frameCount = this.frameCount;
@@ -14382,6 +14633,10 @@ class WgpuCommandProcessor {
       swapchainProbeInFlight: this._swapchainProbeInFlight,
       swapchainProbeSupported: this._swapchainProbeSupported,
       swapchainProbeErrorCount: this._swapchainProbeErrorCount,
+      swapchainProbeTimeoutCount: this._swapchainProbeTimeoutCount,
+      gpuStallWarnCount: this._gpuStallWarnCount,
+      deviceLostCount: this._deviceLostCount,
+      deviceRecoveredCount: this._deviceRecoveredCount,
       gpuAdapter: this._gpuAdapter,
       chunkedWriteBufferUploads: this._chunkedWriteBufferUploads,
       packetCount: this._packetCount,
@@ -14486,6 +14741,7 @@ class WgpuCommandProcessor {
       promoted1DTo2DCount: this._promoted1DTo2DCount,
       fallbackProfileScanCount: this._fallbackProfileScanCount,
       resourceReplayEnabled: this._resourceReplayEnabled,
+      shadowBufferReplayEnabled: this._shadowBufferReplayEnabled,
     };
   }
 
@@ -15532,6 +15788,18 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
         : processor && processor.swapchainProbeErrorCount,
       0
     );
+    snapshot.swapchainProbeTimeoutCount = toNonNegativeInt(
+      stats && stats.swapchainProbeTimeoutCount !== undefined
+        ? stats.swapchainProbeTimeoutCount
+        : processor && processor.swapchainProbeTimeoutCount,
+      0
+    );
+    snapshot.gpuStallWarnCount = toNonNegativeInt(
+      stats && stats.gpuStallWarnCount !== undefined
+        ? stats.gpuStallWarnCount
+        : processor && processor.gpuStallWarnCount,
+      0
+    );
     const rawLastMaxLuma =
       stats && stats.lastSampledMaxLuma !== undefined
         ? stats.lastSampledMaxLuma
@@ -16532,8 +16800,14 @@ function createWgpuWorkerHandler(options = {}) {
               const packStats = targetProcessor.wgslPackCache.getStats();
               summary.shaderPackShaders = packStats ? packStats.shaderCount || 0 : 0;
             }
-          } catch (_) {
+          } catch (err) {
             // Non-fatal: worker init must never abort if shader pack fetch/parse fails.
+            if (typeof targetProcessor._logDiagnostic === 'function') {
+              targetProcessor._logDiagnostic(
+                'warn',
+                `[wgpu_worker] shader pack preload failed: ${sanitizeGpuErrorDetail(err)}`
+              );
+            }
           }
         })()
       );
@@ -16699,9 +16973,10 @@ function createWgpuWorkerHandler(options = {}) {
       await ensureRtBvhPreludeLoaded();
       // W104/W105: recreate live pre-loss guest resources on the new device in async chunks so
       // Chrome's GPU IPC drains cleanly without stalling the worker.
+      let replaySummary = null;
       if (typeof targetProcessor.replayRecordedResourcesAsync === 'function') {
         try {
-          await targetProcessor.replayRecordedResourcesAsync();
+          replaySummary = await targetProcessor.replayRecordedResourcesAsync();
         } catch (replayErr) {
           targetProcessor._logDiagnostic(
             'warn',
@@ -16710,7 +16985,7 @@ function createWgpuWorkerHandler(options = {}) {
         }
       } else if (typeof targetProcessor.replayRecordedResources === 'function') {
         try {
-          targetProcessor.replayRecordedResources();
+          replaySummary = targetProcessor.replayRecordedResources();
         } catch (replayErr) {
           targetProcessor._logDiagnostic(
             'warn',
@@ -16720,9 +16995,14 @@ function createWgpuWorkerHandler(options = {}) {
       }
       bindProcessorValidationErrors(targetProcessor);
       ok = true;
+      const replayedRes = replaySummary ? toNonNegativeInt(replaySummary.replayedResources, 0) : 0;
+      const replayedWrites = replaySummary
+        ? toNonNegativeInt(replaySummary.replayedBufferWrites, 0)
+        : 0;
+      const failedRes = replaySummary ? toNonNegativeInt(replaySummary.failedResources, 0) : 0;
       targetProcessor._logDiagnostic(
-        'info',
-        `[wgpu_worker] WebGPU device recovered (attempt ${attempt}/${maxDeviceRecoveries})`
+        'warn',
+        `[wgpu_worker] WebGPU device recovered (attempt ${attempt}/${maxDeviceRecoveries}, replayed=${replayedRes}, bufferWrites=${replayedWrites}${failedRes > 0 ? `, failed=${failedRes}` : ''})`
       );
     } catch (err) {
       if (acquiredDevice && acquiredDevice !== targetProcessor.device) {
@@ -17066,6 +17346,18 @@ function createWgpuWorkerHandler(options = {}) {
         initPayload.swapchainProbeIntervalMs !== undefined
           ? initPayload.swapchainProbeIntervalMs
           : options.swapchainProbeIntervalMs,
+      swapchainProbeTimeoutMs:
+        initPayload.swapchainProbeTimeoutMs !== undefined
+          ? initPayload.swapchainProbeTimeoutMs
+          : options.swapchainProbeTimeoutMs,
+      gpuStallWarnMs:
+        initPayload.gpuStallWarnMs !== undefined
+          ? initPayload.gpuStallWarnMs
+          : options.gpuStallWarnMs,
+      gpuStallWarnMinIntervalMs:
+        initPayload.gpuStallWarnMinIntervalMs !== undefined
+          ? initPayload.gpuStallWarnMinIntervalMs
+          : options.gpuStallWarnMinIntervalMs,
       minVisibleLuma: initPayload.minVisibleLuma ?? options.minVisibleLuma,
       minVisiblePixels: initPayload.minVisiblePixels ?? options.minVisiblePixels,
       nonBlackPixelProbe:
@@ -17184,6 +17476,10 @@ function createWgpuWorkerHandler(options = {}) {
         initPayload.enableResourceReplay !== undefined
           ? initPayload.enableResourceReplay
           : options.enableResourceReplay,
+      enableShadowBufferReplay:
+        initPayload.enableShadowBufferReplay !== undefined
+          ? initPayload.enableShadowBufferReplay
+          : options.enableShadowBufferReplay,
       enableSplashBridge:
         initPayload.enableSplashBridge ?? options.enableSplashBridge,
       fallbackShaderHashes:
@@ -17420,6 +17716,13 @@ function createWgpuWorkerHandler(options = {}) {
       ) {
         processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
       }
+      if (
+        processor &&
+        payload.enableShadowBufferReplay !== undefined &&
+        typeof processor.setEnableShadowBufferReplay === 'function'
+      ) {
+        processor.setEnableShadowBufferReplay(payload.enableShadowBufferReplay !== false);
+      }
       if (payload.ringSab || payload.ring) {
         attachRingFromMessage(payload);
       } else if (attachedRing && processor) {
@@ -17446,6 +17749,12 @@ function createWgpuWorkerHandler(options = {}) {
         typeof processor.setEnableResourceReplay === 'function'
       ) {
         processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
+      }
+      if (
+        payload.enableShadowBufferReplay !== undefined &&
+        typeof processor.setEnableShadowBufferReplay === 'function'
+      ) {
+        processor.setEnableShadowBufferReplay(payload.enableShadowBufferReplay !== false);
       }
       await preloadBootShaderAssets(processor, payload);
     } catch (err) {
@@ -17612,6 +17921,14 @@ function createWgpuWorkerHandler(options = {}) {
               ? toNonNegativeInt(stats.oversizedWgslFallbacks, 0)
               : 0,
             coalescedPresents: stats ? toNonNegativeInt(stats.coalescedPresents, 0) : 0,
+            deviceLostCount: stats ? toNonNegativeInt(stats.deviceLostCount, 0) : 0,
+            deviceRecoveredCount: stats ? toNonNegativeInt(stats.deviceRecoveredCount, 0) : 0,
+            deviceStats: processor ? resolveDeviceLossTelemetry(processor, stats) : null,
+            shaderPackStats: processor ? resolveShaderPackTelemetry(processor, stats) : null,
+            swapchainProbeTimeoutCount: stats
+              ? toNonNegativeInt(stats.swapchainProbeTimeoutCount, 0)
+              : 0,
+            gpuStallWarnCount: stats ? toNonNegativeInt(stats.gpuStallWarnCount, 0) : 0,
             missingShaderSummary:
               stats && stats.missingShaderSummary ? stats.missingShaderSummary : null,
             asyncPipelineStats:
@@ -18138,6 +18455,9 @@ const exportedApi = {
   sanitizeMissingShaderSummary,
   DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
   DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
+  REPLAY_LOG_MAX_BIND_GROUPS,
+  SWAPCHAIN_PROBE_DEFAULT_TIMEOUT_MS,
+  DEFAULT_GPU_STALL_WARN_MS,
   resolveShaderPackStreamThresholdBytes,
   InlineWgslPackCache,
   parseHashOnlyShaderPayload,
