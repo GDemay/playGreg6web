@@ -642,6 +642,7 @@ class _CachedFileHandle:
         "_fd_fileios",
         "_on_before_pool_open",
         "_on_pool_fd_opened",
+        "_on_pool_open_aborted",
         "_on_pool_fd_closed",
     )
 
@@ -655,6 +656,7 @@ class _CachedFileHandle:
         max_concurrent_fds: int = DEFAULT_CONCURRENT_FD_POOL_SIZE,
         on_before_pool_open: Callable[[], bool] | None = None,
         on_pool_fd_opened: Callable[[], None] | None = None,
+        on_pool_open_aborted: Callable[[], None] | None = None,
         on_pool_fd_closed: Callable[[int], None] | None = None,
     ) -> None:
         self.realpath = realpath
@@ -677,6 +679,7 @@ class _CachedFileHandle:
             self._fd_fileios[fd] = primary_fio
         self._on_before_pool_open = on_before_pool_open
         self._on_pool_fd_opened = on_pool_fd_opened
+        self._on_pool_open_aborted = on_pool_open_aborted
         self._on_pool_fd_closed = on_pool_fd_closed
 
     def _register_fileio_locked(self, fd: int) -> io.FileIO | None:
@@ -866,8 +869,11 @@ class _CachedFileHandle:
 
             if discard_fd is not None:
                 _close_fd_safely(discard_fd)
-            if notify_opened and self._on_pool_fd_opened is not None:
-                self._on_pool_fd_opened()
+            if notify_opened:
+                if self._on_pool_fd_opened is not None:
+                    self._on_pool_fd_opened()
+            elif budget_ok and self._on_pool_open_aborted is not None:
+                self._on_pool_open_aborted()
 
         try:
             yield _BorrowedFileReader(
@@ -936,6 +942,7 @@ class ReadOnlyFileHandleCache:
         self._open_handles = 0
         self._pooled_handles = 0
         self._pool_opens = 0
+        self._reserved_pool_opens = 0
 
     def __len__(self) -> int:
         with self._lock:
@@ -957,7 +964,7 @@ class ReadOnlyFileHandleCache:
                 break
 
     def _reserve_global_pool_fd_budget(self) -> bool:
-        """Ensure opening one more pooled FD stays within `max_total_open_fds`."""
+        """Atomically reserve one pooled FD slot within `max_total_open_fds`."""
         limit = self._max_total_open_fds
         if limit is None:
             return True
@@ -966,18 +973,29 @@ class ReadOnlyFileHandleCache:
         with self._lock:
             if self._closed:
                 return False
-            if self._open_handles >= limit:
-                self._trim_idle_pooled_fds_locked(limit - 1, fds_to_close)
-            allowed = self._open_handles < limit
+            if self._open_handles + self._reserved_pool_opens >= limit:
+                self._trim_idle_pooled_fds_locked(
+                    max(0, limit - 1 - self._reserved_pool_opens), fds_to_close
+                )
+            allowed = (self._open_handles + self._reserved_pool_opens) < limit
+            if allowed:
+                self._reserved_pool_opens += 1
         for fd in fds_to_close:
             _close_fd_safely(fd)
         return allowed
 
     def _record_pool_fd_opened(self) -> None:
         with self._lock:
+            if self._reserved_pool_opens > 0:
+                self._reserved_pool_opens -= 1
             self._open_handles += 1
             self._pooled_handles += 1
             self._pool_opens += 1
+
+    def _release_global_pool_fd_reservation(self) -> None:
+        with self._lock:
+            if self._reserved_pool_opens > 0:
+                self._reserved_pool_opens -= 1
 
     def _record_pool_fd_closed(self, count: int) -> None:
         with self._lock:
@@ -1089,9 +1107,17 @@ class ReadOnlyFileHandleCache:
                     donated = False
                     if not _HAS_PREAD:
                         limit = self._max_total_open_fds
-                        if limit is not None and self._open_handles >= limit:
-                            self._trim_idle_pooled_fds_locked(limit - 1, fds_to_close)
-                        if limit is None or self._open_handles < limit:
+                        if (
+                            limit is not None
+                            and self._open_handles + self._reserved_pool_opens >= limit
+                        ):
+                            self._trim_idle_pooled_fds_locked(
+                                max(0, limit - 1 - self._reserved_pool_opens), fds_to_close
+                            )
+                        if (
+                            limit is None
+                            or (self._open_handles + self._reserved_pool_opens) < limit
+                        ):
                             donated = existing.try_donate_pooled_fd(fd)
                             if donated:
                                 self._open_handles += 1
@@ -1107,10 +1133,12 @@ class ReadOnlyFileHandleCache:
                         self._retire_entry_locked(existing, fds_to_close)
                     if (
                         self._max_total_open_fds is not None
-                        and self._open_handles >= self._max_total_open_fds
+                        and self._open_handles + self._reserved_pool_opens
+                        >= self._max_total_open_fds
                     ):
                         self._trim_idle_pooled_fds_locked(
-                            self._max_total_open_fds - 1, fds_to_close
+                            max(0, self._max_total_open_fds - 1 - self._reserved_pool_opens),
+                            fds_to_close,
                         )
                     entry = _CachedFileHandle(
                         realpath,
@@ -1120,6 +1148,7 @@ class ReadOnlyFileHandleCache:
                         max_concurrent_fds=self._max_concurrent_fds_per_file,
                         on_before_pool_open=self._reserve_global_pool_fd_budget,
                         on_pool_fd_opened=self._record_pool_fd_opened,
+                        on_pool_open_aborted=self._release_global_pool_fd_reservation,
                         on_pool_fd_closed=self._record_pool_fd_closed,
                     )
                     self._entries[realpath] = entry
