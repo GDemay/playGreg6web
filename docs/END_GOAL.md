@@ -1,4 +1,4 @@
-# End Goal — `playgta6web`
+# End Goal — PlayGreg6Web
 
 ## Vision
 Run **Grand Theft Auto VI (Xbox Series)** directly inside a user's modern web browser (Chrome/Edge) via **Wasm64 (`memory64`) + WebGPU + HTTP `206` Range streaming**, hosted locally or on a private family/LAN server — with **zero server-side video streaming** and **zero copyrighted files in this repository**.
