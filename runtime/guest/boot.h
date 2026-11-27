@@ -609,6 +609,12 @@ std::string last_report_json();
 // calls made so far per guest thread and import. Later calls are ignored; reset by the next boot.
 void mark_first_present();
 
+// Milliseconds since the boot started (the clock of the report's elapsed_ms / frame_times).
+uint64_t boot_elapsed_ms();
+
+// Frames the title has presented so far.
+uint64_t boot_present_count();
+
 // Source of extra top-level report members: returns `"name": value[, ...]` text (no braces, no
 // trailing comma; empty for none), called whenever the report is built. nullptr removes it.
 using ReportExtension = std::string (*)();

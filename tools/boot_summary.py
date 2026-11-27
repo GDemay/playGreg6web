@@ -132,6 +132,33 @@ def frame_time_lines(report: dict[str, Any]) -> list[str]:
     return out
 
 
+def underrun_lines(report: dict[str, Any]) -> list[str]:
+    """audio_out.underrun_events printed next to the frame_times hitches: an underrun within ~500 ms of a
+    guest frame hitch (or already classed guest_stalled) is a guest stall, not host starvation."""
+    ao = _d(report.get("audio_out"))
+    events = [e for e in ao.get("underrun_events") or [] if isinstance(e, dict)]
+    if not events:
+        return []
+    hitches = [h for h in _d(report.get("frame_times")).get("hitches") or [] if isinstance(h, dict)]
+    out = [f"audio underruns ({_i(ao.get('underruns_guest_stalled'))} guest_stalled, "
+           f"{_i(ao.get('underruns_host_starved'))} host_starved):"]
+    for e in events:
+        at = _n(e.get("at_ms"))
+        near = [h for h in hitches if _n(h.get("at_ms")) - _n(h.get("ms")) - 500 <= at <= _n(h.get("at_ms")) + 500]
+        tag = ""
+        if near:
+            h = max(near, key=lambda x: _n(x.get("ms")))
+            tag = f"  <- frame hitch {_n(h.get('ms')):.0f} ms ending at {_n(h.get('at_ms')):.0f} ms"
+        out.append(f"  at {at:.0f} ms  {_i(e.get('frames_missing'))} frames missing  {e.get('cause')}  "
+                   f"{_n(e.get('ms_since_push')):.0f} ms since push, ring {_n(e.get('ring_fill_ms')):.0f} ms, "
+                   f"present #{_i(e.get('present_index'))}{tag}")
+    for h in hitches:
+        if not any(_n(e.get("at_ms")) >= _n(h.get("at_ms")) - _n(h.get("ms")) - 500 and
+                   _n(e.get("at_ms")) <= _n(h.get("at_ms")) + 500 for e in events):
+            out.append(f"  frame hitch {_n(h.get('ms')):.0f} ms ending at {_n(h.get('at_ms')):.0f} ms: no underrun")
+    return out
+
+
 def _gpu_table_phase_lines(title: str, table: dict[str, Any]) -> list[str]:
     phases = [p for p in (table.get("phases") or []) if isinstance(p, dict)]
     whole = sum(int(_n(e.get("draws")) + _n(e.get("dispatches"))) for e in (table.get("entries") or []) if isinstance(e, dict))
@@ -337,6 +364,7 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
         L.append(f"audio out: device {'open' if ao.get('device_open') else 'closed'}, "
                  f"{_i(ao.get('frames_played'))} frames played, {_i(ao.get('underruns'))} underruns"
                  + (f", error {ao.get('error')}" if ao.get("error") else ""))
+        L.extend(underrun_lines(report))
     b = _d(report.get("bink"))
     if b:
         callers = [e for e in b.get("exports") or [] if isinstance(e, dict) and _n(e.get("calls"))]

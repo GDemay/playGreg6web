@@ -1709,7 +1709,9 @@ int main(int argc, char** argv) {
                                                       g_audio_wasapi.open(), g_audio_wasapi.device_rate(),
                                                       g_audio_feed.buffer().stats(), g_audio_out_error,
                                                       g_audio_wasapi.device_channels(),
-                                                      g_audio_wasapi.device_channel_mask());
+                                                      g_audio_wasapi.device_channel_mask(),
+                                                      playgta6::os::audio_out::steady_now_us() -
+                                                          playgta6::guest::boot_elapsed_ms() * 1000ull);
                 }
             }
             if (s_with_presents) {
@@ -1834,6 +1836,7 @@ int main(int argc, char** argv) {
         }
     }
     if (g_options.audio_out) {
+        g_audio_feed.set_present_source([]() -> uint64_t { return playgta6::guest::boot_present_count(); });
         g_audio_out_active = g_audio_wasapi.start(g_audio_feed, &g_audio_out_error);
         if (!g_audio_out_active) {
             std::fprintf(stderr, "[harness] --audio-out: no audio device, continuing silent (%s)\n",
