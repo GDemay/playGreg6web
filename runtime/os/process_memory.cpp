@@ -9,6 +9,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <dxgi.h>
 #include <psapi.h>
 #endif
 
@@ -32,6 +33,43 @@ bool process_memory_bytes(uint64_t* private_bytes, uint64_t* working_set_bytes, 
     (void)working_set_bytes;
     (void)peak_private_bytes;
     return false;
+#endif
+}
+
+uint64_t available_physical_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    return GlobalMemoryStatusEx(&ms) ? ms.ullAvailPhys : 0;
+#else
+    return 0;
+#endif
+}
+
+uint64_t dedicated_video_memory_bytes() {
+#ifdef _WIN32
+    // Loaded at run time: no link dependency on dxgi.lib.
+    HMODULE dxgi = LoadLibraryW(L"dxgi");  // the loader appends .dll
+    if (dxgi == nullptr) return 0;
+    using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+    auto create = reinterpret_cast<CreateFactory>(reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")));
+    uint64_t best = 0;
+    IDXGIFactory1* factory = nullptr;
+    if (create != nullptr && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_ADAPTER_DESC1 d{};
+            if (SUCCEEDED(adapter->GetDesc1(&d)) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+                best = std::max<uint64_t>(best, d.DedicatedVideoMemory);
+            }
+            adapter->Release();
+        }
+        factory->Release();
+    }
+    FreeLibrary(dxgi);
+    return best;
+#else
+    return 0;
 #endif
 }
 
