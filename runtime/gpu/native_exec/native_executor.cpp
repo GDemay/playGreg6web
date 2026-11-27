@@ -265,6 +265,9 @@ struct BglEntry {
     wgpu::BindGroupLayout layout;
     std::vector<LayoutEntry> entries;
     bool entries_known = true;
+    // Over a per-stage limit on its own (an invalid layout): its bind groups are recorded for the remap
+    // but not created, and never bound (an invalid bind group in a pass invalidates the command buffer).
+    bool over_limits = false;
 };
 
 struct PlEntry {
@@ -272,6 +275,19 @@ struct PlEntry {
     bool group0_has_entries = false;
     // The worker's `pipelineLayoutMeta.group0Entries`: nullopt for a manifest layout or an empty slot.
     std::optional<std::vector<Group0LayoutEntry>> group0_entries;
+    // A v2 explicit layout's groups (empty for a manifest layout): each group's layout, its entries
+    // as the WGSL check and the per-stage limit counts read them (fit_pipeline_layout).
+    std::vector<wgpu::BindGroupLayout> bgls;
+    std::vector<FitExplicitGroup> fit_groups;
+    std::vector<std::vector<LayoutEntry>> entry_groups;
+};
+
+// Groups of a fitted pipeline layout the stream does not know about (built from the WGSL, or padding):
+// bound with dummy resources before a draw / dispatch unless the pass bound that group itself.
+struct FitDummies {
+    uint8_t mask = 0;
+    uint8_t force = 0;  // of `mask`: the title's groups replaced by padding (bound over whatever the pass bound)
+    std::array<wgpu::BindGroup, kFitMaxGroups> groups;
 };
 
 // A bind group's recorded descriptor (`bindGroupDescriptors`): the real (non-dummy) resources with
@@ -295,6 +311,11 @@ struct AutoLayoutMeta {
     // Group 0 layout built up front from the shader reflection (the pipeline was created with it as an
     // explicit layout): the remap binds against it without the pipeline having finished compiling.
     wgpu::BindGroupLayout reflected_bgl0;
+    // A fitted group 0 that keeps the title's binding numbers (its layout was over the per-stage limits):
+    // the remap binds each WGSL binding from the same binding of the title's bind group, and a missing
+    // one gets a dummy of the title's entry.
+    bool by_binding = false;
+    std::vector<LayoutEntry> by_binding_entries;
 };
 
 struct RemapCacheEntry {
@@ -322,6 +343,7 @@ struct ShaderEntry {
     // whether it declares @group(0) at all, the fragment outputs of an entry point.
     mutable std::string ep_cache[3];
     mutable std::optional<std::vector<WgslBinding>> group0_cache;
+    mutable std::optional<std::vector<std::vector<WgslBinding>>> groups_cache;  // every @group (layout fit)
     mutable std::optional<bool> declares_group0_cache;
     mutable std::string frag_mask_ep;
     mutable std::optional<std::optional<uint32_t>> frag_mask_cache;
@@ -370,10 +392,12 @@ struct RenderPipelineEntry : AsyncSlot {
     bool expects_group0 = false;
     uint64_t perf_hash = 0;  // GPU-time key: the fragment shader's hash, else the vertex shader's
     uint64_t quarantined_hash = 0;  // the stage hash that is on the shader quarantine (draws are skipped), else 0
+    FitDummies fit;
 };
 
 struct ComputePipelineEntry : AsyncSlot {
     mutable wgpu::ComputePipeline pipeline;
+    FitDummies fit;
 };
 
 struct BufferEntry {
@@ -522,6 +546,8 @@ struct NativeExecutor::Impl {
     ExecutorStats stats;
     DeviceFeatures features;
     uint32_t max_workgroups_per_dim = 65535;
+    StageLimits stage_limits;  // the device's per-stage binding limits (fit_pipeline_layout)
+    uint64_t fit_dummy_owner = 0;
     uint64_t frame_count = 0;
     std::atomic<bool> lost{false};  // set by Dawn's device-lost callback (any thread)
     bool blob_cache_opened = false;
@@ -1118,8 +1144,29 @@ struct NativeExecutor::Impl {
         use_shader_workers = want_worker_sync && shader_workers.running();
         stats.shader_workers = use_shader_workers ? shader_workers.size() : 0;
         wgpu::Limits limits{};
-        if (device.GetLimits(&limits) == wgpu::Status::Success && limits.maxComputeWorkgroupsPerDimension >= 1)
-            max_workgroups_per_dim = limits.maxComputeWorkgroupsPerDimension;
+        if (device.GetLimits(&limits) == wgpu::Status::Success) {
+            if (limits.maxComputeWorkgroupsPerDimension >= 1) max_workgroups_per_dim = limits.maxComputeWorkgroupsPerDimension;
+            stage_limits.uniform_buffers = limits.maxUniformBuffersPerShaderStage;
+            stage_limits.storage_buffers = limits.maxStorageBuffersPerShaderStage;
+            stage_limits.sampled_textures = limits.maxSampledTexturesPerShaderStage;
+            stage_limits.samplers = limits.maxSamplersPerShaderStage;
+            stage_limits.storage_textures = limits.maxStorageTexturesPerShaderStage;
+            stats.limit_uniform_buffers_per_stage = stage_limits.uniform_buffers;
+            stats.limit_storage_buffers_per_stage = stage_limits.storage_buffers;
+            stats.limit_sampled_textures_per_stage = stage_limits.sampled_textures;
+            stats.limit_samplers_per_stage = stage_limits.samplers;
+            stats.limit_storage_textures_per_stage = stage_limits.storage_textures;
+            // The adapter's own per-stage maxima (requested above where they exceed the defaults): a
+            // layout over these cannot be raised into range, only fitted to the WGSL.
+            std::fprintf(stderr,
+                         "[native_exec] per-stage limits (adapter / device): uniform buffers %u / %u, storage buffers "
+                         "%u / %u, sampled textures %u / %u, samplers %u / %u, storage textures %u / %u\n",
+                         adapter_limits.maxUniformBuffersPerShaderStage, limits.maxUniformBuffersPerShaderStage,
+                         adapter_limits.maxStorageBuffersPerShaderStage, limits.maxStorageBuffersPerShaderStage,
+                         adapter_limits.maxSampledTexturesPerShaderStage, limits.maxSampledTexturesPerShaderStage,
+                         adapter_limits.maxSamplersPerShaderStage, limits.maxSamplersPerShaderStage,
+                         adapter_limits.maxStorageTexturesPerShaderStage, limits.maxStorageTexturesPerShaderStage);
+        }
         if (!surface) create_offscreen();
         if (options.gpu_timing) setup_timers(adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery));
         *status = CreateStatus::Ok;
@@ -2591,6 +2638,185 @@ struct NativeExecutor::Impl {
         return true;
     }
 
+    // A bind group layout of WGSL bindings (a fitted group): buffers without a minimum size (checked
+    // at the draw against the shader, like the title's own entries), the rest as the remap synthesizes.
+    wgpu::BindGroupLayout wgsl_bgl(const std::vector<FitBinding>& fb) {
+        std::vector<wgpu::BindGroupLayoutEntry> wes(fb.size());
+        for (size_t i = 0; i < fb.size(); ++i) {
+            const SynthLayoutEntry se = synth_layout_entry(fb[i].b);
+            wgpu::BindGroupLayoutEntry& w = wes[i];
+            w.binding = se.binding;
+            w.visibility = static_cast<wgpu::ShaderStage>(fb[i].visibility);
+            if (se.kind == 0) {
+                w.buffer.type = se.subtype == 0   ? wgpu::BufferBindingType::Uniform
+                                : se.subtype == 1 ? wgpu::BufferBindingType::Storage
+                                                  : wgpu::BufferBindingType::ReadOnlyStorage;
+            } else if (se.kind == 1) {
+                w.sampler.type = se.subtype == 2 ? wgpu::SamplerBindingType::Comparison : wgpu::SamplerBindingType::Filtering;
+            } else if (se.kind == 2) {
+                static const wgpu::TextureSampleType kS[5] = {
+                    wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
+                    wgpu::TextureSampleType::Depth, wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
+                w.texture.sampleType = kS[se.subtype < 5 ? se.subtype : 0];
+                if (se.multisampled && w.texture.sampleType == wgpu::TextureSampleType::Float)
+                    w.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+                w.texture.viewDimension = wgpu_view_dim(se.view_dim);
+                w.texture.multisampled = se.multisampled;
+            } else {
+                const StorageResolution sr = resolve_storage_format(se.storage_format, features);
+                const uint8_t f = sr.supported && sr.storage_format ? sr.storage_format : 22;
+                w.storageTexture.access = wgpu::StorageTextureAccess::WriteOnly;
+                w.storageTexture.format = wgpu_format(f);
+                w.storageTexture.viewDimension = wgpu_view_dim(se.view_dim == 4 || se.view_dim == 5 ? 3 : se.view_dim);
+            }
+        }
+        wgpu::BindGroupLayoutDescriptor d{};
+        d.entryCount = wes.size();
+        d.entries = wes.data();
+        return device.CreateBindGroupLayout(&d);
+    }
+
+    // A bind group of dummy resources for a fitted group the stream does not bind.
+    wgpu::BindGroup fit_dummy_group(const wgpu::BindGroupLayout& bgl, const std::vector<FitBinding>& fb) {
+        const uint64_t owner = (1ull << 63) | ++fit_dummy_owner;  // distinct storage-texture dummies
+        std::vector<wgpu::BindGroupEntry> wes(fb.size());
+        for (size_t i = 0; i < fb.size(); ++i) {
+            const SynthLayoutEntry se = synth_layout_entry(fb[i].b);
+            LayoutEntry le;
+            le.binding = se.binding;
+            le.kind = se.kind;
+            le.subtype = se.subtype;
+            le.view_dim = se.kind == 3 && (se.view_dim == 4 || se.view_dim == 5) ? 3 : se.view_dim;
+            le.storage_format = se.storage_format;
+            le.multisampled = se.multisampled;
+            le.min_binding_size = 65536;  // the largest uniform binding a WGSL struct can ask for by default
+            const Dummy dm = dummy_resource(le, owner);
+            wes[i].binding = se.binding;
+            wes[i].buffer = dm.buffer;
+            wes[i].sampler = dm.sampler;
+            wes[i].textureView = dm.view;
+            wes[i].size = wgpu::kWholeSize;
+        }
+        wgpu::BindGroupDescriptor bd{};
+        bd.layout = bgl;
+        bd.entryCount = wes.size();
+        bd.entries = wes.data();
+        return device.CreateBindGroup(&bd);
+    }
+
+    // The title's explicit layout fitted to the pipeline's WGSL (layout_model.h): null when the layout
+    // serves the WGSL as it is (or is a manifest layout, or would stay over the limits). A group 0 that
+    // the remap binds (`meta.remap`, or the title's layout is over a per-stage limit: the remap then
+    // binds only what the WGSL references) is built from the WGSL and handed to the remap in
+    // `meta.reflected_bgl0`; groups above 0 that the title's layout lacks are built from the WGSL and
+    // get dummy bind groups (`dummies`) for passes that do not bind them.
+    wgpu::PipelineLayout fit_pipeline_layout(const PlEntry& pl, const std::vector<FitStage>& stages, AutoLayoutMeta& meta,
+                                             const std::vector<WgslBinding>& group0, FitDummies* dummies) {
+        if (pl.fit_groups.empty()) return {};
+        size_t ng = 0;
+        for (const FitStage& st : stages)
+            if (st.groups) ng = std::max(ng, st.groups->size());
+        std::vector<std::vector<FitBinding>> wg(ng);
+        for (size_t g = 0; g < ng; ++g) wg[g] = merge_fit_group(stages, g);
+        auto limits_of = [](const std::vector<LayoutEntry>& es, std::vector<LimitEntry>* out) {
+            for (const LayoutEntry& le : es) out->push_back({le.visibility, le.kind, le.subtype});
+        };
+        std::vector<LimitEntry> title_entries;
+        for (const auto& eg : pl.entry_groups) limits_of(eg, &title_entries);
+        const bool over = !stage_limit_excess(title_entries, stage_limits).empty();
+        bool upper = false;
+        for (size_t g = 1; g < ng; ++g) upper = upper || !wg[g].empty();
+        const bool remap0 = meta.remap || over;
+        std::vector<FitSource> src = fit_layout_groups(pl.fit_groups, wg, remap0);
+        if (!layout_needs_fit(src, pl.fit_groups.size(), over) && !(meta.remap && upper)) return {};
+        std::vector<LimitEntry> fitted;
+        for (size_t g = 0; g < src.size(); ++g) {
+            if (src[g] == FitSource::Explicit) limits_of(pl.entry_groups[g], &fitted);
+            else if (src[g] == FitSource::Wgsl)
+                for (const FitBinding& f : wg[g]) fitted.push_back(limit_entry_of(f));
+        }
+        uint8_t force = 0;
+        if (!stage_limit_excess(fitted, stage_limits).empty()) {
+            std::vector<FitSource> padded = src;
+            force = replace_unused_groups(&padded, wg);
+            fitted.clear();
+            for (size_t g = 0; g < padded.size(); ++g) {
+                if (padded[g] == FitSource::Explicit) limits_of(pl.entry_groups[g], &fitted);
+                else if (padded[g] == FitSource::Wgsl)
+                    for (const FitBinding& f : wg[g]) fitted.push_back(limit_entry_of(f));
+            }
+            const std::string excess = stage_limit_excess(fitted, stage_limits);
+            if (!force || !excess.empty()) {
+                if (++stats.layout_fit_still_over <= 8)
+                    std::fprintf(stderr, "[native_exec] layout fit: the WGSL alone is over a per-stage limit: %s\n",
+                                 excess.c_str());
+                return {};
+            }
+            src = std::move(padded);
+            for (uint32_t g = 0; g < kFitMaxGroups; ++g)
+                if (force & (1u << g)) ++stats.layout_fit_unused_groups;
+        }
+        std::vector<wgpu::BindGroupLayout> bgls(src.size());
+        FitDummies fd;
+        // Over the limits with a group 0 that matches the WGSL: the title's own entries for the bindings
+        // the WGSL references, visible to the stages that reference them (dynamic offsets fold into the
+        // remap's static ones).
+        const bool by_binding = remap0 && !meta.remap && !wg.empty() && !wg[0].empty() && !pl.entry_groups.empty();
+        std::vector<LayoutEntry> bb;
+        if (by_binding) {
+            for (const FitBinding& f : wg[0])
+                for (const LayoutEntry& le : pl.entry_groups[0])
+                    if (le.binding == f.b.binding) {
+                        LayoutEntry x = le;
+                        x.visibility = f.visibility;
+                        x.dynamic = false;
+                        // The title's storage entry for a WGSL read-only binding: Dawn wants the WGSL's access.
+                        if (x.kind == 0)
+                            x.subtype = f.b.kind == WgslBindingKind::Uniform ? 0 : f.b.kind == WgslBindingKind::Storage ? 1 : 2;
+                        bb.push_back(x);
+                    }
+            std::vector<wgpu::BindGroupLayoutEntry> wes(bb.size());
+            for (size_t i = 0; i < bb.size(); ++i) to_wgpu_layout_entry(bb[i], &wes[i]);
+            wgpu::BindGroupLayoutDescriptor d{};
+            d.entryCount = wes.size();
+            d.entries = wes.data();
+            bgls[0] = device.CreateBindGroupLayout(&d);
+        }
+        for (size_t g = 0; g < src.size(); ++g) {
+            if (src[g] == FitSource::Explicit) {
+                bgls[g] = pl.bgls[g];
+                continue;
+            }
+            if (g == 0 && by_binding) continue;
+            const std::vector<FitBinding> none;
+            const std::vector<FitBinding>& fb = src[g] == FitSource::Wgsl ? wg[g] : none;
+            bgls[g] = fb.empty() ? empty_bgl() : wgsl_bgl(fb);
+            if (g > 0 && src[g] == FitSource::Wgsl) ++stats.layout_fit_wgsl_groups;
+            // Group 0 with bindings is the remap's; everything else the stream does not bind gets dummies.
+            if (g == 0 && !fb.empty()) continue;
+            fd.mask |= static_cast<uint8_t>(1u << g);
+            fd.groups[g] = fit_dummy_group(bgls[g], fb);
+        }
+        wgpu::PipelineLayoutDescriptor pd{};
+        pd.bindGroupLayoutCount = bgls.size();
+        pd.bindGroupLayouts = bgls.data();
+        wgpu::PipelineLayout fitted_pl = device.CreatePipelineLayout(&pd);
+        if (remap0) {
+            if (!meta.remap) {
+                meta.remap = true;
+                meta.bindings = group0;
+                meta.by_binding = by_binding;
+                meta.by_binding_entries = std::move(bb);
+            }
+            meta.reflected_bgl0 = bgls[0];
+        }
+        if (over) ++stats.layout_fit_over_limits;
+        ++stats.layout_fit_pipelines;
+        fd.force = force;
+        *dummies = std::move(fd);
+        return fitted_pl;
+    }
+
     // v2 remap pipelines: an explicit layout from the stages' reflection instead of layout:'auto', so
     // nothing has to wait for the compiled pipeline to get its group 0 layout. Null (stay on 'auto',
     // budgeted wait later) unless every stage has a record and its group 0 binds exactly the WGSL's
@@ -2696,8 +2922,9 @@ struct NativeExecutor::Impl {
             ++e.worker_scans;
         }
         e.group0_cache = parse_wgsl_group0_bindings(e.code);
+        e.groups_cache = parse_wgsl_group_bindings(e.code);
         e.declares_group0_cache = wgsl_declares_group0(e.code);
-        e.worker_scans += 2;
+        e.worker_scans += 3;
         if (e.stage == 1) {
             e.frag_mask_ep = e.ep_cache[1];
             e.frag_mask_cache = wgsl_fragment_output_mask(e.code, e.frag_mask_ep);
@@ -2865,6 +3092,15 @@ struct NativeExecutor::Impl {
             note_scan(now_ns() - t0);
         }
         return *e.group0_cache;
+    }
+
+    const std::vector<std::vector<WgslBinding>>& groups_of(const ShaderEntry& e) {
+        if (!e.groups_cache) {
+            const uint64_t t0 = now_ns();
+            e.groups_cache = parse_wgsl_group_bindings(e.code);
+            note_scan(now_ns() - t0);
+        }
+        return *e.groups_cache;
     }
 
     bool declares_group0_of(const ShaderEntry& e) {
@@ -3385,6 +3621,40 @@ struct NativeExecutor::Impl {
         return true;
     }
 
+    // decodeBindGroupLayoutEntry -> the WebGPU entry (create_bind_group_layout, fitted group 0).
+    static void to_wgpu_layout_entry(const LayoutEntry& le, wgpu::BindGroupLayoutEntry* out) {
+        wgpu::BindGroupLayoutEntry& w = *out;
+        w.binding = le.binding;
+        w.visibility = static_cast<wgpu::ShaderStage>(le.visibility);
+        if (le.kind == 0) {
+            w.buffer.type = le.subtype == 0   ? wgpu::BufferBindingType::Uniform
+                            : le.subtype == 1 ? wgpu::BufferBindingType::Storage
+                                              : wgpu::BufferBindingType::ReadOnlyStorage;
+            w.buffer.hasDynamicOffset = le.dynamic;
+            w.buffer.minBindingSize = le.min_binding_size;
+        } else if (le.kind == 1) {
+            w.sampler.type = le.subtype == 0   ? wgpu::SamplerBindingType::Filtering
+                             : le.subtype == 1 ? wgpu::SamplerBindingType::NonFiltering
+                                               : wgpu::SamplerBindingType::Comparison;
+        } else if (le.kind == 2) {
+            static const wgpu::TextureSampleType kS[5] = {
+                wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
+                wgpu::TextureSampleType::Depth, wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
+            w.texture.sampleType = kS[le.subtype];
+            // 'float' + multisampled is invalid in WebGPU (a Texture2DMS<float4> SRV): non-filterable
+            if (le.multisampled && w.texture.sampleType == wgpu::TextureSampleType::Float)
+                w.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
+            w.texture.viewDimension = wgpu_view_dim(le.view_dim);
+            w.texture.multisampled = le.multisampled;
+        } else {
+            w.storageTexture.access = le.subtype == 0   ? wgpu::StorageTextureAccess::WriteOnly
+                                      : le.subtype == 1 ? wgpu::StorageTextureAccess::ReadOnly
+                                                        : wgpu::StorageTextureAccess::ReadWrite;
+            w.storageTexture.format = wgpu_format(le.storage_format);
+            w.storageTexture.viewDimension = wgpu_view_dim(le.view_dim);
+        }
+    }
+
     bool create_bind_group_layout(const Packet& p) {
         if (p.payload_bytes < sizeof(GpuCreateBindGroupLayoutPayload)) return false;
         const auto h = read_payload<GpuCreateBindGroupLayoutPayload>(p);
@@ -3451,39 +3721,7 @@ struct NativeExecutor::Impl {
             layout = cit->second;
         } else {
             std::vector<wgpu::BindGroupLayoutEntry> wes(entries.size());
-            for (size_t i = 0; i < entries.size(); ++i) {
-                const LayoutEntry& le = entries[i];
-                wgpu::BindGroupLayoutEntry& w = wes[i];
-                w.binding = le.binding;
-                w.visibility = static_cast<wgpu::ShaderStage>(le.visibility);
-                if (le.kind == 0) {
-                    w.buffer.type = le.subtype == 0   ? wgpu::BufferBindingType::Uniform
-                                    : le.subtype == 1 ? wgpu::BufferBindingType::Storage
-                                                      : wgpu::BufferBindingType::ReadOnlyStorage;
-                    w.buffer.hasDynamicOffset = le.dynamic;
-                    w.buffer.minBindingSize = le.min_binding_size;
-                } else if (le.kind == 1) {
-                    w.sampler.type = le.subtype == 0   ? wgpu::SamplerBindingType::Filtering
-                                     : le.subtype == 1 ? wgpu::SamplerBindingType::NonFiltering
-                                                       : wgpu::SamplerBindingType::Comparison;
-                } else if (le.kind == 2) {
-                    static const wgpu::TextureSampleType kS[5] = {
-                        wgpu::TextureSampleType::Float, wgpu::TextureSampleType::UnfilterableFloat,
-                        wgpu::TextureSampleType::Depth, wgpu::TextureSampleType::Sint, wgpu::TextureSampleType::Uint};
-                    w.texture.sampleType = kS[le.subtype];
-                    // 'float' + multisampled is invalid in WebGPU (a Texture2DMS<float4> SRV): non-filterable
-                    if (le.multisampled && w.texture.sampleType == wgpu::TextureSampleType::Float)
-                        w.texture.sampleType = wgpu::TextureSampleType::UnfilterableFloat;
-                    w.texture.viewDimension = wgpu_view_dim(le.view_dim);
-                    w.texture.multisampled = le.multisampled;
-                } else {
-                    w.storageTexture.access = le.subtype == 0   ? wgpu::StorageTextureAccess::WriteOnly
-                                              : le.subtype == 1 ? wgpu::StorageTextureAccess::ReadOnly
-                                                                : wgpu::StorageTextureAccess::ReadWrite;
-                    w.storageTexture.format = wgpu_format(le.storage_format);
-                    w.storageTexture.viewDimension = wgpu_view_dim(le.view_dim);
-                }
-            }
+            for (size_t i = 0; i < entries.size(); ++i) to_wgpu_layout_entry(entries[i], &wes[i]);
             wgpu::BindGroupLayoutDescriptor d{};
             d.entryCount = wes.size();
             d.entries = wes.data();
@@ -3492,6 +3730,12 @@ struct NativeExecutor::Impl {
         }
         BglEntry b;
         b.layout = layout;
+        {
+            std::vector<LimitEntry> le;
+            for (const LayoutEntry& x : entries) le.push_back({x.visibility, x.kind, x.subtype});
+            b.over_limits = !stage_limit_excess(le, stage_limits).empty();
+            if (b.over_limits) ++stats.over_limit_bind_group_layouts;
+        }
         b.entries = std::move(entries);
         bgls[h.id] = std::move(b);
         ++stats.bind_group_layouts;
@@ -3528,6 +3772,8 @@ struct NativeExecutor::Impl {
         }
         if (uint64_t{24} + uint64_t{h.bind_group_layout_count} * 4 > p.payload_bytes) return false;
         std::vector<wgpu::BindGroupLayout> layouts;
+        std::vector<FitExplicitGroup> fit_groups;
+        std::vector<std::vector<LayoutEntry>> entry_groups;
         const BglEntry* group0 = nullptr;
         for (uint32_t g = 0; g < h.bind_group_layout_count; ++g) {
             const uint32_t bgl_id = read_payload<uint32_t>(p, 24 + size_t{g} * 4);
@@ -3539,12 +3785,26 @@ struct NativeExecutor::Impl {
             }
             if (g == 0) group0 = rec;
             layouts.push_back(rec ? rec->layout : empty_bgl());
+            FitExplicitGroup fg;
+            std::vector<LayoutEntry> eg;
+            if (!rec || rec->entries_known) {
+                fg.entries.emplace();
+                if (rec) {
+                    for (const LayoutEntry& le : rec->entries) fg.entries->push_back({le.binding, le.kind, le.subtype});
+                    eg = rec->entries;
+                }
+            }
+            fit_groups.push_back(std::move(fg));
+            entry_groups.push_back(std::move(eg));
         }
         wgpu::PipelineLayoutDescriptor d{};
         d.bindGroupLayoutCount = layouts.size();
         d.bindGroupLayouts = layouts.data();
         PlEntry e;
         e.layout = device.CreatePipelineLayout(&d);
+        e.bgls = layouts;
+        e.fit_groups = std::move(fit_groups);
+        e.entry_groups = std::move(entry_groups);
         e.group0_has_entries = group0 && (!group0->entries_known || !group0->entries.empty());
         if (group0 && group0->entries_known) {
             std::vector<Group0LayoutEntry> g0;
@@ -3777,14 +4037,22 @@ struct NativeExecutor::Impl {
             }
         }
         auto_meta.gen = ++pipeline_gen_counter;
+        FitDummies fit;
+        wgpu::PipelineLayout fitted_pl;
+        if (!auto_layout) {
+            const std::vector<FitStage> st = {{kFitVertex, &groups_of(vs)}, {kFitFragment, fs ? &groups_of(*fs) : nullptr}};
+            fitted_pl = fit_pipeline_layout(
+                *pl, st, auto_meta, merge_wgsl_group0_bindings(group0_of(vs), fs ? group0_of(*fs) : std::vector<WgslBinding>{}),
+                &fit);
+        }
         wgpu::PipelineLayout reflected_pl;
-        if (auto_meta.remap && reflection.shader_count() != 0) {
+        if (!fitted_pl && auto_meta.remap && reflection.shader_count() != 0) {
             std::vector<const reflect::StageRecord*> rf;
             if (const auto* r = resolve_shader_reflection(vs, "vertex")) rf.push_back(r);
             if (fs) if (const auto* r = resolve_shader_reflection(*fs, "fragment")) rf.push_back(r);
             reflected_pl = reflected_remap_layout(auto_meta, rf, fs ? 2 : 1);
         }
-        rd.layout = reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
+        rd.layout = fitted_pl ? fitted_pl : reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
         rd.vertex.module = vs.module;
         const std::string& vep = entry_point_of(vs, "vertex");
         rd.vertex.entryPoint = {vep.data(), vep.size()};
@@ -3804,6 +4072,7 @@ struct NativeExecutor::Impl {
         if (!expects && !auto_layout && group0_has_entries) expects = true;
         e.expects_group0 = expects;
         e.auto_meta = std::move(auto_meta);
+        e.fit = std::move(fit);
         e.perf_hash = fs && fs->hash ? fs->hash : vs.hash;
         e.quarantined_hash = quarantined_stage(fs ? fs->hash : 0, vs.hash);
         render_pipelines[h.id] = std::move(e);
@@ -4029,6 +4298,7 @@ struct NativeExecutor::Impl {
         const std::string msg = std::string("async ") + what + " pipeline [vs=" + hash_hex(slot.vs_hash) +
                                 " fs=" + hash_hex(slot.fs_hash) + "]: " + st.message;
         stats.last_device_error = msg;
+        ++stats.async_failure_kinds[classify_pipeline_failure(st.message)];
         if (stats.device_error_log.size() < 20) stats.device_error_log.push_back(msg);
         if (stats.async_pipeline_failures <= 16) std::fprintf(stderr, "[native_exec] %s\n", msg.substr(0, 600).c_str());
     }
@@ -4148,16 +4418,20 @@ struct NativeExecutor::Impl {
         }
         auto_meta.gen = ++pipeline_gen_counter;
         wgpu::ComputePipelineDescriptor cd{};
+        FitDummies fit;
+        wgpu::PipelineLayout fitted_pl;
+        if (!auto_layout) fitted_pl = fit_pipeline_layout(*pl, {{kFitCompute, &groups_of(cs)}}, auto_meta, group0_of(cs), &fit);
         wgpu::PipelineLayout reflected_pl;
-        if (auto_meta.remap && reflection.shader_count() != 0) {
+        if (!fitted_pl && auto_meta.remap && reflection.shader_count() != 0) {
             std::vector<const reflect::StageRecord*> rf;
             if (const auto* r = resolve_shader_reflection(cs, "compute")) rf.push_back(r);
             reflected_pl = reflected_remap_layout(auto_meta, rf, 1);
         }
-        cd.layout = reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
+        cd.layout = fitted_pl ? fitted_pl : reflected_pl ? reflected_pl : auto_layout || auto_meta.remap ? nullptr : layout;
         cd.compute.module = cs.module;
         cd.compute.entryPoint = {ep.data(), ep.size()};
         ComputePipelineEntry ce;
+        ce.fit = std::move(fit);
         if (options.async_pipelines) {
             create_compute_async(cd, &ce);
         } else {
@@ -4784,7 +5058,8 @@ struct NativeExecutor::Impl {
         bd.layout = rec.layout;
         bd.entryCount = wes.size();
         bd.entries = wes.data();
-        bind_groups[h.id] = device.CreateBindGroup(&bd);
+        if (rec.over_limits) bind_groups[h.id] = nullptr;  // recorded (desc) for the remap only
+        else bind_groups[h.id] = device.CreateBindGroup(&bd);
         bg_descs[h.id] = std::move(desc);
         compute_bind_groups.erase(h.id);  // a v2 group of the same id is not a v1 compute group
         ++stats.bind_groups;
@@ -4982,7 +5257,17 @@ struct NativeExecutor::Impl {
         bool explicit_pass = false;       // the active render pass came from BeginRenderPass
         std::optional<AttachmentSize> explicit_size;
         bool group0_bound = false;
+        uint8_t bound_groups = 0;  // groups the active pass bound (bit = group): fitted dummies skip them
+        // The stream's own bind groups 1..3 of the active pass, to restore after a padded pipeline's
+        // draw bound its padding over them (`overridden`).
+        struct StreamGroup {
+            wgpu::BindGroup group;
+            std::vector<uint32_t> offsets;
+        };
+        std::array<StreamGroup, kFitMaxGroups> stream_groups;
+        uint8_t overridden = 0;
         std::optional<uint32_t> active_pipeline;
+        std::optional<uint32_t> active_compute;
         // _preparePassCommandsForFlush compute filter state
         bool had_explicit_compute = false, compute_valid = false;
         bool compute_failed = false;  // the compute pipeline's async compile failed
@@ -5039,7 +5324,11 @@ struct NativeExecutor::Impl {
             if (cpass) { cpass.End(); cpass = nullptr; }
             explicit_pass = false;
             group0_bound = false;
+            bound_groups = 0;
+            overridden = 0;
+            for (auto& sg : stream_groups) sg = StreamGroup{};
             active_pipeline.reset();
+            active_compute.reset();
         }
         void ensure_render() {  // _ensurePresentRenderPass
             if (rpass) return;
@@ -5255,6 +5544,7 @@ struct NativeExecutor::Impl {
                     return;
                 }
                 e.ensure_compute();
+                bind_compute_fit_dummies(e);
                 e.cpass.DispatchWorkgroupsIndirect(it->second.buffer, in->offset);
                 ++stats.dispatches;
             } else if (draw_allowed(e)) {
@@ -5266,6 +5556,7 @@ struct NativeExecutor::Impl {
             if (auto dit = compute_pipelines.find(sc->id); dit != compute_pipelines.end()) settle_budgeted(dit->second);
             remap_set_compute_pipeline(sc->id);
             e.ensure_compute();
+            e.active_compute = sc->id;
             e.had_explicit_compute = true;
             auto it = compute_pipelines.find(sc->id);
             e.compute_valid = it != compute_pipelines.end();
@@ -5318,6 +5609,7 @@ struct NativeExecutor::Impl {
             }
             remap_before_dispatch(e);
             e.ensure_compute();
+            bind_compute_fit_dummies(e);
             e.cpass.DispatchWorkgroups(x, y, z);
             ++stats.dispatches;
         } else if (const auto* vp = std::get_if<ViewportCmd>(&cmd)) {
@@ -5343,9 +5635,18 @@ struct NativeExecutor::Impl {
         } else if (const auto* bg = std::get_if<SetBindGroup2Cmd>(&cmd)) {
             if (bg->group == 0 && remap_set_group0(e, *bg)) return;  // layout:'auto' remap
             if (!e.rpass && !e.cpass) return;  // `if (!ctl.pass) return`
+            if (!bg->bind_group) {  // a group of an over-limit layout: only a fitted pipeline can use it (remap)
+                ++stats.over_limit_binds_skipped;
+                return;
+            }
             if (e.rpass) e.rpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
             else e.cpass.SetBindGroup(bg->group, bg->bind_group, bg->offsets.size(), bg->offsets.data());
             if (bg->group == 0) e.group0_bound = true;
+            if (bg->group < 8) e.bound_groups |= static_cast<uint8_t>(1u << bg->group);
+            if (bg->group > 0 && bg->group < kFitMaxGroups) {
+                e.stream_groups[bg->group] = {bg->bind_group, bg->offsets};
+                e.overridden &= static_cast<uint8_t>(~(1u << bg->group));
+            }
         } else if (const auto* b1 = std::get_if<SetBindGroup1Cmd>(&cmd)) {
             // `this.bindGroups.get(id) || cmd.bindGroup`; a missing group is a validation error.
             auto it = bind_groups.find(b1->id);
@@ -5361,6 +5662,11 @@ struct NativeExecutor::Impl {
             if (e.rpass) e.rpass.SetBindGroup(b1->group, bg, 0, nullptr);
             else e.cpass.SetBindGroup(b1->group, bg, 0, nullptr);
             if (b1->group == 0) e.group0_bound = true;
+            if (b1->group < 8) e.bound_groups |= static_cast<uint8_t>(1u << b1->group);
+            if (b1->group > 0 && b1->group < kFitMaxGroups) {
+                e.stream_groups[b1->group] = {bg, {}};
+                e.overridden &= static_cast<uint8_t>(~(1u << b1->group));
+            }
         } else if (const auto* rb = std::get_if<ReadbackCmd>(&cmd)) {
             e.end_active();  // _recordReadbackCopy: pc.endPass()
             record_readback_copy(e.enc, rb->req);
@@ -5464,7 +5770,7 @@ struct NativeExecutor::Impl {
                 const WgslBinding& b = meta.bindings[i];
                 wgpu::BindGroupEntry& w = wes[i];
                 w.binding = b.binding;
-                const PickResult r = picker.pick(b);
+                const PickResult r = meta.by_binding ? picker.pick_binding(b) : picker.pick(b);
                 if (r.kind == PickResult::Kind::Resource) {
                     const BgHandles& hnd = desc->handles[r.index];
                     w.buffer = hnd.buffer;
@@ -5490,6 +5796,11 @@ struct NativeExecutor::Impl {
                     le.storage_format = se.storage_format;
                     le.multisampled = se.multisampled;
                     le.min_binding_size = se.min_binding_size;
+                    for (const LayoutEntry& x : meta.by_binding_entries)
+                        if (x.binding == b.binding) {
+                            le = x;
+                            le.min_binding_size = std::max<uint64_t>(x.min_binding_size, se.min_binding_size);
+                        }
                     const Dummy d = dummy_resource(le);
                     w.buffer = d.buffer;
                     w.sampler = d.sampler;
@@ -5517,6 +5828,43 @@ struct NativeExecutor::Impl {
         return out;
     }
 
+    // Before a draw / dispatch: the fitted groups the pass has not bound get their dummies.
+    // Every draw / dispatch: a group a padded pipeline bound over the stream's own is restored first
+    // (unless this pipeline pads it too).
+    void bind_fit_dummies(Encoder& e, const FitDummies& fd) {
+        if (!e.rpass && !e.cpass) return;
+        for (uint32_t g = 1; g < kFitMaxGroups && e.overridden; ++g) {
+            const uint8_t bit = static_cast<uint8_t>(1u << g);
+            if (!(e.overridden & bit) || (fd.force & bit)) continue;
+            e.overridden &= static_cast<uint8_t>(~bit);
+            const auto& sg = e.stream_groups[g];
+            if (!sg.group) continue;
+            if (e.rpass) e.rpass.SetBindGroup(g, sg.group, sg.offsets.size(), sg.offsets.data());
+            else e.cpass.SetBindGroup(g, sg.group, sg.offsets.size(), sg.offsets.data());
+            ++stats.layout_fit_restores;
+        }
+        if (!fd.mask) return;
+        for (uint32_t g = 0; g < kFitMaxGroups; ++g) {
+            const uint8_t bit = static_cast<uint8_t>(1u << g);
+            const bool force = (fd.force & bit) != 0;
+            if (!(fd.mask & bit) || !fd.groups[g]) continue;
+            if (!force && (e.bound_groups & bit)) continue;
+            if (force && (e.overridden & bit)) continue;  // still bound from the previous draw
+            if (e.rpass) e.rpass.SetBindGroup(g, fd.groups[g], 0, nullptr);
+            else e.cpass.SetBindGroup(g, fd.groups[g], 0, nullptr);
+            e.bound_groups |= bit;
+            if (force) e.overridden |= bit;
+            ++stats.layout_fit_dummy_binds;
+        }
+    }
+
+    void bind_compute_fit_dummies(Encoder& e) {
+        static const FitDummies kNone;
+        if (!e.active_compute || !e.compute_valid) return bind_fit_dummies(e, kNone);
+        auto it = compute_pipelines.find(*e.active_compute);
+        bind_fit_dummies(e, it != compute_pipelines.end() ? it->second.fit : kNone);
+    }
+
     // RemappedSetBindGroupCommand.run: `if (!ctl.pass) return`.
     void apply_remapped(Encoder& e, const wgpu::BindGroup& g) {
         if (!e.rpass && !e.cpass) return;
@@ -5526,6 +5874,7 @@ struct NativeExecutor::Impl {
         } else {
             e.cpass.SetBindGroup(0, g, 0, nullptr);
         }
+        e.bound_groups |= 1u;
     }
 
     void remap_reset_compute() {
@@ -5988,6 +6337,7 @@ struct NativeExecutor::Impl {
                 ++stats.op_errors;
                 return false;
             }
+            bind_fit_dummies(e, it->second.fit);
         }
         return true;
     }
@@ -6722,6 +7072,29 @@ std::string NativeExecutor::stats_json() const {
     num("async_pipeline_wait_ns", st.async_pipeline_wait_ns);
     num("pipeline_pending_skips", st.pipeline_pending_skips);
     num("remap_reflected_layouts", st.remap_reflected_layouts);
+    num("layout_fit_pipelines", st.layout_fit_pipelines);
+    num("layout_fit_wgsl_groups", st.layout_fit_wgsl_groups);
+    num("layout_fit_over_limits", st.layout_fit_over_limits);
+    num("layout_fit_still_over", st.layout_fit_still_over);
+    num("layout_fit_dummy_binds", st.layout_fit_dummy_binds);
+    num("layout_fit_unused_groups", st.layout_fit_unused_groups);
+    num("layout_fit_restores", st.layout_fit_restores);
+    num("over_limit_bind_group_layouts", st.over_limit_bind_group_layouts);
+    num("over_limit_binds_skipped", st.over_limit_binds_skipped);
+    j += "\"async_failure_kinds\": {";
+    {
+        bool first = true;
+        for (const auto& [k, v] : st.async_failure_kinds) {
+            j += (first ? "\"" : ", \"") + k + "\": " + std::to_string(v);
+            first = false;
+        }
+    }
+    j += "}, ";
+    num("limit_uniform_buffers_per_stage", st.limit_uniform_buffers_per_stage);
+    num("limit_storage_buffers_per_stage", st.limit_storage_buffers_per_stage);
+    num("limit_sampled_textures_per_stage", st.limit_sampled_textures_per_stage);
+    num("limit_samplers_per_stage", st.limit_samplers_per_stage);
+    num("limit_storage_textures_per_stage", st.limit_storage_textures_per_stage);
     num("quarantine_skips", st.quarantine_skips);
     num("async_pipeline_failures", st.async_pipeline_failures);
     num("pipeline_failed_skips", st.pipeline_failed_skips);

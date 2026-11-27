@@ -477,6 +477,239 @@ void test_auto_layout_remap(NativeExecutor& ex) {
     CHECK(s.device_errors == before.device_errors);
 }
 
+// A compute WGSL that binds @group(3) (as the pack's mesh-to-compute translations do) under a title
+// layout with group 0 only: the layout is fitted (group 3 from the WGSL), the pipeline compiles, a
+// pass that does not bind group 3 gets a dummy there, and one that binds its own group 3 keeps it.
+const char* kComputeGroup3 = R"(
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@group(3) @binding(0) var<storage, read_write> ms_out: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) {
+    out[i] = i * 5u + 1u;
+    ms_out[i] = i + 100u;
+}
+)";
+
+void test_layout_fit_missing_group(NativeExecutor& ex) {
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(130, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_buffer(131, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_shader_module(132, GpuShaderStage::Compute, kComputeGroup3);
+    create_layouts(setup, 133, 134, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 135;
+    cp.cs_module_id = 132;
+    cp.pipeline_layout_id = 134;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 136, 133, {bg_entry(0, GpuBindResourceType::Buffer, 130)});
+    // The stream's own group 3 (the state bridge's mesh output group: one storage buffer, compute).
+    std::vector<uint8_t> bgl3;
+    append(bgl3, GpuCreateBindGroupLayoutPayload{137, 1, 0, 0, 0});
+    append(bgl3, layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1));
+    emit(setup, GpuOpcode::CreateBindGroupLayout, bgl3);
+    create_bind_group(setup, 138, 137, {bg_entry(0, GpuBindResourceType::Buffer, 131)});
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(135);
+    set_bind_group2(frame, 0, 136);
+    frame.dispatch_compute(1, 1, 1);  // no group 3 bound: the fitted dummy
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(130, 0, 16, &out, &err));
+    const uint32_t want[4] = {1, 6, 11, 16};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    ExecutorStats s = ex.stats();
+    CHECK(s.layout_fit_pipelines == before.layout_fit_pipelines + 1);
+    CHECK(s.layout_fit_wgsl_groups == before.layout_fit_wgsl_groups + 1);
+    CHECK(s.layout_fit_dummy_binds == before.layout_fit_dummy_binds + 3);  // padding groups 1, 2 and group 3
+    CHECK(s.async_pipeline_failures == before.async_pipeline_failures);
+    CHECK(s.dispatches == before.dispatches + 1);
+    CHECK(s.device_errors == before.device_errors);
+
+    gpu::CommandEncoder frame2;
+    frame2.begin_frame();
+    frame2.set_compute_pipeline(135);
+    set_bind_group2(frame2, 0, 136);
+    set_bind_group2(frame2, 3, 138);
+    frame2.dispatch_compute(1, 1, 1);
+    frame2.present();
+    run(ex, frame2);
+    ex.wait_idle();
+    CHECK(ex.read_buffer(131, 0, 16, &out, &err));
+    const uint32_t want3[4] = {100, 101, 102, 103};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want3, 16) == 0);
+    s = ex.stats();
+    CHECK(s.layout_fit_dummy_binds == before.layout_fit_dummy_binds + 5);  // only the padding: the stream's group 3 stays
+    CHECK(s.device_errors == before.device_errors);
+}
+
+// A title layout over the device's per-stage uniform-buffer limit (a root signature visible to every
+// stage) is invalid as a whole; the WGSL references two of its bindings. Fitted: group 0 keeps the
+// title's entries for those two, the remap binds them by binding number, and the dispatch runs.
+void test_layout_fit_over_limits(NativeExecutor& ex) {
+    const uint32_t n = ex.stats().limit_uniform_buffers_per_stage + 1;
+    CHECK(n > 1);
+    if (n <= 1 || n > 64) return;
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(140, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 256);
+    setup.create_buffer(141, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, 256);
+    setup.create_buffer(142, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_buffer(148, GpuBufferUsage::Storage | GpuBufferUsage::CopyDst, 16);  // zeros
+    const uint32_t seven[4] = {7, 0, 0, 0};
+    const uint32_t nine[4] = {9, 0, 0, 0};
+    setup.write_buffer(140, 0, nine, 16);
+    setup.write_buffer(141, 0, seven, 16);
+    // Binding n+1: a read-only WGSL buffer (`var<storage>`) under the title's read-only entry.
+    const std::string wgsl = "@group(0) @binding(2) var<uniform> u: vec4<u32>;\n@group(0) @binding(" + std::to_string(n) +
+                             ") var<storage, read_write> out: array<u32>;\n@group(0) @binding(" + std::to_string(n + 1) +
+                             ") var<storage> ro: array<u32>;\n"
+                             "@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = u.x + i + ro[0]; }\n";
+    setup.create_shader_module(143, GpuShaderStage::Compute, wgsl.c_str());
+    std::vector<GpuBindGroupLayoutEntry> les;
+    std::vector<GpuBindGroupEntry2> bes;
+    for (uint32_t b = 0; b < n; ++b) {
+        les.push_back(layout_entry(b, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 0));
+        bes.push_back(bg_entry(b, GpuBindResourceType::Buffer, b == 2 ? 141 : 140));
+    }
+    les.push_back(layout_entry(n, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1));
+    bes.push_back(bg_entry(n, GpuBindResourceType::Buffer, 142));
+    les.push_back(layout_entry(n + 1, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 2));
+    bes.push_back(bg_entry(n + 1, GpuBindResourceType::Buffer, 148));
+    create_layouts(setup, 144, 145, les);
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 146;
+    cp.cs_module_id = 143;
+    cp.pipeline_layout_id = 145;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 147, 144, bes);
+    run(ex, setup);
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(146);
+    set_bind_group2(frame, 0, 147);
+    frame.dispatch_compute(1, 1, 1);
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(142, 0, 16, &out, &err));
+    const uint32_t want[4] = {7, 8, 9, 10};  // binding 2's buffer, not the first uniform of the group
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want, 16) == 0);
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.layout_fit_pipelines == before.layout_fit_pipelines + 1);
+    CHECK(s.layout_fit_over_limits == before.layout_fit_over_limits + 1);
+    CHECK(s.async_pipeline_failures == before.async_pipeline_failures);
+    CHECK(s.dispatches == before.dispatches + 1);
+}
+
+// A title layout whose group 1 (another root parameter's table, unused by the WGSL) is over the
+// uniform-buffer limit on its own: its bind groups are never bound, the fitted layout pads group 1
+// and binds the padding over whatever the pass bound there, and the next pipeline gets the pass's own
+// group 1 back.
+const char* kComputeG0Only = R"(
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { out[i] = i + 40u; }
+)";
+const char* kComputeG1 = R"(
+@group(0) @binding(0) var<storage, read_write> a: array<u32>;
+@group(1) @binding(0) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(4) fn cs_main(@builtin(local_invocation_index) i: u32) { a[i] = 1u; b[i] = i + 60u; }
+)";
+
+void test_layout_fit_unused_group_over_limits(NativeExecutor& ex) {
+    const uint32_t n = ex.stats().limit_uniform_buffers_per_stage + 1;
+    if (n <= 1 || n > 64) return;
+    const ExecutorStats before = ex.stats();
+    gpu::CommandEncoder setup;
+    setup.create_buffer(150, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_buffer(151, GpuBufferUsage::Uniform, 256);
+    setup.create_buffer(152, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_buffer(153, GpuBufferUsage::Storage | GpuBufferUsage::CopySrc, 16);
+    setup.create_shader_module(154, GpuShaderStage::Compute, kComputeG0Only);
+    setup.create_shader_module(155, GpuShaderStage::Compute, kComputeG1);
+    auto bgl = [&](uint32_t id, const std::vector<GpuBindGroupLayoutEntry>& es) {
+        std::vector<uint8_t> v;
+        append(v, GpuCreateBindGroupLayoutPayload{id, static_cast<uint32_t>(es.size()), 0, 0, 0});
+        for (const auto& e : es) append(v, e);
+        emit(setup, GpuOpcode::CreateBindGroupLayout, v);
+    };
+    auto pl = [&](uint32_t id, std::vector<uint32_t> groups) {
+        std::vector<uint8_t> v;
+        append(v, GpuCreatePipelineLayoutPayload{id, static_cast<uint32_t>(groups.size()), 0, 0, 0});
+        for (uint32_t g : groups) append(v, g);
+        emit(setup, GpuOpcode::CreatePipelineLayout, v);
+    };
+    const auto storage0 = layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1);
+    bgl(156, {storage0});
+    std::vector<GpuBindGroupLayoutEntry> uniforms;
+    std::vector<GpuBindGroupEntry2> ub;
+    for (uint32_t b = 0; b < n; ++b) {
+        uniforms.push_back(layout_entry(b, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 0));
+        ub.push_back(bg_entry(b, GpuBindResourceType::Buffer, 151));
+    }
+    bgl(157, uniforms);  // over the limit on its own
+    bgl(158, {storage0});
+    pl(159, {156, 157});  // A: group 1 over the limit, unused by the WGSL
+    pl(160, {156, 158});  // B: a valid group 1 the WGSL writes
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 161;
+    cp.cs_module_id = 154;
+    cp.pipeline_layout_id = 159;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    cp.id = 162;
+    cp.cs_module_id = 155;
+    cp.pipeline_layout_id = 160;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 163, 156, {bg_entry(0, GpuBindResourceType::Buffer, 150)});
+    create_bind_group(setup, 164, 157, ub);
+    create_bind_group(setup, 165, 158, {bg_entry(0, GpuBindResourceType::Buffer, 153)});
+    create_bind_group(setup, 166, 156, {bg_entry(0, GpuBindResourceType::Buffer, 152)});
+    run(ex, setup);
+    const uint64_t setup_errors = ex.stats().device_errors;  // the over-limit layout itself
+
+    gpu::CommandEncoder frame;
+    frame.begin_frame();
+    frame.set_compute_pipeline(161);
+    set_bind_group2(frame, 0, 163);
+    set_bind_group2(frame, 1, 164);  // the over-limit group: not bound
+    frame.dispatch_compute(1, 1, 1);
+    set_bind_group2(frame, 1, 165);  // the pass's own group 1; A pads over it
+    frame.dispatch_compute(1, 1, 1);
+    frame.set_compute_pipeline(162);
+    set_bind_group2(frame, 0, 166);
+    frame.dispatch_compute(1, 1, 1);  // group 1 restored
+    frame.present();
+    run(ex, frame);
+    ex.wait_idle();
+    std::vector<uint8_t> out;
+    std::string err;
+    CHECK(ex.read_buffer(150, 0, 16, &out, &err));
+    const uint32_t want_a[4] = {40, 41, 42, 43};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want_a, 16) == 0);
+    CHECK(ex.read_buffer(153, 0, 16, &out, &err));
+    const uint32_t want_b[4] = {60, 61, 62, 63};
+    CHECK(out.size() == 16 && std::memcmp(out.data(), want_b, 16) == 0);
+    const ExecutorStats& s = ex.stats();
+    CHECK(s.over_limit_bind_group_layouts == before.over_limit_bind_group_layouts + 1);
+    CHECK(s.over_limit_binds_skipped == before.over_limit_binds_skipped + 1);
+    CHECK(s.layout_fit_unused_groups == before.layout_fit_unused_groups + 1);
+    CHECK(s.layout_fit_restores == before.layout_fit_restores + 1);
+    CHECK(s.async_pipeline_failures == before.async_pipeline_failures);
+    CHECK(s.dispatches == before.dispatches + 3);
+    CHECK(s.device_errors == setup_errors);  // nothing in the frame
+}
+
 const char* kPackPath = "test_native_executor.wgsl.pack";
 
 void test_pack_and_formats(NativeExecutor& ex) {
@@ -3136,6 +3369,9 @@ int main() {
     test_textured_draw(*ex);
     test_compute(*ex);
     test_auto_layout_remap(*ex);
+    test_layout_fit_missing_group(*ex);
+    test_layout_fit_over_limits(*ex);
+    test_layout_fit_unused_group_over_limits(*ex);
     test_indirect_constants_pass(*ex);
     test_mesh_pipeline(*ex);
     test_pack_and_formats(*ex);
