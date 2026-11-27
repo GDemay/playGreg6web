@@ -234,6 +234,66 @@ class BootSummaryTest(unittest.TestCase):
         self.assertNotIn("9000 ms  96 frames missing  host_starved  3 ms since push, ring 40 ms, present #600  <-", text)
         self.assertIn("frame hitch 150 ms ending at 20000 ms: no underrun", text)
 
+    def test_browser_memory_stats_validation_errors_reflection_and_pipeline_dump(self):
+        r = browser_report()
+        r["counters"]["gpu_validation_errors"] = 4
+        r["reflection_join_failures"] = 2
+        r["gpu_memory"] = {
+            "vramBytes": 512 * 1024 * 1024,
+            "totalLiveGpuBytes": 256 * 1024 * 1024,
+            "peakBufferBytes": 128 * 1024 * 1024,
+            "peakTextureBytes": 192 * 1024 * 1024,
+            "stagingPoolBytes": 16 * 1024 * 1024,
+        }
+        r["renderer_memory"] = {"wasmLinearMemoryBytes": 1024 * 1024 * 1024}
+        r["pipeline_dump"] = {"dumped": 42, "render": 35, "compute": 7, "failed": 1}
+        r["scripted_inputs_sent"] = 6
+
+        out = bs.summarize(r)
+        self.assertIn("gpu_validation_errors=4", out)
+        self.assertIn("reflection_join_failures=2", out)
+        self.assertIn("gpu memory:", out)
+        self.assertIn("vram 512.0 MiB", out)
+        self.assertIn("peak tex 192.0 MiB", out)
+        self.assertIn("wasm 1.0 GiB", out)
+        self.assertIn("pipeline dump: dumped=42, render=35, compute=7, failed=1", out)
+        self.assertIn("scripted inputs: 6 sent", out)
+
+        # memory_stats alias & browser --compare delta tracking
+        r2 = browser_report()
+        r2.pop("present_fps_avg")
+        r2["counters"]["gpu_validation_errors"] = 0
+        r2["reflection_join_failures"] = 0
+        r2["memory_stats"] = {"vram_peak_mb": 300.5, "peak_texture_bytes": 64 * 1024 * 1024}
+        r2["pipeline_dump"] = {"dumped": 50, "failed": 0}
+        r2["scripted_inputs_sent"] = 10
+        out2 = bs.summarize(r2)
+        self.assertIn("first visible frame 7.1s", out2)
+        self.assertIn("gpu errors: none", out2)
+        self.assertIn("vram peak 300.5 MiB", out2)
+
+        diff = bs.compare(r, r2)
+        self.assertIn("counters.gpu_validation_errors", diff)
+        self.assertIn("reflection_join_failures", diff)
+        self.assertIn("gpu_memory.peak_texture_bytes", diff)
+        self.assertIn("pipeline_dump.dumped", diff)
+        self.assertIn("scripted_inputs_sent", diff)
+
+        # Verify lower-is-better classification on reflection_join_failures,
+        # black_loading_s, and first_visible_frame_s in --compare verdicts.
+        r_worse = browser_report()
+        r_worse["reflection_join_failures"] = 5
+        r_worse["black_loading_s"] = 12.5
+        r_worse["first_visible_frame_s"] = 19.0
+        r_base = browser_report()
+        r_base["reflection_join_failures"] = 1
+        r_base["black_loading_s"] = 3.0
+        r_base["first_visible_frame_s"] = 7.1
+        reg_diff = bs.compare(r_base, r_worse)
+        self.assertRegex(reg_diff, r"reflection_join_failures.*REGRESSION")
+        self.assertRegex(reg_diff, r"black_loading_s.*REGRESSION")
+        self.assertRegex(reg_diff, r"first_visible_frame_s.*REGRESSION")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -819,6 +819,15 @@ OPTIONAL_TELEMETRY_DELTA_METRICS: tuple[str, ...] = (
     "fps_p50_window",
     "fps_max_window",
     "windows_ge_30fps_pct",
+    "gpu_vram_mb",
+    "gpu_live_mb",
+    "gpu_peak_buffer_mb",
+    "gpu_peak_texture_mb",
+    "wasm_linear_memory_mb",
+    "reflection_join_failures",
+    "pipeline_dump_count",
+    "pipeline_dump_failed",
+    "scripted_inputs_sent",
 )
 
 PHASE_DELTA_METRICS: tuple[str, ...] = (
@@ -846,6 +855,15 @@ _TELEMETRY_METRIC_SPECS: dict[str, dict[str, str]] = {
     "fps_p50_window": {"kind": "float", "unit": " fps", "better": "higher"},
     "fps_max_window": {"kind": "float", "unit": " fps", "better": "higher"},
     "windows_ge_30fps_pct": {"kind": "float", "unit": "%", "better": "higher"},
+    "gpu_vram_mb": {"kind": "float", "unit": " MB", "better": "lower"},
+    "gpu_live_mb": {"kind": "float", "unit": " MB", "better": "lower"},
+    "gpu_peak_buffer_mb": {"kind": "float", "unit": " MB", "better": "lower"},
+    "gpu_peak_texture_mb": {"kind": "float", "unit": " MB", "better": "lower"},
+    "wasm_linear_memory_mb": {"kind": "float", "unit": " MB", "better": "lower"},
+    "reflection_join_failures": {"kind": "int", "unit": "", "better": "lower"},
+    "pipeline_dump_count": {"kind": "int", "unit": "", "better": "neutral"},
+    "pipeline_dump_failed": {"kind": "int", "unit": "", "better": "lower"},
+    "scripted_inputs_sent": {"kind": "int", "unit": "", "better": "neutral"},
 }
 
 _PHASE_METRIC_SPECS: dict[str, dict[str, str]] = {
@@ -893,7 +911,16 @@ MULTI_RUN_METRICS: tuple[str, ...] = (
     "audio_ring_attached",
     "js_heap_used_mb",
     "js_heap_total_mb",
+    "gpu_vram_mb",
+    "gpu_live_mb",
+    "gpu_peak_buffer_mb",
+    "gpu_peak_texture_mb",
+    "wasm_linear_memory_mb",
     "gpu_validation_errors",
+    "reflection_join_failures",
+    "pipeline_dump_count",
+    "pipeline_dump_failed",
+    "scripted_inputs_sent",
 )
 
 _BYTES_PER_MIB = 1024.0 * 1024.0
@@ -1241,6 +1268,11 @@ def extract_telemetry_metrics(report: dict[str, Any]) -> dict[str, int | float |
         ("fps_max_window", "fpsMaxWindow", 2),
         ("windows_ge_30fps_pct", "windowsGe30fpsPct", 1),
     ):
+        extra_aliases: tuple[Any, ...] = (
+            (report.get("fps_p50"), telemetry.get("fps_p50"), summary.get("fps_p50"))
+            if opt_key == "fps_p50_window"
+            else ()
+        )
         val = _first_non_negative_number(
             report.get(opt_key),
             report.get(camel_key),
@@ -1250,11 +1282,99 @@ def extract_telemetry_metrics(report: dict[str, Any]) -> dict[str, int | float |
             summary.get(camel_key),
             counters.get(opt_key),
             counters.get(camel_key),
+            *extra_aliases,
         )
         if val is not None:
             if opt_key == "windows_ge_30fps_pct" and float(val) > 100.0:
                 continue
             metrics[opt_key] = round(float(val), digits)
+
+    # 9. Optional GPU / renderer memory peaks (gpu_memory or memory_stats alias -> MiB)
+    gpu_mem_sources = (
+        _dict_or_empty(report.get("gpu_memory")),
+        _dict_or_empty(summary.get("gpu_memory")),
+        _dict_or_empty(telemetry.get("gpu_memory")),
+        _dict_or_empty(report.get("memory_stats")),
+        _dict_or_empty(summary.get("memory_stats")),
+        _dict_or_empty(telemetry.get("memory_stats")),
+    )
+    renderer_mem_sources = (
+        _dict_or_empty(report.get("renderer_memory")),
+        _dict_or_empty(summary.get("renderer_memory")),
+        _dict_or_empty(telemetry.get("renderer_memory")),
+        *gpu_mem_sources,
+    )
+
+    def _extract_mem_mb(
+        sources: Sequence[dict[str, Any]],
+        mb_keys: tuple[str, ...],
+        byte_keys: tuple[str, ...],
+    ) -> float | None:
+        mb_cands = [src.get(k) for src in sources for k in mb_keys]
+        mb_val = _first_non_negative_number(*mb_cands)
+        if mb_val is not None:
+            return round(float(mb_val), 2)
+        byte_cands = [src.get(k) for src in sources for k in byte_keys]
+        byte_val = _first_non_negative_number(*byte_cands)
+        if byte_val is not None:
+            return round(float(byte_val) / _BYTES_PER_MIB, 2)
+        return None
+
+    for dst, sources, mb_keys, byte_keys in (
+        ("gpu_vram_mb", gpu_mem_sources, ("vram_peak_mb", "vramMb", "vram_mb"), ("vramBytes", "vram_bytes")),
+        ("gpu_live_mb", gpu_mem_sources, ("total_live_gpu_mb", "liveGpuMb"), ("totalLiveGpuBytes", "total_live_gpu_bytes")),
+        ("gpu_peak_buffer_mb", gpu_mem_sources, ("peak_buffer_mb", "peakBufferMb"), ("peakBufferBytes", "peak_buffer_bytes")),
+        ("gpu_peak_texture_mb", gpu_mem_sources, ("peak_texture_mb", "peakTextureMb"), ("peakTextureBytes", "peak_texture_bytes")),
+        ("wasm_linear_memory_mb", renderer_mem_sources, ("wasm_linear_memory_mb", "wasmLinearMemoryMb"), ("wasmLinearMemoryBytes", "wasm_linear_memory_bytes")),
+    ):
+        mem_mb = _extract_mem_mb(sources, mb_keys, byte_keys)
+        if mem_mb is not None:
+            metrics[dst] = mem_mb
+
+    # 10. Optional reflection_join_failures, pipeline_dump counts, and scripted_inputs_sent
+    gpu_work = _dict_or_empty(report.get("gpu_work"))
+    rjf = _first_non_negative_number(
+        report.get("reflection_join_failures"),
+        counters.get("reflection_join_failures"),
+        summary.get("reflection_join_failures"),
+        summary.get("reflectionJoinFailures"),
+        telemetry.get("reflection_join_failures"),
+        gpu_work.get("reflection_join_failures"),
+    )
+    if rjf is not None:
+        metrics["reflection_join_failures"] = int(rjf) if float(rjf).is_integer() else round(float(rjf), 2)
+
+    pd_sources = (
+        _dict_or_empty(report.get("pipeline_dump")),
+        _dict_or_empty(summary.get("pipeline_dump")),
+        _dict_or_empty(telemetry.get("pipeline_dump")),
+    )
+    pd_count = _first_non_negative_number(
+        *[src.get(k) for src in pd_sources for k in ("dumped", "count", "total", "pipelines")],
+        report.get("pipeline_dump_count"),
+        summary.get("pipeline_dump_count"),
+    )
+    if pd_count is not None:
+        metrics["pipeline_dump_count"] = int(pd_count) if float(pd_count).is_integer() else round(float(pd_count), 2)
+
+    pd_failed = _first_non_negative_number(
+        *[src.get(k) for src in pd_sources for k in ("failed", "errors")],
+        report.get("pipeline_dump_failed"),
+        summary.get("pipeline_dump_failed"),
+    )
+    if pd_failed is not None:
+        metrics["pipeline_dump_failed"] = int(pd_failed) if float(pd_failed).is_integer() else round(float(pd_failed), 2)
+
+    scripted_inputs = _first_non_negative_number(
+        report.get("scripted_inputs_sent"),
+        telemetry.get("scripted_inputs_sent"),
+        summary.get("scripted_inputs_sent"),
+        counters.get("scripted_inputs_sent"),
+    )
+    if scripted_inputs is not None:
+        metrics["scripted_inputs_sent"] = (
+            int(scripted_inputs) if float(scripted_inputs).is_integer() else round(float(scripted_inputs), 2)
+        )
 
     return metrics
 
