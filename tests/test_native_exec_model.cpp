@@ -10,6 +10,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/native_exec/blit_model.h"
+#include "gpu/native_exec/clear_model.h"
 #include "gpu/native_exec/error_scope_model.h"
 #include "gpu/native_exec/fragment_outputs_model.h"
 #include "gpu/native_exec/layout_model.h"
@@ -1090,7 +1091,117 @@ void test_error_scope_model() {
     CHECK(log.total() == 203);
 }
 
+// Bytes the copies zero per (mip, slice, row) texel row: every pending texel exactly once.
+uint64_t copied_bytes(const std::vector<ZeroCopy>& copies) {
+    uint64_t n = 0;
+    for (const ZeroCopy& c : copies) n += c.bytes;
+    return n;
+}
+
+void test_clear_model() {
+    // 8x8 rgba8 with 4 mips, nothing written: every texel of every mip, one copy per mip.
+    ClearGeometry g;
+    g.width = 8;
+    g.height = 8;
+    g.mips = 4;
+    PendingClear pc;
+    pc.reset(g);
+    CHECK(pc.pending() && pc.pending_subresources() == 4);
+    std::vector<ZeroCopy> copies;
+    pc.zero_copies(1u << 20, &copies);
+    CHECK(copies.size() == 4);
+    CHECK(copied_bytes(copies) == (64 + 16 + 4 + 1) * 4);
+    for (const ZeroCopy& c : copies) {
+        CHECK(c.bytes_per_row == 256 && c.y == 0 && c.z == 0 && c.depth == 1);
+        CHECK(c.width == (8u >> c.mip) && c.height == (8u >> c.mip) && c.rows_per_image == c.height);
+    }
+
+    // A full write of mip 0 and the first band of mip 1: mip 0 needs no copy, mip 1 only its last rows.
+    CHECK(pc.note_write(0, 0, 0, 0, 8, 8, 1));
+    CHECK(pc.note_write(1, 0, 0, 0, 4, 2, 1));
+    CHECK(pc.note_write(1, 0, 2, 0, 4, 1, 1));  // the next band extends the covered rows
+    copies.clear();
+    pc.zero_copies(1u << 20, &copies);
+    CHECK(copies.size() == 3);
+    CHECK(copies[0].mip == 1 && copies[0].y == 3 && copies[0].height == 1);
+    CHECK(copied_bytes(copies) == (4 + 4 + 1) * 4);
+    // Inside the covered rows: fine. A partial-width write or one past the covered rows: needs the clear first.
+    CHECK(pc.note_write(1, 1, 0, 0, 2, 2, 1));
+    CHECK(!pc.note_write(1, 0, 3, 0, 2, 1, 1));
+    CHECK(!pc.note_write(2, 0, 1, 0, 2, 1, 1));
+    // Every texel written: nothing left to copy.
+    PendingClear all;
+    all.reset(g);
+    for (uint32_t m = 0; m < 4; ++m) CHECK(all.note_write(m, 0, 0, 0, 8u >> m, 8u >> m, 1));
+    CHECK(!all.pending());
+    copies.clear();
+    all.zero_copies(1u << 20, &copies);
+    CHECK(copies.empty());
+
+    // BC7 (4x4 blocks, 16 B) 10x6, 2 mips: physical extents 12x8 and 8x4 (block-rounded).
+    ClearGeometry bc;
+    bc.width = 10;
+    bc.height = 6;
+    bc.mips = 2;
+    bc.block_w = 4;
+    bc.block_h = 4;
+    bc.block_bytes = 16;
+    PendingClear pb;
+    pb.reset(bc);
+    copies.clear();
+    pb.zero_copies(1u << 20, &copies);
+    CHECK(copies.size() == 2);
+    CHECK(copies[0].width == 12 && copies[0].height == 8 && copies[0].rows_per_image == 2);
+    CHECK(copies[1].width == 8 && copies[1].height == 4 && copies[1].rows_per_image == 1);
+    CHECK(copied_bytes(copies) == 3 * 2 * 16 + 2 * 1 * 16);
+    CHECK(pb.note_write(0, 0, 0, 0, 12, 4, 1));  // one block row
+    copies.clear();
+    pb.zero_copies(1u << 20, &copies);
+    CHECK(copies.size() == 2 && copies[0].y == 4 && copies[0].height == 4 && copies[0].rows_per_image == 1);
+
+    // 2D array of 6 layers 16x16 rgba8: untouched layers share a copy; a written layer is skipped.
+    ClearGeometry arr;
+    arr.width = 16;
+    arr.height = 16;
+    arr.depth_or_layers = 6;
+    PendingClear pa;
+    pa.reset(arr);
+    CHECK(pa.note_write(0, 0, 0, 2, 16, 16, 1));  // layer 2 written whole
+    copies.clear();
+    pa.zero_copies(1u << 20, &copies);
+    CHECK(copies.size() == 2);
+    CHECK(copies[0].z == 0 && copies[0].depth == 2 && copies[1].z == 3 && copies[1].depth == 3);
+    CHECK(copied_bytes(copies) == 5ull * 16 * 16 * 4);
+    // A small zero buffer splits the layers, then the rows: 16 rows of 256 B = 4 KiB per layer.
+    copies.clear();
+    pa.zero_copies(4096, &copies);
+    CHECK(copies.size() == 5 && copied_bytes(copies) == 5ull * 16 * 16 * 4);
+    copies.clear();
+    pa.zero_copies(1024, &copies);  // 4 rows per copy
+    CHECK(copies.size() == 20 && copied_bytes(copies) == 5ull * 16 * 16 * 4);
+    for (const ZeroCopy& c : copies) CHECK(uint64_t{c.bytes_per_row} * c.rows_per_image * c.depth <= 1024);
+
+    // 3D 8x8x8, 2 mips: slices are the unit; full-slice writes from the front shrink the copy.
+    ClearGeometry vol;
+    vol.width = 8;
+    vol.height = 8;
+    vol.depth_or_layers = 8;
+    vol.mips = 2;
+    vol.dimension = 2;
+    PendingClear pv;
+    pv.reset(vol);
+    CHECK(pv.note_write(0, 0, 0, 0, 8, 8, 3));
+    CHECK(!pv.note_write(0, 0, 0, 5, 8, 8, 1));  // a gap: clear first
+    copies.clear();
+    pv.zero_copies(1u << 20, &copies);
+    CHECK(copies.size() == 2);
+    CHECK(copies[0].mip == 0 && copies[0].z == 3 && copies[0].depth == 5);
+    CHECK(copies[1].mip == 1 && copies[1].z == 0 && copies[1].depth == 4 && copies[1].width == 4);
+    CHECK(copied_bytes(copies) == 5ull * 64 * 4 + 4ull * 16 * 4);
+}
+
 int main() {
+    test_clear_model();
     test_present_model();
     test_shader_payloads();
     test_pack();

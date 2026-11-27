@@ -8,8 +8,13 @@
 // and takes it back when a texture of the same shape (format, extent, mips, dimension, storage use)
 // is needed. The pool is bookkeeping only: it holds ids and byte counts and emits no GPU packets.
 //
-// A parked texture still holds its old texels. The owner must overwrite every texel of every mip on
-// reuse (zero_fill_writes lists the writes) so no stale content is ever visible.
+// A parked texture still holds its old texels. The owner must zero every texel of every mip on
+// reuse so no stale content is ever visible: with a ClearTexture packet (GPU-side, when the
+// consumer has it: gpu_texture_clear()) or else with CPU zero writes (zero_fill_writes).
+//
+// Two pools: small_texture_pool() for chains up to kSmallTextureMaxBytes (with either clear), and
+// large_texture_pool() for bigger chains up to kLargeTextureMaxBytes, used only with the GPU clear
+// (CPU zero uploads of those would cost more than the creations they save).
 //
 // Parked textures stay counted in the texture budget (texture_budget.h): the owner calls
 // note_created once when the host texture is really created and note_destroyed only when it is
@@ -29,6 +34,17 @@ namespace playgta6::gpu {
 inline constexpr uint64_t kSmallTextureMaxBytes = 64u * 1024u;      // largest mip chain that is pooled
 inline constexpr uint32_t kSmallTexturePoolMaxCount = 512;          // parked textures at most
 inline constexpr uint64_t kSmallTexturePoolMaxBytes = 16ull << 20;  // parked bytes at most
+inline constexpr uint64_t kLargeTextureMaxBytes = 32ull << 20;      // largest chain of the large pool
+inline constexpr uint32_t kLargeTexturePoolMaxCount = 1024;
+inline constexpr uint64_t kLargeTexturePoolMaxBytes = 256ull << 20;
+// The large pool is trimmed while the texture budget's use (parked bytes included) is above this
+// share of the budget, so parked textures never push live ones into the size cap (texture_budget.h).
+inline constexpr uint32_t kLargeTexturePoolBudgetPercent = 60;
+
+// The GPU consumer zeroes textures itself (GpuOpcode::ClearTexture; the native executor). Off by
+// default: the browser worker does not have the packet yet.
+void set_gpu_texture_clear(bool on) noexcept;
+bool gpu_texture_clear() noexcept;
 
 struct SmallTextureShape {
     uint64_t owner = 0;  // the device that owns the host texture ids (ids are per device)
@@ -80,9 +96,24 @@ struct SmallTexturePoolStats {
 
 class SmallTexturePool {
 public:
+    SmallTexturePool() = default;
+    // A pool of chains in (min_chain_bytes, max_chain_bytes] with its own count / byte limits.
+    SmallTexturePool(uint64_t min_chain_bytes, uint64_t max_chain_bytes, uint32_t max_count, uint64_t max_bytes) noexcept
+        : min_chain_(min_chain_bytes),
+          max_chain_(max_chain_bytes),
+          default_max_count_(max_count),
+          default_max_bytes_(max_bytes),
+          max_count_(max_count),
+          max_bytes_(max_bytes) {}
+
     static bool poolable(uint64_t chain_bytes) noexcept {
         return chain_bytes != 0 && chain_bytes <= kSmallTextureMaxBytes;
     }
+    // This pool's chain range.
+    bool accepts(uint64_t chain_bytes) const noexcept {
+        return chain_bytes != 0 && chain_bytes > min_chain_ && chain_bytes <= max_chain_;
+    }
+    uint64_t max_chain_bytes() const noexcept { return max_chain_; }
 
     void set_limits(uint32_t max_count, uint64_t max_bytes) noexcept;
     void set_enabled(bool enabled) noexcept;
@@ -140,6 +171,10 @@ private:
     std::unordered_map<SmallTextureShape, uint32_t, SmallTextureShapeHash> buckets_;  // shape -> newest (LIFO head)
     uint32_t lru_head_ = kInvalidNode;                                                 // oldest
     uint32_t lru_tail_ = kInvalidNode;                                                 // newest
+    uint64_t min_chain_ = 0;
+    uint64_t max_chain_ = kSmallTextureMaxBytes;
+    uint32_t default_max_count_ = kSmallTexturePoolMaxCount;
+    uint64_t default_max_bytes_ = kSmallTexturePoolMaxBytes;
     uint32_t max_count_ = kSmallTexturePoolMaxCount;
     uint64_t max_bytes_ = kSmallTexturePoolMaxBytes;
     bool enabled_ = true;
@@ -148,6 +183,11 @@ private:
 };
 
 SmallTexturePool& small_texture_pool() noexcept;
+// Chains in (kSmallTextureMaxBytes, kLargeTextureMaxBytes]; only used with gpu_texture_clear().
+SmallTexturePool& large_texture_pool() noexcept;
+// The pool a chain of `chain_bytes` goes to: the large pool when it takes it and the GPU clear is
+// on, else the small pool (which declines, and counts, a chain too big for it).
+SmallTexturePool& texture_pool_for(uint64_t chain_bytes) noexcept;
 
 // One zero write: a region of one mip level (depth_or_layers is slices of a 3D mip or array layers).
 struct ZeroWrite {

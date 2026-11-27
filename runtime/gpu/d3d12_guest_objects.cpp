@@ -441,6 +441,7 @@ Device::~Device() {
             // Backlog 38: textures parked for reuse go with the device.
             std::vector<uint64_t> parked_bytes;
             small_texture_pool().drain(reinterpret_cast<uintptr_t>(this), &ids, &parked_bytes);
+            large_texture_pool().drain(reinterpret_cast<uintptr_t>(this), &ids, &parked_bytes);
             for (const uint64_t b : parked_bytes) {
                 texture_budget().note_destroyed(b);
             }

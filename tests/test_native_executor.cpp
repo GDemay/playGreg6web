@@ -553,6 +553,119 @@ GpuReadbackBufferPayload rb_buffer(uint32_t id, uint64_t src, uint64_t size, uin
     return r;
 }
 
+// ClearTexture: a texture full of old texels reads back as zero after the clear, except where later
+// writes landed: a write extending the covered rows needs no flush, a partial one forces one.
+void test_clear_texture(NativeExecutor& ex) {
+    std::vector<uint8_t> mem(8192, 0xEE);
+    GuestMemory gm;
+    gm.base = mem.data();
+    gm.size = mem.size();
+    std::memset(mem.data(), 0, 16);
+    ex.attach_guest_memory(gm);
+    const ExecutorStats before = ex.stats();
+
+    auto write = [](gpu::CommandEncoder& enc, uint32_t id, uint32_t mip, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                    uint8_t value) {
+        GpuWriteTexturePayload wt;
+        std::memset(&wt, 0, sizeof wt);
+        wt.texture_id = id;
+        wt.mip_level = mip;
+        wt.origin_x = x;
+        wt.origin_y = y;
+        wt.width = w;
+        wt.height = h;
+        wt.depth_or_layers = 1;
+        wt.bytes_per_row = 256;
+        wt.rows_per_image = h;
+        wt.data_len = 256 * h;
+        std::vector<uint8_t> v = bytes_of(wt);
+        v.insert(v.end(), size_t{256} * h, value);
+        emit(enc, GpuOpcode::WriteTexture, v);
+    };
+    auto readback = [](gpu::CommandEncoder& enc, uint32_t id, uint32_t mip, uint32_t w, uint32_t h, uint64_t dst,
+                       uint64_t done) {
+        GpuReadbackTexturePayload rt;
+        std::memset(&rt, 0, sizeof rt);
+        rt.seq = 1;
+        rt.texture_id = id;
+        rt.mip_level = mip;
+        rt.width = w;
+        rt.height = h;
+        rt.depth_or_layers = 1;
+        rt.bytes_per_row = w * 4;
+        rt.rows_per_image = h;
+        rt.dst_addr = dst;
+        rt.done_addr = done;
+        rt.dst_size = uint64_t{w} * 4 * h;
+        emit(enc, GpuOpcode::ReadbackTexture, bytes_of(rt));
+    };
+
+    // 4x4 rgba8 with 2 mips, filled with 0x55, then cleared; row 0 of mip 0 is written again (0x07).
+    GpuCreateTexture2Payload ct = texture2(120, 4, 4, GpuTextureUsage::CopySrc | GpuTextureUsage::CopyDst, 22);
+    ct.mip_levels = 2;
+    gpu::CommandEncoder enc;
+    emit(enc, GpuOpcode::CreateTexture2, bytes_of(ct));
+    write(enc, 120, 0, 0, 0, 4, 4, 0x55);
+    write(enc, 120, 1, 0, 0, 2, 2, 0x55);
+    GpuClearTexturePayload clear{120, 0};
+    emit(enc, GpuOpcode::ClearTexture, bytes_of(clear));
+    write(enc, 120, 0, 0, 0, 4, 1, 0x07);
+    readback(enc, 120, 0, 4, 4, 1024, 0);
+    readback(enc, 120, 1, 2, 2, 2048, 4);
+    CHECK(run(ex, enc) == 0);
+    ex.wait_idle();
+    ex.poll();
+    bool row0 = true, rest0 = true, mip1 = true;
+    for (int i = 0; i < 16; ++i) row0 &= mem[1024 + i] == 0x07;
+    for (int i = 16; i < 64; ++i) rest0 &= mem[1024 + i] == 0;
+    for (int i = 0; i < 16; ++i) mip1 &= mem[2048 + i] == 0;
+    CHECK(row0 && rest0 && mip1);
+    const ExecutorStats& a = ex.stats();
+    CHECK(a.textures_cleared == before.textures_cleared + 1);
+    CHECK(a.clear_flushes == before.clear_flushes);  // the band only extended the covered rows
+    CHECK(a.clear_copies == before.clear_copies + 2);  // rows 1..3 of mip 0, all of mip 1
+    CHECK(u32_at(mem, 0) == 1 && u32_at(mem, 4) == 1);
+
+    // A partial-width write onto a pending row needs the clear first (a flush), then lands on zero.
+    gpu::CommandEncoder enc2;
+    write(enc2, 120, 0, 0, 0, 4, 4, 0x55);
+    emit(enc2, GpuOpcode::ClearTexture, bytes_of(clear));
+    write(enc2, 120, 0, 2, 2, 1, 1, 0x09);
+    readback(enc2, 120, 0, 4, 4, 4096, 8);
+    CHECK(run(ex, enc2) == 0);
+    ex.wait_idle();
+    ex.poll();
+    bool ok = true;
+    for (int i = 0; i < 64; ++i) {
+        const bool texel = i >= (2 * 4 + 2) * 4 && i < (2 * 4 + 3) * 4;
+        ok &= mem[4096 + i] == (texel ? 0x09 : 0);
+    }
+    CHECK(ok);
+    CHECK(ex.stats().clear_flushes == before.clear_flushes + 1);
+    CHECK(u32_at(mem, 8) == 1);
+
+    // Every texel written after the clear: no copy at all. A missing texture is counted, not an error.
+    const uint64_t copies = ex.stats().clear_copies;
+    gpu::CommandEncoder enc3;
+    emit(enc3, GpuOpcode::ClearTexture, bytes_of(clear));
+    write(enc3, 120, 0, 0, 0, 4, 4, 0x11);
+    write(enc3, 120, 1, 0, 0, 2, 2, 0x11);
+    GpuClearTexturePayload missing{9999, 0};
+    emit(enc3, GpuOpcode::ClearTexture, bytes_of(missing));
+    readback(enc3, 120, 1, 2, 2, 6144, 12);
+    CHECK(run(ex, enc3) == 0);
+    ex.wait_idle();
+    ex.poll();
+    CHECK(ex.stats().clear_copies == copies);
+    CHECK(ex.stats().clears_covered == before.clears_covered + 1);
+    CHECK(ex.stats().clears_missing == before.clears_missing + 1);
+    CHECK(mem[6144] == 0x11 && mem[6159] == 0x11);
+    CHECK(ex.stats().device_errors == before.device_errors);
+    gpu::CommandEncoder done;
+    done.destroy_resource(120);
+    run(ex, done);
+}
+
 void test_readbacks(NativeExecutor& ex) {
     std::vector<uint8_t> mem(8192, 0xEE);
     GuestMemory gm;
@@ -2663,6 +2776,7 @@ int main() {
     test_pack_and_formats(*ex);
     test_stream_accounting(*ex);
     test_readbacks(*ex);
+    test_clear_texture(*ex);
     test_readbacks_host_addresses(*ex);
     test_v1(*ex);
     test_reflection();

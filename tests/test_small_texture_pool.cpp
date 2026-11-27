@@ -359,9 +359,50 @@ void test_stress_2000_ops_matches_reference() {
         }
     }
 }
+// The large pool takes chains over 64 KiB up to its own cap, with its own limits, and only when the
+// consumer clears on the GPU; texture_pool_for routes a chain to the right pool.
+void test_large_pool() {
+    SmallTexturePool p(kSmallTextureMaxBytes, kLargeTextureMaxBytes, 2, 3u << 20);
+    CHECK(!p.accepts(kSmallTextureMaxBytes) && p.accepts(kSmallTextureMaxBytes + 1) && p.accepts(kLargeTextureMaxBytes));
+    CHECK(!p.accepts(kLargeTextureMaxBytes + 1) && !p.accepts(0));
+    CHECK(!p.release(shape(8, 8), 1, 256, nullptr, nullptr));  // small chains stay in the small pool
+    CHECK(p.stats().rejected == 1);
+    CHECK(p.acquire(shape(512, 512), 1u << 20) == 0 && p.stats().misses == 1);
+    CHECK(p.release(shape(512, 512), 7, 1u << 20, nullptr, nullptr));
+    CHECK(p.acquire(shape(512, 512, 29), 1u << 20) == 0);  // other format
+    CHECK(p.acquire(shape(512, 512), 1u << 20) == 7);      // same shape: reused
+    // Own byte limit: a third 1 MiB texture pushes out the oldest.
+    std::vector<uint32_t> ev;
+    std::vector<uint64_t> evb;
+    CHECK(p.release(shape(512, 512), 1, 1u << 20, &ev, &evb));
+    CHECK(p.release(shape(256, 1024), 2, 1u << 20, &ev, &evb));
+    CHECK(ev.empty());
+    CHECK(p.release(shape(1024, 256), 3, 1u << 20, &ev, &evb));  // count limit 2
+    CHECK(ev.size() == 1 && ev[0] == 1 && evb[0] == (1u << 20));
+    CHECK(!p.release(shape(2048, 2048), 4, 4u << 20, &ev, &evb));  // over the pool's byte limit
+    // reset() restores this pool's own limits, not the small pool's.
+    p.set_limits(0, 0);
+    p.reset();
+    CHECK(p.release(shape(512, 512), 5, 2u << 20, nullptr, nullptr));
+    CHECK(p.release(shape(512, 512), 6, 1u << 20, nullptr, nullptr));
+    CHECK(p.stats().parked_count == 2 && p.stats().parked_bytes == (3u << 20));
+
+    // Routing: without the GPU clear every chain goes to the small pool (which declines big ones).
+    set_gpu_texture_clear(false);
+    CHECK(&texture_pool_for(256) == &small_texture_pool());
+    CHECK(&texture_pool_for(1u << 20) == &small_texture_pool());
+    set_gpu_texture_clear(true);
+    CHECK(gpu_texture_clear());
+    CHECK(&texture_pool_for(256) == &small_texture_pool());
+    CHECK(&texture_pool_for(kSmallTextureMaxBytes) == &small_texture_pool());
+    CHECK(&texture_pool_for(kSmallTextureMaxBytes + 1) == &large_texture_pool());
+    CHECK(&texture_pool_for(kLargeTextureMaxBytes + 1) == &small_texture_pool());
+    set_gpu_texture_clear(false);
+}
 }  // namespace
 
 int main() {
+    test_large_pool();
     test_hit_miss();
     test_not_poolable();
     test_eviction_and_drain();
