@@ -2825,3 +2825,98 @@ test('#1077 resolve cache enforces maxResolveCachePackWgslBytes LRU while preser
   router.registerRealShader(0x2003n, 'vertex', { wgsl: 'fn c() {}' });
   assert.equal(router._realShaders.size, 2);
 });
+
+test('P1 #9: all built-in fallback profiles are VS<->PS inter-stage compatible and buildInterstageFallbackVertexWgsl matches PS @location/@interpolate(flat)', () => {
+  const { analyzeInterstageCompatibility } = require('../web/workers/pipeline_cache.js');
+  const { buildInterstageFallbackVertexWgsl } = routerMod;
+  assert.equal(typeof buildInterstageFallbackVertexWgsl, 'function');
+
+  // 1. Every built-in fallback profile pair (vertex + fragment) must pass strict inter-stage compatibility.
+  const profiles = getBuiltInFallbackProfiles();
+  for (const [name, pair] of Object.entries(profiles)) {
+    const check = analyzeInterstageCompatibility(pair.vertex, pair.fragment);
+    assert.equal(
+      check.compatible,
+      true,
+      `built-in profile "${name}" has inter-stage mismatch: ${check.patchSignature}`
+    );
+  }
+
+  // 2. Default buildInterstageFallbackVertexWgsl() emits @location(0..7) vec4<f32>.
+  const defaultLoc8Vs = buildInterstageFallbackVertexWgsl();
+  assertValidWgsl(defaultLoc8Vs, 'vertex');
+  for (let loc = 0; loc < 8; loc += 1) {
+    assert.match(defaultLoc8Vs, new RegExp(`@location\\(${loc}\\)\\s+param_${loc}_:\\s*vec4<f32>`));
+  }
+
+  // 3. PS-tailored fallback VS matches @location(0..7), @interpolate(flat), @interpolate(linear, centroid), and integer vec4<u32>.
+  const realStylePs = [
+    'struct FragIn {',
+    '    @location(0) attr_0_: vec4<f32>,',
+    '    @location(2) @interpolate(flat) attr_2_: vec4<f32>,',
+    '    @location(4) @interpolate(linear, centroid) attr_4_: vec4<f32>,',
+    '    @location(7) @interpolate(flat) attr_7_: vec4<u32>,',
+    '}',
+    'struct PsOut {',
+    '    @location(0) mrt_0_: vec4<f32>,',
+    '}',
+    '@fragment',
+    'fn fs_main(frag_in: FragIn) -> PsOut {',
+    '    var out: PsOut;',
+    '    out.mrt_0_ = frag_in.attr_0_ + frag_in.attr_2_ + frag_in.attr_4_;',
+    '    return out;',
+    '}',
+  ].join('\n');
+
+  const tailoredVs = buildInterstageFallbackVertexWgsl({ psWgsl: realStylePs });
+  assertValidWgsl(tailoredVs, 'vertex');
+  const tailoredCheck = analyzeInterstageCompatibility(tailoredVs, realStylePs);
+  assert.equal(
+    tailoredCheck.compatible,
+    true,
+    `tailored fallback VS failed compatibility: ${tailoredCheck.patchSignature}`
+  );
+
+  // 4. Router resolve(hash, 'vertex', { psWgsl }) returns a PS-compatible built-in fallback VS without polluting normal resolve cache.
+  const router = new ShaderFallbackRouter();
+  const resolvedTailored = router.resolve('0x1234567890abcdef', 'vertex', { psWgsl: realStylePs });
+  assert.equal(resolvedTailored.source, 'builtin');
+  assert.equal(analyzeInterstageCompatibility(resolvedTailored.wgsl, realStylePs).compatible, true);
+
+  // Subsequent normal resolve without psWgsl still returns standard default built-in VS.
+  const resolvedDefault = router.resolve('0x1234567890abcdef', 'vertex');
+  assert.equal(resolvedDefault.wgsl, BUILTIN_FALLBACK_WGSL.vertex);
+
+  // 5. Standalone regex fallback (when PlayGta6PipelineCache is absent) strips custom output struct names & comments.
+  const customOutPs = [
+    'struct FragmentOutput {',
+    '    @location(0) color0: vec4<f32>,',
+    '    @location(1) color1: vec4<f32>,',
+    '}',
+    'struct CustomIn {',
+    '    // @location(9) @interpolate(flat) commented_out: vec4<f32>,',
+    '    @location(0) @interpolate(flat) flat_v: vec4<f32>,',
+    '    @location(3) uv_v: vec2<f32>,',
+    '}',
+    '@fragment fn fs_main(inp: CustomIn) -> FragmentOutput {',
+    '    var out: FragmentOutput;',
+    '    out.color0 = inp.flat_v;',
+    '    out.color1 = vec4<f32>(inp.uv_v, 0.0, 1.0);',
+    '    return out;',
+    '}',
+  ].join('\n');
+  const savedCacheGlobal = globalThis.PlayGta6PipelineCache;
+  let standaloneVs;
+  try {
+    delete globalThis.PlayGta6PipelineCache;
+    standaloneVs = buildInterstageFallbackVertexWgsl({ psWgsl: customOutPs });
+  } finally {
+    globalThis.PlayGta6PipelineCache = savedCacheGlobal;
+  }
+  assertValidWgsl(standaloneVs, 'vertex');
+  assert.equal(
+    analyzeInterstageCompatibility(standaloneVs, customOutPs).compatible,
+    true,
+    'standalone fallback VS must match custom PS output struct names cleanly'
+  );
+});

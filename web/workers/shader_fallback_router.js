@@ -363,6 +363,220 @@
   }
 
   /**
+   * Build a minimal fullscreen-triangle fallback vertex WGSL shader whose `struct VsOut`
+   * matches arbitrary PS `@location(N)` / `@interpolate(...)` / type expectations (defaulting
+   * to `@location(0..7)` `vec4<f32>` zero-filled outputs when no explicit locations or `psWgsl`
+   * are provided). Ensures fallback VS paired with real PS shaders (including `@interpolate(flat)`
+   * and integer locations) passes WebGPU inter-stage validation without errors.
+   *
+   * @param {{
+   *   locations?: Array<{ location: number, type?: string, interpolate?: string | null }>,
+   *   psWgsl?: string,
+   *   locationCount?: number,
+   *   entryPoint?: string,
+   * }} [options]
+   * @returns {string}
+   */
+  function buildInterstageFallbackVertexWgsl(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const entryPoint =
+      typeof opts.entryPoint === 'string' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(opts.entryPoint)
+        ? opts.entryPoint
+        : 'vs_main';
+
+    const byLocation = new Map();
+
+    const normalizeScalarZero = (typeStr) => {
+      const t = String(typeStr || 'vec4<f32>').trim();
+      if (t === 'u32') return '0u';
+      if (t === 'i32') return '0i';
+      if (t === 'f16') return '0.0h';
+      if (t === 'f32') return '0.0';
+      const vm = /^vec([234])\s*<\s*(f32|f16|i32|u32)\s*>$/.exec(t);
+      if (vm) {
+        const sc = vm[2];
+        const z = sc === 'u32' ? '0u' : sc === 'i32' ? '0i' : sc === 'f16' ? '0.0h' : '0.0';
+        return `vec${vm[1]}<${sc}>(${z})`;
+      }
+      return 'vec4<f32>(0.0)';
+    };
+
+    const normalizeIoType = (rawType) => {
+      if (typeof rawType !== 'string') return 'vec4<f32>';
+      const t = rawType.trim();
+      const shorthand = {
+        vec2f: 'vec2<f32>',
+        vec3f: 'vec3<f32>',
+        vec4f: 'vec4<f32>',
+        vec2h: 'vec2<f16>',
+        vec3h: 'vec3<f16>',
+        vec4h: 'vec4<f16>',
+        vec2i: 'vec2<i32>',
+        vec3i: 'vec3<i32>',
+        vec4i: 'vec4<i32>',
+        vec2u: 'vec2<u32>',
+        vec3u: 'vec3<u32>',
+        vec4u: 'vec4<u32>',
+      };
+      if (Object.prototype.hasOwnProperty.call(shorthand, t)) {
+        return shorthand[t];
+      }
+      if (/^(?:f32|f16|i32|u32)$/.test(t)) {
+        return t;
+      }
+      const vm = /^vec([234])\s*<\s*(f32|f16|i32|u32)\s*>$/.exec(t);
+      if (vm) {
+        return `vec${vm[1]}<${vm[2]}>`;
+      }
+      return 'vec4<f32>';
+    };
+
+    const isIntegerType = (canonicalType) =>
+      canonicalType === 'u32' ||
+      canonicalType === 'i32' ||
+      canonicalType.includes('<u32>') ||
+      canonicalType.includes('<i32>');
+
+    const normalizeInterpAttr = (rawInterp, canonicalType) => {
+      if (typeof rawInterp === 'string' && rawInterp.trim().length > 0) {
+        const trimmed = rawInterp.trim();
+        const inner = trimmed.startsWith('@interpolate')
+          ? trimmed.replace(/^@interpolate\s*\(\s*/, '').replace(/\s*\)$/, '')
+          : trimmed;
+        const parts = inner
+          .split(',')
+          .map((p) => p.trim().toLowerCase())
+          .filter((p) => p.length > 0);
+        if (parts.length > 0) {
+          const mode = parts[0];
+          const sampling = parts.length > 1 ? parts[1] : null;
+          if (mode === 'perspective' && (!sampling || sampling === 'center') && !isIntegerType(canonicalType)) {
+            return null;
+          }
+          if (mode === 'linear' && (!sampling || sampling === 'center')) {
+            return '@interpolate(linear)';
+          }
+          return sampling ? `@interpolate(${mode}, ${sampling})` : `@interpolate(${mode})`;
+        }
+      }
+      if (isIntegerType(canonicalType)) {
+        return '@interpolate(flat)';
+      }
+      return null;
+    };
+
+    if (typeof opts.psWgsl === 'string' && opts.psWgsl.length > 0) {
+      // Use PlayGta6PipelineCache.parseInterstageInterface when loaded, else lightweight regex scan.
+      const cacheApi =
+        typeof globalThis !== 'undefined' && globalThis.PlayGta6PipelineCache
+          ? globalThis.PlayGta6PipelineCache
+          : null;
+      if (cacheApi && typeof cacheApi.parseInterstageInterface === 'function') {
+        const psIface = cacheApi.parseInterstageInterface(opts.psWgsl, 'fragment');
+        if (psIface && psIface.locations) {
+          for (const [loc, info] of psIface.locations.entries()) {
+            if (!Number.isInteger(loc) || loc < 0 || loc > 15) continue;
+            const cType = normalizeIoType(info.typeInfo ? info.typeInfo.canonical : info.rawType);
+            const iAttr = normalizeInterpAttr(
+              info.interpolate && info.interpolate.wgslAttr ? info.interpolate.wgslAttr : null,
+              cType
+            );
+            byLocation.set(loc, { location: loc, type: cType, interpolateAttr: iAttr });
+          }
+        }
+      } else {
+        // Lightweight standalone scanner (when PlayGta6PipelineCache is not loaded):
+        // strip comments and any fragment output struct named by `@fragment fn ... -> <OutStruct>`.
+        const noComments = opts.psWgsl
+          .replace(/\/\*[\s\S]*?\*\//g, ' ')
+          .replace(/\/\/[^\r\n]*/g, ' ');
+        let psScanSrc = noComments;
+        const fragRetStructMatch =
+          /@fragment\b[\s\S]*?\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*\([^)]*\)\s*->\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{/.exec(
+            noComments
+          );
+        if (fragRetStructMatch) {
+          const outStructRe = new RegExp(`\\bstruct\\s+${fragRetStructMatch[1]}\\s*\\{[^}]*\\}`, 'g');
+          psScanSrc = psScanSrc.replace(outStructRe, '');
+        }
+        const declRe =
+          /(?:@interpolate\s*\(([^)]+)\)\s*)?@location\s*\(\s*(\d+)u?\s*\)(?:\s*@interpolate\s*\(([^)]+)\))?\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*(vec[234]\s*<\s*(?:f32|f16|i32|u32)\s*>|vec[234][fhiu]|f32|f16|i32|u32)/g;
+        let m;
+        while ((m = declRe.exec(psScanSrc)) !== null) {
+          const loc = Number(m[2]);
+          if (!Number.isInteger(loc) || loc < 0 || loc > 15) continue;
+          const cType = normalizeIoType(m[4]);
+          const iAttr = normalizeInterpAttr(m[1] || m[3] || null, cType);
+          if (!byLocation.has(loc)) {
+            byLocation.set(loc, { location: loc, type: cType, interpolateAttr: iAttr });
+          }
+        }
+      }
+    }
+
+    if (Array.isArray(opts.locations)) {
+      for (let i = 0; i < opts.locations.length; i += 1) {
+        const spec = opts.locations[i];
+        if (!spec || typeof spec !== 'object') continue;
+        const loc = spec.location;
+        if (!Number.isInteger(loc) || loc < 0 || loc > 15) continue;
+        const cType = normalizeIoType(spec.type);
+        const iAttr = normalizeInterpAttr(spec.interpolate, cType);
+        byLocation.set(loc, { location: loc, type: cType, interpolateAttr: iAttr });
+      }
+    }
+
+    const hasExplicitInputs =
+      typeof opts.psWgsl === 'string' && opts.psWgsl.length > 0
+        ? true
+        : Array.isArray(opts.locations);
+
+    if (!hasExplicitInputs) {
+      const count =
+        Number.isInteger(opts.locationCount) && opts.locationCount >= 0
+          ? Math.min(16, opts.locationCount)
+          : 8;
+      for (let loc = 0; loc < count; loc += 1) {
+        byLocation.set(loc, { location: loc, type: 'vec4<f32>', interpolateAttr: null });
+      }
+    }
+
+    const sortedLocs = Array.from(byLocation.values()).sort((a, b) => a.location - b.location);
+    const structFields = ['    @builtin(position) position: vec4<f32>,'];
+    const assignLines = [];
+    for (let i = 0; i < sortedLocs.length; i += 1) {
+      const entry = sortedLocs[i];
+      const fieldName = `param_${entry.location}_`;
+      const attrPart = entry.interpolateAttr
+        ? `@location(${entry.location}) ${entry.interpolateAttr}`
+        : `@location(${entry.location})`;
+      structFields.push(`    ${attrPart} ${fieldName}: ${entry.type},`);
+      assignLines.push(`    out.${fieldName} = ${normalizeScalarZero(entry.type)};`);
+    }
+
+    return [
+      'struct VsOut {',
+      ...structFields,
+      '};',
+      '',
+      '@vertex',
+      `fn ${entryPoint}(@builtin(vertex_index) vertex_index: u32) -> VsOut {`,
+      '    var positions = array<vec2<f32>, 3>(',
+      '        vec2<f32>(-1.0, -1.0),',
+      '        vec2<f32>(3.0, -1.0),',
+      '        vec2<f32>(-1.0, 3.0),',
+      '    );',
+      '    let idx = vertex_index % 3u;',
+      '    var out: VsOut;',
+      '    out.position = vec4<f32>(positions[idx], 0.0, 1.0);',
+      ...assignLines,
+      '    return out;',
+      '}',
+      '',
+    ].join('\n');
+  }
+
+  /**
    * Return a sanitized, JSON-serializable map of available built-in fallback WGSL profiles.
    * Each call returns fresh copies so caller mutations cannot alter router templates.
    *
@@ -2050,6 +2264,13 @@
       }
 
       const opts = options !== undefined && options !== null && typeof options === 'object' ? options : null;
+      const hasInterstageVertexOpts =
+        stageCode === SHADER_STAGE.VERTEX &&
+        opts !== null &&
+        (opts.interstageLocations !== undefined ||
+          opts.psWgsl !== undefined ||
+          opts.interstageLocationCount !== undefined);
+
       const hasSpecialOpts =
         opts !== null &&
         (opts.forceFallback === true ||
@@ -2057,7 +2278,8 @@
           opts.existingSource !== undefined ||
           opts.existingShader !== undefined ||
           opts.reason !== undefined ||
-          opts.missingReason !== undefined);
+          opts.missingReason !== undefined ||
+          hasInterstageVertexOpts);
 
       // W204/W304 Fast Path: zero-alloc O(1) BigInt/numeric/canonical-hex routing (no hex formatting).
       let requested;
@@ -2186,7 +2408,13 @@
         }
 
         const profileTemplates = BUILTIN_FALLBACK_PROFILES[profileName] || BUILTIN_FALLBACK_WGSL;
-        const builtin = profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
+        const builtin = hasInterstageVertexOpts
+          ? buildInterstageFallbackVertexWgsl({
+              locations: opts.interstageLocations,
+              psWgsl: opts.psWgsl,
+              locationCount: opts.interstageLocationCount,
+            })
+          : profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
         this._stats.builtinHits += 1;
         return Object.freeze({
           wgsl: builtin,
@@ -2371,7 +2599,13 @@
       }
 
       const profileTemplates = BUILTIN_FALLBACK_PROFILES[profileName] || BUILTIN_FALLBACK_WGSL;
-      const builtin = profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
+      const builtin = hasInterstageVertexOpts
+        ? buildInterstageFallbackVertexWgsl({
+            locations: opts.interstageLocations,
+            psWgsl: opts.psWgsl,
+            locationCount: opts.interstageLocationCount,
+          })
+        : profileTemplates[stageName] || BUILTIN_FALLBACK_WGSL[stageName];
       this._stats.builtinHits += 1;
       const result = Object.freeze({
         wgsl: builtin,
@@ -3171,6 +3405,7 @@
   }
 
   ShaderFallbackRouter.getBuiltInFallbackProfiles = getBuiltInFallbackProfiles;
+  ShaderFallbackRouter.buildInterstageFallbackVertexWgsl = buildInterstageFallbackVertexWgsl;
 
   const exportedApi = Object.freeze({
     SHADER_STAGE,
@@ -3195,6 +3430,7 @@
     normalizeFallbackProfile,
     selectDeterministicFallbackProfile,
     getBuiltInFallbackProfiles,
+    buildInterstageFallbackVertexWgsl,
     ShaderFallbackRouter,
   });
 
