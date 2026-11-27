@@ -2,11 +2,7 @@
   "benchmark": "synthetic native Rust public emit_module",
   "baselineCommit": "52918dfa4d41e9f316990b06b713219dd9135aac",
   "patchCommit": "uncommitted-decimal-dispatch-bound",
-  "environment": {
-    "system": "Darwin",
-    "release": "27.0.0",
-    "arch": "arm64"
-  },
+  "environment": {"system":"Darwin","release":"27.0.0","arch":"arm64"},
   "sampling": "separate prebuilt binaries; alternating order; fresh process each sample; untimed byte-for-byte complete output oracle per case",
   "allocationMetric": "peak live allocation requested sizes tracked through System allocator wrapper; realloc net requested size; excludes fixtures; not RSS or allocator internals",
   "unmeasured": "real title module sizes/distribution, LLVM compile/link time, browser/Wasm execution and game FPS",
@@ -17,134 +13,22 @@
       "output_sha256": "f9dc2ae4e19565a645095f0b64592d33ebfa43578b5168d74c9e0d7a00c11b12",
       "samples": {
         "before": [
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.28662499999999996,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 589824,
-            "peak_live_requested_bytes": 632116,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.293541,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 589824,
-            "peak_live_requested_bytes": 632116,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.313083,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 589824,
-            "peak_live_requested_bytes": 632116,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.28225,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 589824,
-            "peak_live_requested_bytes": 632116,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.31187499999999996,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 589824,
-            "peak_live_requested_bytes": 632116,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.292792,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 589824,
-            "peak_live_requested_bytes": 632116,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.347917,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 589824,
-            "peak_live_requested_bytes": 632116,
-            "output_fnv64": "8994214a0acd22c0"
-          }
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.28662499999999996,"output_bytes":319272,"output_capacity_bytes":589824,"peak_live_requested_bytes":632116,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.293541,"output_bytes":319272,"output_capacity_bytes":589824,"peak_live_requested_bytes":632116,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.313083,"output_bytes":319272,"output_capacity_bytes":589824,"peak_live_requested_bytes":632116,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.28225,"output_bytes":319272,"output_capacity_bytes":589824,"peak_live_requested_bytes":632116,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.31187499999999996,"output_bytes":319272,"output_capacity_bytes":589824,"peak_live_requested_bytes":632116,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.292792,"output_bytes":319272,"output_capacity_bytes":589824,"peak_live_requested_bytes":632116,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.347917,"output_bytes":319272,"output_capacity_bytes":589824,"peak_live_requested_bytes":632116,"output_fnv64":"8994214a0acd22c0"}
         ],
         "after": [
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.37225,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 331109,
-            "peak_live_requested_bytes": 373401,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.301583,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 331109,
-            "peak_live_requested_bytes": 373401,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.329791,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 331109,
-            "peak_live_requested_bytes": 373401,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.296,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 331109,
-            "peak_live_requested_bytes": 373401,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.304,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 331109,
-            "peak_live_requested_bytes": 373401,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.299708,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 331109,
-            "peak_live_requested_bytes": 373401,
-            "output_fnv64": "8994214a0acd22c0"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 0,
-            "wall_ms": 0.291041,
-            "output_bytes": 319272,
-            "output_capacity_bytes": 331109,
-            "peak_live_requested_bytes": 373401,
-            "output_fnv64": "8994214a0acd22c0"
-          }
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.37225,"output_bytes":319272,"output_capacity_bytes":331109,"peak_live_requested_bytes":373401,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.301583,"output_bytes":319272,"output_capacity_bytes":331109,"peak_live_requested_bytes":373401,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.329791,"output_bytes":319272,"output_capacity_bytes":331109,"peak_live_requested_bytes":373401,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.296,"output_bytes":319272,"output_capacity_bytes":331109,"peak_live_requested_bytes":373401,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.304,"output_bytes":319272,"output_capacity_bytes":331109,"peak_live_requested_bytes":373401,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.299708,"output_bytes":319272,"output_capacity_bytes":331109,"peak_live_requested_bytes":373401,"output_fnv64":"8994214a0acd22c0"},
+          {"kind":"dispatch-many","fixture_mib":0,"wall_ms":0.291041,"output_bytes":319272,"output_capacity_bytes":331109,"peak_live_requested_bytes":373401,"output_fnv64":"8994214a0acd22c0"}
         ]
       }
     },
@@ -154,134 +38,22 @@
       "output_sha256": "00be0a59a2a2af250cfa5d3e68cadff79ef6b9ce9b5f0649158313fff14f55c5",
       "samples": {
         "before": [
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.637667,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 57591808,
-            "peak_live_requested_bytes": 57634100,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.033834,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 57591808,
-            "peak_live_requested_bytes": 57634100,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.828916999999999,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 57591808,
-            "peak_live_requested_bytes": 57634100,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.354291,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 57591808,
-            "peak_live_requested_bytes": 57634100,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.986917,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 57591808,
-            "peak_live_requested_bytes": 57634100,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.11225,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 57591808,
-            "peak_live_requested_bytes": 57634100,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.304041999999999,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 57591808,
-            "peak_live_requested_bytes": 57634100,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          }
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":10.637667,"output_bytes":42169128,"output_capacity_bytes":57591808,"peak_live_requested_bytes":57634100,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":10.033834,"output_bytes":42169128,"output_capacity_bytes":57591808,"peak_live_requested_bytes":57634100,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":9.828916999999999,"output_bytes":42169128,"output_capacity_bytes":57591808,"peak_live_requested_bytes":57634100,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":10.354291,"output_bytes":42169128,"output_capacity_bytes":57591808,"peak_live_requested_bytes":57634100,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":9.986917,"output_bytes":42169128,"output_capacity_bytes":57591808,"peak_live_requested_bytes":57634100,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":10.11225,"output_bytes":42169128,"output_capacity_bytes":57591808,"peak_live_requested_bytes":57634100,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":10.304041999999999,"output_bytes":42169128,"output_capacity_bytes":57591808,"peak_live_requested_bytes":57634100,"output_fnv64":"8e6a1b4ef37175d4"}
         ],
         "after": [
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.210417,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 42180965,
-            "peak_live_requested_bytes": 42223257,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.913375,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 42180965,
-            "peak_live_requested_bytes": 42223257,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.621542,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 42180965,
-            "peak_live_requested_bytes": 42223257,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.568292000000001,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 42180965,
-            "peak_live_requested_bytes": 42223257,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.764875,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 42180965,
-            "peak_live_requested_bytes": 42223257,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.1385,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 42180965,
-            "peak_live_requested_bytes": 42223257,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          },
-          {
-            "kind": "dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.27525,
-            "output_bytes": 42169128,
-            "output_capacity_bytes": 42180965,
-            "peak_live_requested_bytes": 42223257,
-            "output_fnv64": "8e6a1b4ef37175d4"
-          }
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":10.210417,"output_bytes":42169128,"output_capacity_bytes":42180965,"peak_live_requested_bytes":42223257,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":9.913375,"output_bytes":42169128,"output_capacity_bytes":42180965,"peak_live_requested_bytes":42223257,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":9.621542,"output_bytes":42169128,"output_capacity_bytes":42180965,"peak_live_requested_bytes":42223257,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":9.568292000000001,"output_bytes":42169128,"output_capacity_bytes":42180965,"peak_live_requested_bytes":42223257,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":9.764875,"output_bytes":42169128,"output_capacity_bytes":42180965,"peak_live_requested_bytes":42223257,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":11.1385,"output_bytes":42169128,"output_capacity_bytes":42180965,"peak_live_requested_bytes":42223257,"output_fnv64":"8e6a1b4ef37175d4"},
+          {"kind":"dispatch-many","fixture_mib":40,"wall_ms":10.27525,"output_bytes":42169128,"output_capacity_bytes":42180965,"peak_live_requested_bytes":42223257,"output_fnv64":"8e6a1b4ef37175d4"}
         ]
       }
     },
@@ -291,134 +63,22 @@
       "output_sha256": "2845f2336caf606a0dbdc363f2fc9be53d838cfffe2a0c592ef155aa3bb0fb64",
       "samples": {
         "before": [
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.64925,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 60180480,
-            "peak_live_requested_bytes": 60222964,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.545667,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 60180480,
-            "peak_live_requested_bytes": 60222964,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.922167,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 60180480,
-            "peak_live_requested_bytes": 60222964,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.331083,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 60180480,
-            "peak_live_requested_bytes": 60222964,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.90025,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 60180480,
-            "peak_live_requested_bytes": 60222964,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.725,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 60180480,
-            "peak_live_requested_bytes": 60222964,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.055,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 60180480,
-            "peak_live_requested_bytes": 60222964,
-            "output_fnv64": "502432fd4e20d509"
-          }
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":10.64925,"output_bytes":42157080,"output_capacity_bytes":60180480,"peak_live_requested_bytes":60222964,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":10.545667,"output_bytes":42157080,"output_capacity_bytes":60180480,"peak_live_requested_bytes":60222964,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":9.922167,"output_bytes":42157080,"output_capacity_bytes":60180480,"peak_live_requested_bytes":60222964,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":9.331083,"output_bytes":42157080,"output_capacity_bytes":60180480,"peak_live_requested_bytes":60222964,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":9.90025,"output_bytes":42157080,"output_capacity_bytes":60180480,"peak_live_requested_bytes":60222964,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":9.725,"output_bytes":42157080,"output_capacity_bytes":60180480,"peak_live_requested_bytes":60222964,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":11.055,"output_bytes":42157080,"output_capacity_bytes":60180480,"peak_live_requested_bytes":60222964,"output_fnv64":"502432fd4e20d509"}
         ],
         "after": [
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.751541999999999,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 42182229,
-            "peak_live_requested_bytes": 42224713,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.422041,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 42182229,
-            "peak_live_requested_bytes": 42224713,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.520958,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 42182229,
-            "peak_live_requested_bytes": 42224713,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.700833000000001,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 42182229,
-            "peak_live_requested_bytes": 42224713,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.437375000000001,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 42182229,
-            "peak_live_requested_bytes": 42224713,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.062875,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 42182229,
-            "peak_live_requested_bytes": 42224713,
-            "output_fnv64": "502432fd4e20d509"
-          },
-          {
-            "kind": "helper-dispatch-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.358375,
-            "output_bytes": 42157080,
-            "output_capacity_bytes": 42182229,
-            "peak_live_requested_bytes": 42224713,
-            "output_fnv64": "502432fd4e20d509"
-          }
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":10.751541999999999,"output_bytes":42157080,"output_capacity_bytes":42182229,"peak_live_requested_bytes":42224713,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":10.422041,"output_bytes":42157080,"output_capacity_bytes":42182229,"peak_live_requested_bytes":42224713,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":9.520958,"output_bytes":42157080,"output_capacity_bytes":42182229,"peak_live_requested_bytes":42224713,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":9.700833000000001,"output_bytes":42157080,"output_capacity_bytes":42182229,"peak_live_requested_bytes":42224713,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":10.437375000000001,"output_bytes":42157080,"output_capacity_bytes":42182229,"peak_live_requested_bytes":42224713,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":10.062875,"output_bytes":42157080,"output_capacity_bytes":42182229,"peak_live_requested_bytes":42224713,"output_fnv64":"502432fd4e20d509"},
+          {"kind":"helper-dispatch-many","fixture_mib":40,"wall_ms":9.358375,"output_bytes":42157080,"output_capacity_bytes":42182229,"peak_live_requested_bytes":42224713,"output_fnv64":"502432fd4e20d509"}
         ]
       }
     },
@@ -428,134 +88,22 @@
       "output_sha256": "bd80f6eaa9e1bea556b87ded016b719e406bfe32b19618d1546a36a57ed31dcb",
       "samples": {
         "before": [
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.930499999999999,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 58640384,
-            "peak_live_requested_bytes": 58682676,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.522458,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 58640384,
-            "peak_live_requested_bytes": 58682676,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.353542000000001,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 58640384,
-            "peak_live_requested_bytes": 58682676,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.326584,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 58640384,
-            "peak_live_requested_bytes": 58682676,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.990041999999999,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 58640384,
-            "peak_live_requested_bytes": 58682676,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.591125,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 58640384,
-            "peak_live_requested_bytes": 58682676,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.555584,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 58640384,
-            "peak_live_requested_bytes": 58682676,
-            "output_fnv64": "f94013d397046b22"
-          }
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.930499999999999,"output_bytes":43751200,"output_capacity_bytes":58640384,"peak_live_requested_bytes":58682676,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.522458,"output_bytes":43751200,"output_capacity_bytes":58640384,"peak_live_requested_bytes":58682676,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.353542000000001,"output_bytes":43751200,"output_capacity_bytes":58640384,"peak_live_requested_bytes":58682676,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.326584,"output_bytes":43751200,"output_capacity_bytes":58640384,"peak_live_requested_bytes":58682676,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":9.990041999999999,"output_bytes":43751200,"output_capacity_bytes":58640384,"peak_live_requested_bytes":58682676,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.591125,"output_bytes":43751200,"output_capacity_bytes":58640384,"peak_live_requested_bytes":58682676,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.555584,"output_bytes":43751200,"output_capacity_bytes":58640384,"peak_live_requested_bytes":58682676,"output_fnv64":"f94013d397046b22"}
         ],
         "after": [
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 9.926499999999999,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 43763037,
-            "peak_live_requested_bytes": 43805329,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.1095,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 43763037,
-            "peak_live_requested_bytes": 43805329,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.713917,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 43763037,
-            "peak_live_requested_bytes": 43805329,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.887374999999999,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 43763037,
-            "peak_live_requested_bytes": 43805329,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.065958,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 43763037,
-            "peak_live_requested_bytes": 43805329,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.15975,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 43763037,
-            "peak_live_requested_bytes": 43805329,
-            "output_fnv64": "f94013d397046b22"
-          },
-          {
-            "kind": "dispatch-long-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.229125,
-            "output_bytes": 43751200,
-            "output_capacity_bytes": 43763037,
-            "peak_live_requested_bytes": 43805329,
-            "output_fnv64": "f94013d397046b22"
-          }
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":9.926499999999999,"output_bytes":43751200,"output_capacity_bytes":43763037,"peak_live_requested_bytes":43805329,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.1095,"output_bytes":43751200,"output_capacity_bytes":43763037,"peak_live_requested_bytes":43805329,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.713917,"output_bytes":43751200,"output_capacity_bytes":43763037,"peak_live_requested_bytes":43805329,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.887374999999999,"output_bytes":43751200,"output_capacity_bytes":43763037,"peak_live_requested_bytes":43805329,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.065958,"output_bytes":43751200,"output_capacity_bytes":43763037,"peak_live_requested_bytes":43805329,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.15975,"output_bytes":43751200,"output_capacity_bytes":43763037,"peak_live_requested_bytes":43805329,"output_fnv64":"f94013d397046b22"},
+          {"kind":"dispatch-long-many","fixture_mib":40,"wall_ms":10.229125,"output_bytes":43751200,"output_capacity_bytes":43763037,"peak_live_requested_bytes":43805329,"output_fnv64":"f94013d397046b22"}
         ]
       }
     },
@@ -565,134 +113,22 @@
       "output_sha256": "c6115e1502f57204238d1a377bc0f14317bec0940bb29bee11a695c9c4bf8876",
       "samples": {
         "before": [
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 9.641709,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 83887738,
-            "peak_live_requested_bytes": 83888638,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 9.561791,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 83887738,
-            "peak_live_requested_bytes": 83888638,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 9.813749999999999,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 83887738,
-            "peak_live_requested_bytes": 83888638,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.241125,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 83887738,
-            "peak_live_requested_bytes": 83888638,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.254583,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 83887738,
-            "peak_live_requested_bytes": 83888638,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.105583000000001,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 83887738,
-            "peak_live_requested_bytes": 83888638,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 9.898,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 83887738,
-            "peak_live_requested_bytes": 83888638,
-            "output_fnv64": "f9435dc93a711585"
-          }
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":9.641709,"output_bytes":41949325,"output_capacity_bytes":83887738,"peak_live_requested_bytes":83888638,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":9.561791,"output_bytes":41949325,"output_capacity_bytes":83887738,"peak_live_requested_bytes":83888638,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":9.813749999999999,"output_bytes":41949325,"output_capacity_bytes":83887738,"peak_live_requested_bytes":83888638,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":11.241125,"output_bytes":41949325,"output_capacity_bytes":83887738,"peak_live_requested_bytes":83888638,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":10.254583,"output_bytes":41949325,"output_capacity_bytes":83887738,"peak_live_requested_bytes":83888638,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":11.105583000000001,"output_bytes":41949325,"output_capacity_bytes":83887738,"peak_live_requested_bytes":83888638,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":9.898,"output_bytes":41949325,"output_capacity_bytes":83887738,"peak_live_requested_bytes":83888638,"output_fnv64":"f9435dc93a711585"}
         ],
         "after": [
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.496125000000001,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 41950140,
-            "peak_live_requested_bytes": 41951040,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 9.972999999999999,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 41950140,
-            "peak_live_requested_bytes": 41951040,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.135666,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 41950140,
-            "peak_live_requested_bytes": 41951040,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.395208,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 41950140,
-            "peak_live_requested_bytes": 41951040,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.376167,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 41950140,
-            "peak_live_requested_bytes": 41951040,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.239125,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 41950140,
-            "peak_live_requested_bytes": 41951040,
-            "output_fnv64": "f9435dc93a711585"
-          },
-          {
-            "kind": "dispatch-skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.43775,
-            "output_bytes": 41949325,
-            "output_capacity_bytes": 41950140,
-            "peak_live_requested_bytes": 41951040,
-            "output_fnv64": "f9435dc93a711585"
-          }
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":10.496125000000001,"output_bytes":41949325,"output_capacity_bytes":41950140,"peak_live_requested_bytes":41951040,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":9.972999999999999,"output_bytes":41949325,"output_capacity_bytes":41950140,"peak_live_requested_bytes":41951040,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":10.135666,"output_bytes":41949325,"output_capacity_bytes":41950140,"peak_live_requested_bytes":41951040,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":10.395208,"output_bytes":41949325,"output_capacity_bytes":41950140,"peak_live_requested_bytes":41951040,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":10.376167,"output_bytes":41949325,"output_capacity_bytes":41950140,"peak_live_requested_bytes":41951040,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":10.239125,"output_bytes":41949325,"output_capacity_bytes":41950140,"peak_live_requested_bytes":41951040,"output_fnv64":"f9435dc93a711585"},
+          {"kind":"dispatch-skew","fixture_mib":40,"wall_ms":11.43775,"output_bytes":41949325,"output_capacity_bytes":41950140,"peak_live_requested_bytes":41951040,"output_fnv64":"f9435dc93a711585"}
         ]
       }
     },
@@ -702,134 +138,22 @@
       "output_sha256": "580a112d0e5108eadd9a8ec3718ed6184c5aa1928af10686235bec1edb019d52",
       "samples": {
         "before": [
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 12.729583,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 125832106,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 12.24925,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 125832106,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 13.558667,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 125832106,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 13.503416000000001,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 125832106,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 14.441291999999999,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 125832106,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 13.540084,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 125832106,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 12.624458,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 125832106,
-            "output_fnv64": "2872fa4773ee67e0"
-          }
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":12.729583,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":125832106,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":12.24925,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":125832106,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":13.558667,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":125832106,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":13.503416000000001,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":125832106,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":14.441291999999999,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":125832106,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":13.540084,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":125832106,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":12.624458,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":125832106,"output_fnv64":"2872fa4773ee67e0"}
         ],
         "after": [
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 12.396167,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 83889379,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 14.277833,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 83889379,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 12.347624999999999,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 83889379,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 13.287749999999999,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 83889379,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 12.73025,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 83889379,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 13.564792,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 83889379,
-            "output_fnv64": "2872fa4773ee67e0"
-          },
-          {
-            "kind": "raw-dispatch",
-            "fixture_mib": 40,
-            "wall_ms": 13.967417,
-            "output_bytes": 41944413,
-            "output_capacity_bytes": 83888468,
-            "peak_live_requested_bytes": 83889379,
-            "output_fnv64": "2872fa4773ee67e0"
-          }
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":12.396167,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":83889379,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":14.277833,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":83889379,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":12.347624999999999,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":83889379,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":13.287749999999999,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":83889379,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":12.73025,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":83889379,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":13.564792,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":83889379,"output_fnv64":"2872fa4773ee67e0"},
+          {"kind":"raw-dispatch","fixture_mib":40,"wall_ms":13.967417,"output_bytes":41944413,"output_capacity_bytes":83888468,"peak_live_requested_bytes":83889379,"output_fnv64":"2872fa4773ee67e0"}
         ]
       }
     },
@@ -839,134 +163,22 @@
       "output_sha256": "0d9d79fe738feb3fddb8d927962ac5a9949a4d29942b911cdc81dcf98712a6fc",
       "samples": {
         "before": [
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004959,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004625,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004125,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004167,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.0045000000000000005,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004167,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004291,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          }
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.004959,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.004625,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.004125,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.004167,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.0045000000000000005,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.004167,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.004291,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"}
         ],
         "after": [
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.006,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.00425,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003583,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003917,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003958,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          },
-          {
-            "kind": "dispatch-control",
-            "fixture_mib": 0,
-            "wall_ms": 0.0043749999999999995,
-            "output_bytes": 1419,
-            "output_capacity_bytes": 2304,
-            "peak_live_requested_bytes": 2444,
-            "output_fnv64": "10005d050eea2444"
-          }
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.006,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.004,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.00425,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.003583,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.003917,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.003958,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"},
+          {"kind":"dispatch-control","fixture_mib":0,"wall_ms":0.0043749999999999995,"output_bytes":1419,"output_capacity_bytes":2304,"peak_live_requested_bytes":2444,"output_fnv64":"10005d050eea2444"}
         ]
       }
     },
@@ -976,134 +188,22 @@
       "output_sha256": "7f618df818be4d0fc64385d46ed619b9e9171ec312476001c44dc1aaddc96ab4",
       "samples": {
         "before": [
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 12.030416,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 60213248,
-            "peak_live_requested_bytes": 60255732,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 12.002125000000001,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 60213248,
-            "peak_live_requested_bytes": 60255732,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.116584000000001,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 60213248,
-            "peak_live_requested_bytes": 60255732,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 12.571292,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 60213248,
-            "peak_live_requested_bytes": 60255732,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 12.14125,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 60213248,
-            "peak_live_requested_bytes": 60255732,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.18525,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 60213248,
-            "peak_live_requested_bytes": 60255732,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.491375,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 60213248,
-            "peak_live_requested_bytes": 60255732,
-            "output_fnv64": "4418d59a2807425c"
-          }
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":12.030416,"output_bytes":42027479,"output_capacity_bytes":60213248,"peak_live_requested_bytes":60255732,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":12.002125000000001,"output_bytes":42027479,"output_capacity_bytes":60213248,"peak_live_requested_bytes":60255732,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":11.116584000000001,"output_bytes":42027479,"output_capacity_bytes":60213248,"peak_live_requested_bytes":60255732,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":12.571292,"output_bytes":42027479,"output_capacity_bytes":60213248,"peak_live_requested_bytes":60255732,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":12.14125,"output_bytes":42027479,"output_capacity_bytes":60213248,"peak_live_requested_bytes":60255732,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":11.18525,"output_bytes":42027479,"output_capacity_bytes":60213248,"peak_live_requested_bytes":60255732,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":11.491375,"output_bytes":42027479,"output_capacity_bytes":60213248,"peak_live_requested_bytes":60255732,"output_fnv64":"4418d59a2807425c"}
         ],
         "after": [
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.765042000000001,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 42028453,
-            "peak_live_requested_bytes": 42070937,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.624208000000001,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 42028453,
-            "peak_live_requested_bytes": 42070937,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.509875,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 42028453,
-            "peak_live_requested_bytes": 42070937,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.820082999999999,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 42028453,
-            "peak_live_requested_bytes": 42070937,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.584375,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 42028453,
-            "peak_live_requested_bytes": 42070937,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 12.165667,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 42028453,
-            "peak_live_requested_bytes": 42070937,
-            "output_fnv64": "4418d59a2807425c"
-          },
-          {
-            "kind": "helper-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.131042,
-            "output_bytes": 42027479,
-            "output_capacity_bytes": 42028453,
-            "peak_live_requested_bytes": 42070937,
-            "output_fnv64": "4418d59a2807425c"
-          }
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":10.765042000000001,"output_bytes":42027479,"output_capacity_bytes":42028453,"peak_live_requested_bytes":42070937,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":11.624208000000001,"output_bytes":42027479,"output_capacity_bytes":42028453,"peak_live_requested_bytes":42070937,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":11.509875,"output_bytes":42027479,"output_capacity_bytes":42028453,"peak_live_requested_bytes":42070937,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":10.820082999999999,"output_bytes":42027479,"output_capacity_bytes":42028453,"peak_live_requested_bytes":42070937,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":11.584375,"output_bytes":42027479,"output_capacity_bytes":42028453,"peak_live_requested_bytes":42070937,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":12.165667,"output_bytes":42027479,"output_capacity_bytes":42028453,"peak_live_requested_bytes":42070937,"output_fnv64":"4418d59a2807425c"},
+          {"kind":"helper-many","fixture_mib":40,"wall_ms":11.131042,"output_bytes":42027479,"output_capacity_bytes":42028453,"peak_live_requested_bytes":42070937,"output_fnv64":"4418d59a2807425c"}
         ]
       }
     },
@@ -1113,134 +213,22 @@
       "output_sha256": "ef56ec5d3c5359092a343a3fdc1cc077acf66d070f30e90c4a78c705ec15a7c0",
       "samples": {
         "before": [
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.477375,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 57624576,
-            "peak_live_requested_bytes": 57666868,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.177459,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 57624576,
-            "peak_live_requested_bytes": 57666868,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 12.055042,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 57624576,
-            "peak_live_requested_bytes": 57666868,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 12.433,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 57624576,
-            "peak_live_requested_bytes": 57666868,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.121958,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 57624576,
-            "peak_live_requested_bytes": 57666868,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.985624999999999,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 57624576,
-            "peak_live_requested_bytes": 57666868,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.901333,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 57624576,
-            "peak_live_requested_bytes": 57666868,
-            "output_fnv64": "bb354d762abc9bdd"
-          }
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.477375,"output_bytes":42026215,"output_capacity_bytes":57624576,"peak_live_requested_bytes":57666868,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.177459,"output_bytes":42026215,"output_capacity_bytes":57624576,"peak_live_requested_bytes":57666868,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":12.055042,"output_bytes":42026215,"output_capacity_bytes":57624576,"peak_live_requested_bytes":57666868,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":12.433,"output_bytes":42026215,"output_capacity_bytes":57624576,"peak_live_requested_bytes":57666868,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.121958,"output_bytes":42026215,"output_capacity_bytes":57624576,"peak_live_requested_bytes":57666868,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.985624999999999,"output_bytes":42026215,"output_capacity_bytes":57624576,"peak_live_requested_bytes":57666868,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":10.901333,"output_bytes":42026215,"output_capacity_bytes":57624576,"peak_live_requested_bytes":57666868,"output_fnv64":"bb354d762abc9bdd"}
         ],
         "after": [
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.559625,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 42027189,
-            "peak_live_requested_bytes": 42069481,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.677290999999999,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 42027189,
-            "peak_live_requested_bytes": 42069481,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.028958,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 42027189,
-            "peak_live_requested_bytes": 42069481,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.410292,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 42027189,
-            "peak_live_requested_bytes": 42069481,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.012667,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 42027189,
-            "peak_live_requested_bytes": 42069481,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 10.629042,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 42027189,
-            "peak_live_requested_bytes": 42069481,
-            "output_fnv64": "bb354d762abc9bdd"
-          },
-          {
-            "kind": "control-many",
-            "fixture_mib": 40,
-            "wall_ms": 11.908583,
-            "output_bytes": 42026215,
-            "output_capacity_bytes": 42027189,
-            "peak_live_requested_bytes": 42069481,
-            "output_fnv64": "bb354d762abc9bdd"
-          }
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.559625,"output_bytes":42026215,"output_capacity_bytes":42027189,"peak_live_requested_bytes":42069481,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.677290999999999,"output_bytes":42026215,"output_capacity_bytes":42027189,"peak_live_requested_bytes":42069481,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.028958,"output_bytes":42026215,"output_capacity_bytes":42027189,"peak_live_requested_bytes":42069481,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":10.410292,"output_bytes":42026215,"output_capacity_bytes":42027189,"peak_live_requested_bytes":42069481,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.012667,"output_bytes":42026215,"output_capacity_bytes":42027189,"peak_live_requested_bytes":42069481,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":10.629042,"output_bytes":42026215,"output_capacity_bytes":42027189,"peak_live_requested_bytes":42069481,"output_fnv64":"bb354d762abc9bdd"},
+          {"kind":"control-many","fixture_mib":40,"wall_ms":11.908583,"output_bytes":42026215,"output_capacity_bytes":42027189,"peak_live_requested_bytes":42069481,"output_fnv64":"bb354d762abc9bdd"}
         ]
       }
     },
@@ -1250,134 +238,22 @@
       "output_sha256": "0ef2238f5273c8a5b64ad5445af6d0794ad002f09c65602e717e76e6a652101c",
       "samples": {
         "before": [
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.664290999999999,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 83887770,
-            "peak_live_requested_bytes": 83888670,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.648333000000001,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 83887770,
-            "peak_live_requested_bytes": 83888670,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.731958,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 83887770,
-            "peak_live_requested_bytes": 83888670,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 12.006375,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 83887770,
-            "peak_live_requested_bytes": 83888670,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.822458,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 83887770,
-            "peak_live_requested_bytes": 83888670,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 12.45075,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 83887770,
-            "peak_live_requested_bytes": 83888670,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 12.177,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 83887770,
-            "peak_live_requested_bytes": 83888670,
-            "output_fnv64": "a16199501fbb590b"
-          }
+          {"kind":"skew","fixture_mib":40,"wall_ms":10.664290999999999,"output_bytes":41945662,"output_capacity_bytes":83887770,"peak_live_requested_bytes":83888670,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":11.648333000000001,"output_bytes":41945662,"output_capacity_bytes":83887770,"peak_live_requested_bytes":83888670,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":10.731958,"output_bytes":41945662,"output_capacity_bytes":83887770,"peak_live_requested_bytes":83888670,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":12.006375,"output_bytes":41945662,"output_capacity_bytes":83887770,"peak_live_requested_bytes":83888670,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":10.822458,"output_bytes":41945662,"output_capacity_bytes":83887770,"peak_live_requested_bytes":83888670,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":12.45075,"output_bytes":41945662,"output_capacity_bytes":83887770,"peak_live_requested_bytes":83888670,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":12.177,"output_bytes":41945662,"output_capacity_bytes":83887770,"peak_live_requested_bytes":83888670,"output_fnv64":"a16199501fbb590b"}
         ],
         "after": [
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.152584000000001,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 41946636,
-            "peak_live_requested_bytes": 41947536,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.787458,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 41946636,
-            "peak_live_requested_bytes": 41947536,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 12.041292,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 41946636,
-            "peak_live_requested_bytes": 41947536,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.862417,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 41946636,
-            "peak_live_requested_bytes": 41947536,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.354834,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 41946636,
-            "peak_live_requested_bytes": 41947536,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 11.767916,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 41946636,
-            "peak_live_requested_bytes": 41947536,
-            "output_fnv64": "a16199501fbb590b"
-          },
-          {
-            "kind": "skew",
-            "fixture_mib": 40,
-            "wall_ms": 10.655209000000001,
-            "output_bytes": 41945662,
-            "output_capacity_bytes": 41946636,
-            "peak_live_requested_bytes": 41947536,
-            "output_fnv64": "a16199501fbb590b"
-          }
+          {"kind":"skew","fixture_mib":40,"wall_ms":11.152584000000001,"output_bytes":41945662,"output_capacity_bytes":41946636,"peak_live_requested_bytes":41947536,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":11.787458,"output_bytes":41945662,"output_capacity_bytes":41946636,"peak_live_requested_bytes":41947536,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":12.041292,"output_bytes":41945662,"output_capacity_bytes":41946636,"peak_live_requested_bytes":41947536,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":11.862417,"output_bytes":41945662,"output_capacity_bytes":41946636,"peak_live_requested_bytes":41947536,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":10.354834,"output_bytes":41945662,"output_capacity_bytes":41946636,"peak_live_requested_bytes":41947536,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":11.767916,"output_bytes":41945662,"output_capacity_bytes":41946636,"peak_live_requested_bytes":41947536,"output_fnv64":"a16199501fbb590b"},
+          {"kind":"skew","fixture_mib":40,"wall_ms":10.655209000000001,"output_bytes":41945662,"output_capacity_bytes":41946636,"peak_live_requested_bytes":41947536,"output_fnv64":"a16199501fbb590b"}
         ]
       }
     },
@@ -1387,134 +263,22 @@
       "output_sha256": "e70bf265ceaaa9e09f0817862cfb1d2987edb700ab0e8f60054df62b1cbc2d98",
       "samples": {
         "before": [
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.002915999999999,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 10.971917,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 10.974792,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.210792000000001,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.192416999999999,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.870209,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.523583,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          }
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.002915999999999,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":10.971917,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":10.974792,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.210792000000001,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.192416999999999,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.870209,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.523583,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"01f3e9aa90eaeed5"}
         ],
         "after": [
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 10.915459,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.904625000000001,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 10.425208999999999,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.458,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 11.842666,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 12.028416,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          },
-          {
-            "kind": "helper",
-            "fixture_mib": 40,
-            "wall_ms": 10.354500000000002,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "01f3e9aa90eaeed5"
-          }
+          {"kind":"helper","fixture_mib":40,"wall_ms":10.915459,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.904625000000001,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":10.425208999999999,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.458,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":11.842666,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":12.028416,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"01f3e9aa90eaeed5"},
+          {"kind":"helper","fixture_mib":40,"wall_ms":10.354500000000002,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"01f3e9aa90eaeed5"}
         ]
       }
     },
@@ -1524,134 +288,22 @@
       "output_sha256": "5836fa3e3fab4de305d1ec587ab5f1051afd670159c62ef58749b99ad99792c0",
       "samples": {
         "before": [
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 13.728167,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83887968,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.161875,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83887968,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.283375,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83887968,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.645209,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83887968,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.107583,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83887968,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.545209000000002,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83887968,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.459959000000001,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83887968,
-            "output_fnv64": "57a7f8c27310ae00"
-          }
+          {"kind":"raw","fixture_mib":40,"wall_ms":13.728167,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83887968,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.161875,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83887968,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.283375,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83887968,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.645209,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83887968,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.107583,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83887968,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.545209000000002,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83887968,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.459959000000001,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83887968,"output_fnv64":"57a7f8c27310ae00"}
         ],
         "after": [
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.402834,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83888992,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 17.182875,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83888992,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 14.536708,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83888992,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.161166999999999,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83888992,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 16.255917,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83888992,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 14.193375,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83888992,
-            "output_fnv64": "57a7f8c27310ae00"
-          },
-          {
-            "kind": "raw",
-            "fixture_mib": 40,
-            "wall_ms": 15.336541,
-            "output_bytes": 41943935,
-            "output_capacity_bytes": 41943946,
-            "peak_live_requested_bytes": 83888992,
-            "output_fnv64": "57a7f8c27310ae00"
-          }
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.402834,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83888992,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":17.182875,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83888992,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":14.536708,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83888992,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.161166999999999,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83888992,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":16.255917,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83888992,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":14.193375,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83888992,"output_fnv64":"57a7f8c27310ae00"},
+          {"kind":"raw","fixture_mib":40,"wall_ms":15.336541,"output_bytes":41943935,"output_capacity_bytes":41943946,"peak_live_requested_bytes":83888992,"output_fnv64":"57a7f8c27310ae00"}
         ]
       }
     },
@@ -1661,134 +313,22 @@
       "output_sha256": "fcd0bd68f3d3289dfd808168dd4330cdcbec46c0c86398308a46d130dec94cce",
       "samples": {
         "before": [
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 11.292541,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 10.6325,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 11.998333,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 10.397333,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 12.056417,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 10.472125,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 10.967792000000001,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 83890298,
-            "peak_live_requested_bytes": 83890630,
-            "output_fnv64": "18e7eee1878f0f30"
-          }
+          {"kind":"crlf","fixture_mib":40,"wall_ms":11.292541,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":10.6325,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":11.998333,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":10.397333,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":12.056417,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":10.472125,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":10.967792000000001,"output_bytes":41945199,"output_capacity_bytes":83890298,"peak_live_requested_bytes":83890630,"output_fnv64":"18e7eee1878f0f30"}
         ],
         "after": [
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 11.528208,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 10.471333,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 12.607999999999999,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 10.499833,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 11.621542,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 10.943709,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "18e7eee1878f0f30"
-          },
-          {
-            "kind": "crlf",
-            "fixture_mib": 40,
-            "wall_ms": 12.668375000000001,
-            "output_bytes": 41945199,
-            "output_capacity_bytes": 41946173,
-            "peak_live_requested_bytes": 41946505,
-            "output_fnv64": "18e7eee1878f0f30"
-          }
+          {"kind":"crlf","fixture_mib":40,"wall_ms":11.528208,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":10.471333,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":12.607999999999999,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":10.499833,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":11.621542,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":10.943709,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"18e7eee1878f0f30"},
+          {"kind":"crlf","fixture_mib":40,"wall_ms":12.668375000000001,"output_bytes":41945199,"output_capacity_bytes":41946173,"peak_live_requested_bytes":41946505,"output_fnv64":"18e7eee1878f0f30"}
         ]
       }
     },
@@ -1798,134 +338,22 @@
       "output_sha256": "a5a60319a79cdd9a0086d0ed651c6e5df03d418524a75a56164204b86f81cb9c",
       "samples": {
         "before": [
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003375,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.0037500000000000003,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003125,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003167,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.0029579999999999997,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.004292,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.00325,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          }
+          {"kind":"control","fixture_mib":0,"wall_ms":0.003375,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.0037500000000000003,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.003125,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.003167,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.0029579999999999997,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.004292,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.00325,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"}
         ],
         "after": [
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.00325,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.002833,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.002792,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003792,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.003834,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          },
-          {
-            "kind": "control",
-            "fixture_mib": 0,
-            "wall_ms": 0.002833,
-            "output_bytes": 884,
-            "output_capacity_bytes": 1152,
-            "peak_live_requested_bytes": 1292,
-            "output_fnv64": "ed5c02e8a1cbbf0e"
-          }
+          {"kind":"control","fixture_mib":0,"wall_ms":0.00325,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.002833,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.003,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.002792,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.003792,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.003834,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"},
+          {"kind":"control","fixture_mib":0,"wall_ms":0.002833,"output_bytes":884,"output_capacity_bytes":1152,"peak_live_requested_bytes":1292,"output_fnv64":"ed5c02e8a1cbbf0e"}
         ]
       }
     }
