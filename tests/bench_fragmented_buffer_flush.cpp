@@ -27,12 +27,13 @@ int main(int argc,char** argv) {
  try {
  os::set_write_tracking(false); gw::reset_for_testing();gw::set_enabled(true);
  os::VirtualMemoryArena arena;com::reset_com_bridge();com::set_guest_memory(&arena);
- std::vector<uint8_t> storage(mapped_bytes*2,0);
- const uint64_t base=gw::map_runtime_range(storage.data(),mapped_bytes,false);
+ std::vector<uint8_t> storage(mapped_bytes*2+gw::kSlotBytes,0);
+ auto* host=reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(storage.data())+gw::kSlotBytes-1)&~(gw::kSlotBytes-1));
+ const uint64_t base=gw::map_runtime_range(host,mapped_bytes,false);
  const uint64_t cpu=base+(unaligned?123:0);
  if(!cpu)throw std::runtime_error("map runtime range failed");
  for(size_t i=0;i<mapped_bytes/gw::kSlotBytes;++i)
-  if(!gw::map_slot(base+i*gw::kSlotBytes,storage.data()+i*gw::kSlotBytes*(scattered?2:1)))throw std::runtime_error("map slot failed");
+  if(!gw::map_slot(base+i*gw::kSlotBytes,host+i*gw::kSlotBytes*(scattered?2:1)))throw std::runtime_error("map slot failed");
  dg::DeviceOptions options;options.sink=[](const uint8_t*,size_t){};
  auto dev=com::create_object<dg::Device>(com::implements(dg::kID3D12Device),options);dev->initialize_guest_payload();
  dg::GuestResourceDesc d{};d.Dimension=1;d.Width=bytes;d.Height=1;d.DepthOrArraySize=1;d.MipLevels=1;d.SampleCount=1;d.Layout=1;
