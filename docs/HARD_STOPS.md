@@ -95,7 +95,8 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
   both answered locally.
 - **No store or licence call later in the boot.** A native menu-flow run to 240 s states "No store/licence call".
   I found no comment on #663 reporting a store/licence call at about 73 s; if one exists elsewhere, add it here.
-- Token/signature and GetAppSpecificDeviceId: no comment on #663 reports the boot reaching them.
+- **GetAppSpecificDeviceId (XSystem slot 5)**: every boot now reaches it and stops there, at about 62-67 s (see 7.1).
+- Token/signature: no run reports the boot reaching it (slot 25 cannot be reached while slot 24 fails, see 7.2).
   Their stubs would trap on first call, so a stop at them would be visible as an unimplemented-import fault.
 
 ## 6. Owner decisions pending
@@ -135,6 +136,36 @@ What the title does:
 
 Recommendation: **A**. The only caller ignores errors by design.
 
+#### 7.1 Evidence (static re-check of the real executable, read-only)
+
+The boot now stops here every run, at about 62-67 s.
+- **Call site.** The slot 5 wrapper (QueryApiImpl, one vtable call, Release) has exactly **one** caller. That caller
+  passes a zeroed 45-byte buffer and a "bytes used" out value.
+- **Branch.** The return value is tested for `== 0`, not just for its sign. Any non-zero HRESULT skips the step
+  silently: `E_NOTIMPL`, any other error, `S_FALSE`, or the wrapper's own QueryApiImpl failure. On `S_OK` the title
+  compares `min(used, 45)` bytes with a 44-digit all-zero constant and appends the id only when they match exactly.
+  The step does not retry, log, raise a dialog, quit, or take any other path.
+- **Why it is called at all.** The step first asks XSystem slot 3 (console id, 39-byte buffer). It appends the
+  console id and skips the device id only when the console id equals the title's *dotted* all-zero placeholder
+  (zero digit groups joined by dots). Our slot 3 returns 38 zeros with no dots, which never matches, so the device id is
+  always requested.
+- **Consumer.** The step's output (3 or 4 parts, `;`-separated, together with a per-user value and two small
+  numbers) goes through a base-36-style text encoder and is stored in **one** global. That global has exactly four
+  code references: a "built yet?" check, the store, and a shutdown routine that frees it and clears it. Nothing else
+  reads it, so "the built text is never read" now has **high** confidence. The only thing static analysis cannot
+  rule out is a read through pointer arithmetic.
+- **When.** The value is built lazily, once, at the tail of the main game loop's iteration. That fits a stop about
+  60 s in: the first full main-loop pass after the boot.
+- **What comes next.** After the step returns, the loop moves to its next iteration. The loop makes no other
+  XSystem call; slots 3 and 4 are already implemented. The next trap will come from another subsystem. The
+  candidates that are statically reachable are the XUser slots in 7.2.
+- **Consequence per option.** A: three parts, encoded, stored, never read; the boot continues. B/C: the value is
+  compared with the constant and dropped, the same as A. D: one more part that nobody reads. E: the boot stops.
+  None of the options leads to a fatal or "offline" UI path.
+- Not an option to use instead of A, listed only for completeness: if slot 3 returned the dotted placeholder format,
+  the device id would never be asked for. That would change a different API's value just to steer the title's
+  control flow.
+
 ### 7.2 XUser sign-in state for an offline local user (slots 14, 10, 12, 5; backlog item 17)
 
 What the title does (all four are purely local lookups; none leads to a network call, and every online path
@@ -159,8 +190,47 @@ needs a token from slot 23, which already fails offline):
 Recommendation: slot 14 = signed in for the single local offline user, 10/12/5 as in the recommended rows;
 no tokens, no online services.
 
-Confidence: high for the call sites and error handling; medium for "the built text is never read" and the exact
-meaning of the cleared list. No dynamic run backs this.
+Confidence: high for the call sites and error handling; medium for the exact meaning of the cleared list
+("the built text is never read" is now high, see 7.1 evidence). No dynamic run backs this.
+
+#### 7.2 Evidence (static re-check of the real executable, read-only)
+
+Slot numbers follow the public header order from slot 3: Duplicate, Close, Compare, GetMaxUsers, AddAsync,
+AddResult, GetLocalId, FindUserByLocalId, GetId, FindUserById, GetIsGuest, **GetState (14)**. GetGamertag lives on
+the XUser extension.
+- **Slot 14, XUserGetState.** One routine, four call sites, one for each of the user manager's four local-user
+  slots. At each site: if the handle is valid, the state is preset to 2 (SignedOut) and the call is made. If the
+  HRESULT is negative **or** the state is 2, the routine releases every pending item in that user's list (Release
+  on each, count set to 0). States 0 (SignedIn) and 1 (SigningOut) keep the user. The routine raises no dialog,
+  does not quit, and does not call AddAsync again. A "signed out" or error answer therefore stays silent, but it
+  repeats on every poll.
+- **When slot 14 runs.** It is polled from the user manager's per-frame update, only after a deadline that one
+  virtual method of the manager sets to "now + 500 ms". Static analysis did not resolve who calls that method. The
+  same vtable holds the change-event registration (slot 33) and the change-event handler, so user-change handling
+  probably arms the poll. Our runtime never fires change events, so slot 14 may not be reached in today's boot at
+  all. If it is reached, it comes from this routine.
+- **Slots 10 / 12.** Each is called from one small "look up a handle into a reference" helper. A null input skips
+  the call, the output is preset to 0, and the HRESULT is ignored. The result is stored only when it differs from
+  the current handle; a non-null handle is then re-read with slots 11 (GetId) and 9 (GetLocalId). An error gives an
+  empty reference, never a fatal path. Slot 12 is reached from the change-event handler path and one other site.
+  Slot 10 is reached from one path that rebuilds a user record.
+- **Slot 5, XUserCompare.** Called with two handles and no out parameter; it returns a plain int, where 0 means
+  "same". The caller decides some cases itself without calling slot 5: equal handle values count as "same", and an
+  invalid handle on either side counts as "different". Our duplicate handles have different values, so they do reach
+  slot 5. Any non-zero return, including an error HRESULT, counts as "different user". If QueryApiImpl fails, the
+  wrapper returns 0, which counts as "same". The helper is used by the change-event handler and by about five other
+  sites.
+- **Token (23 / 24 / 25).** Slot 25 has two call sites. Both run only after slot 24 succeeded; a negative slot 24
+  takes the site's failure path. Slot 24 already answers with the offline HRESULT, so the slot 25 trap cannot be
+  reached today, and slot 25 needs no decision unless slot 24 changes.
+- **No fatal path.** No call site of slots 5, 10, 12, 14, 24 or 25 leads to a dialog, a quit or a sign-in UI.
+  Every error answer degrades silently.
+- **Next likely stops after 7.1.** Slot 5, 10 or 12 when a user record is compared or rebuilt; slot 14 if the poll
+  is armed. Nothing further can be predicted statically.
+- **Consequence per option (unchanged).** Slot 14 A keeps the local user and its pending items. Slot 14 B
+  silently drops that user's pending items on every poll, which probably affects saves and settings (not verified
+  dynamically). Slot 5 B, or an error HRESULT from slot 5, makes duplicate handles of our one user count as
+  different users.
 
 ### 7.3 XStore licence slots (20, 22, 23, 28, 65, 67, 69)
 
