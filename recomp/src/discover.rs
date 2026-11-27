@@ -285,6 +285,37 @@ impl<'i, 'a> Session<'i, 'a> {
         true
     }
 
+    /// Whether a block of the last round (still in `analysis`, before [`Self::reclaim`]) calls
+    /// one of `thunks` directly, i.e. whether [`Self::add_no_return`] would refuse them after
+    /// the reclaim. Lets the caller start over without reclaiming first.
+    pub fn calls_directly(&self, analysis: &Analysis, thunks: &BTreeSet<u64>) -> bool {
+        let calls = |block: &BasicBlock| {
+            block
+                .calls
+                .iter()
+                .any(|call| matches!(call.target, CallTarget::Direct(t) if thunks.contains(&t)))
+        };
+        !thunks.is_empty()
+            && (self.state.blocks.values().any(calls)
+                || analysis
+                    .functions
+                    .values()
+                    .any(|function| function.blocks.values().any(calls)))
+    }
+
+    /// Ends the session, freeing its block map and indexes on a background thread.
+    pub fn discard(mut self) {
+        let state = &mut self.state;
+        drop_in_background((
+            std::mem::take(&mut state.blocks),
+            std::mem::take(&mut state.preds),
+            std::mem::take(&mut state.leaders),
+            std::mem::take(&mut state.vtable_scanned_blocks),
+            std::mem::take(&mut state.slot_checked),
+            std::mem::take(&mut state.rewritten),
+        ));
+    }
+
     /// Whether a continued round hit an event after which its result may differ from a fresh
     /// run (see the type docs). The session must not be continued then.
     pub fn diverged(&self) -> bool {
@@ -331,16 +362,11 @@ impl<'i, 'a> Session<'i, 'a> {
 
         let relocations = t.time(Phase::Relocations, || {
             let blocks: Vec<&BasicBlock> = state.blocks.values().collect();
-            let mut relocations: Vec<Relocation> = par_map(threads, &blocks, |block| {
-                let mut out = Vec::new();
+            let mut relocations: Vec<Relocation> = par_flat_map(threads, &blocks, |block, out| {
                 for instr in &block.instructions {
-                    instruction_relocations(image, instr, &mut out);
+                    instruction_relocations(image, instr, out);
                 }
-                out
-            })
-            .into_iter()
-            .flatten()
-            .collect();
+            });
             for table in state.jump_tables.values() {
                 jump_table_relocations(image, table, &mut relocations);
             }
@@ -368,22 +394,71 @@ impl Session<'_, '_> {
         let state = &mut self.state;
         let demoted = state.reclaimed.take().expect("reclaim after round");
         let rewritten = std::mem::take(&mut state.rewritten);
-        for function in analysis.functions.into_values() {
-            for (start, mut block) in function.blocks {
-                if state.blocks.contains_key(&start) {
-                    continue;
-                }
-                if let Some(successors) = rewritten.get(&start) {
-                    block.successors.clone_from(successors);
-                }
-                state.blocks.insert(start, block);
+        // The first copy of each block (in entry order) returns, unless the block map still has
+        // one; merged as sorted runs and bulk-built instead of inserted one by one.
+        let Analysis {
+            functions,
+            relocations,
+            jump_tables,
+            unresolved_jumps,
+            pointer_slots,
+        } = analysis;
+        // Each function's blocks as a sorted vector (a parallel wave).
+        let shells: Vec<Mutex<Function>> = functions.into_values().map(Mutex::new).collect();
+        let mut parts: Vec<Vec<(u64, BasicBlock)>> = par_map(state.threads, &shells, |function| {
+            let mut function = function
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut function.blocks).into_iter().collect()
+        });
+        drop_in_background((shells, relocations, unresolved_jumps));
+        // `(start, function, position)` of every copy, sorted: the first of each start is the
+        // copy of the first function in entry order.
+        let mut order: Vec<(u64, u32, u32)> = Vec::new();
+        for (part, blocks) in parts.iter().enumerate() {
+            for (position, &(start, _)) in blocks.iter().enumerate() {
+                order.push((start, part as u32, position as u32));
             }
         }
-        state.jump_tables = analysis.jump_tables;
-        state.pointer_slots = analysis.pointer_slots;
+        order.sort_unstable();
+        order.dedup_by_key(|&mut (start, ..)| start);
+        let kept = std::mem::take(&mut state.blocks);
+        let mut merged: Vec<(u64, BasicBlock)> = Vec::with_capacity(kept.len() + order.len());
+        let mut kept = kept.into_iter().peekable();
+        for (start, part, position) in order {
+            let slot = &mut parts[part as usize][position as usize].1;
+            let mut block = std::mem::replace(slot, BasicBlock::new(start));
+            while let Some(next) = kept.next_if(|&(k, _)| k <= start) {
+                let duplicate = next.0 == start;
+                merged.push(next);
+                if duplicate {
+                    break;
+                }
+            }
+            if merged.last().is_some_and(|&(k, _)| k == start) {
+                continue;
+            }
+            if let Some(successors) = rewritten.get(&start) {
+                block.successors.clone_from(successors);
+            }
+            merged.push((start, block));
+        }
+        merged.extend(kept);
+        drop_in_background(parts);
+        state.blocks = merged.into_iter().collect();
+        state.jump_tables = jump_tables;
+        state.pointer_slots = pointer_slots;
         state.check_preds();
         state.restore_demoted(demoted);
     }
+}
+
+/// Frees `value` on a detached thread. Dropping a multi-million-block state is seconds of
+/// allocator work that nothing waits for (if the thread cannot start, it is dropped here).
+pub fn drop_in_background<T: Send + 'static>(value: T) {
+    let _ = std::thread::Builder::new()
+        .name("discover-drop".into())
+        .spawn(move || drop(value));
 }
 
 /// `f` over `items` on up to `threads` scoped threads, results in input order. Workers claim small
@@ -421,6 +496,27 @@ fn par_map<T: Sync, R: Send>(threads: usize, items: &[T], f: impl Fn(&T) -> R + 
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     parts.sort_unstable_by_key(|(start, _)| *start);
     parts.into_iter().flat_map(|(_, part)| part).collect()
+}
+
+/// [`par_map`] for scans that find few results per item: `f` pushes the results of an item to
+/// `out`, and they come back flattened in input order (one buffer per chunk, not per item).
+fn par_flat_map<T: Sync, R: Send>(
+    threads: usize,
+    items: &[T],
+    f: impl Fn(&T, &mut Vec<R>) + Sync,
+) -> Vec<R> {
+    let chunk = (items.len() / (threads.max(1) * 64)).max(1);
+    let chunks: Vec<&[T]> = items.chunks(chunk).collect();
+    par_map(threads, &chunks, |chunk| {
+        let mut out = Vec::new();
+        for item in *chunk {
+            f(item, &mut out);
+        }
+        out
+    })
+    .into_iter()
+    .flatten()
+    .collect()
 }
 
 /// Relocations of a resolved table: the table and index-table reads plus one per entry.
@@ -496,6 +592,16 @@ fn jump_table_relocations(image: &CodeImage<'_>, table: &JumpTable, out: &mut Ve
     }
 }
 
+/// One finding of the [`Discovery::seed_vtable_callbacks`] scan.
+enum VtableScan {
+    /// A block `(start, end)` scanned in this pass.
+    Scanned(u64, u64),
+    /// A referenced data VA to read as a vtable / function-pointer table.
+    Data(u64),
+    /// An address-taken function entry.
+    Code(u64),
+}
+
 /// `(first block, trace length, incoming edges of the first block)` of a jump's slice.
 type JumpShape = (u64, usize, u32);
 
@@ -556,6 +662,8 @@ struct Discovery<'i, 'a> {
     /// Set by [`Session::round`] (the blocks are in the analysis) until [`Session::reclaim`]:
     /// the tables verification demoted.
     reclaimed: Option<Vec<Demoted>>,
+    /// [`Self::decode_block`]'s instruction buffer (empty between calls).
+    scratch: Vec<Instruction>,
 }
 
 impl<'i, 'a> Discovery<'i, 'a> {
@@ -587,6 +695,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             diverged: false,
             rewritten: BTreeMap::new(),
             reclaimed: None,
+            scratch: Vec::new(),
         }
     }
 
@@ -658,9 +767,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
         if table.is_empty() && self.setjmp_slots.is_empty() {
             return progress;
         }
-        let mut sites = Vec::new();
-        let mut interior = Vec::new();
-        for block in self.blocks.values() {
+        // A read-only scan of every block, run as a parallel wave; the results are applied in
+        // block order, as a serial scan would.
+        let blocks: Vec<&BasicBlock> = self.blocks.values().collect();
+        // `(None, return site)` or `(Some(owner), interior target)`.
+        let found: Vec<(Option<u64>, u64)> = par_flat_map(self.threads, &blocks, |block, out| {
             for call in &block.calls {
                 if let CallTarget::Direct(target) = call.target
                     && !self.no_return.contains(&target)
@@ -671,36 +782,40 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 {
                     let instr = &block.instructions[index];
                     if let Some(next) = instr.ip().checked_add(instr.len() as u64) {
-                        sites.push(next);
+                        out.push((None, next));
                     }
                 }
             }
-            if table.is_empty() {
-                continue;
+            if !table.is_empty() {
+                for instr in &block.instructions {
+                    if instr.mnemonic() != Mnemonic::Lea || !instr.is_ip_rel_memory_operand() {
+                        continue;
+                    }
+                    let target = instr.ip_rel_memory_address();
+                    if self.entries.contains(&target)
+                        || self.image.code_bytes(target).is_err()
+                        || matches!(self.locate(target), Decoded::InsideInstruction)
+                    {
+                        continue;
+                    }
+                    if let Some(owner) = table.function_at(target)
+                        && self.entries.contains(&owner)
+                    {
+                        out.push((Some(owner), target));
+                    }
+                }
             }
-            for instr in &block.instructions {
-                if instr.mnemonic() != Mnemonic::Lea || !instr.is_ip_rel_memory_operand() {
-                    continue;
-                }
-                let target = instr.ip_rel_memory_address();
-                if self.entries.contains(&target)
-                    || self.image.code_bytes(target).is_err()
-                    || matches!(self.locate(target), Decoded::InsideInstruction)
-                {
-                    continue;
-                }
-                if let Some(owner) = table.function_at(target)
-                    && self.entries.contains(&owner)
-                {
-                    interior.push((owner, target));
-                }
+        });
+        drop(blocks);
+        for &(owner, site) in &found {
+            if owner.is_none() {
+                progress |= self.add_return_site(site);
             }
         }
-        for site in sites {
-            progress |= self.add_return_site(site);
-        }
-        for (owner, target) in interior {
-            progress |= self.add_resume_target(owner, target);
+        for (owner, target) in found {
+            if let Some(owner) = owner {
+                progress |= self.add_resume_target(owner, target);
+            }
         }
         progress
     }
@@ -857,6 +972,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             });
         }
 
+        // Decoded into a reused buffer and copied out once, at its final length.
+        let mut instructions = std::mem::take(&mut self.scratch);
         let mut decoder = Decoder::with_ip(64, bytes, start, DecoderOptions::NONE);
         let mut instr = Instruction::default();
         let mut stop_at = start
@@ -930,7 +1047,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 stop_at = self.next_leader_from(next);
                 misaligned = true;
             }
-            block.instructions.push(instr);
+            instructions.push(instr);
             block.end = next;
 
             if let Some(terminator) = self.classify(&instr, next, &mut block, &mut stop_at) {
@@ -938,6 +1055,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 break;
             }
         }
+        block.instructions = instructions.as_slice().to_vec();
+        instructions.clear();
+        self.scratch = instructions;
         self.insert_block(start, block);
     }
 
@@ -1432,18 +1552,18 @@ impl<'i, 'a> Discovery<'i, 'a> {
     fn seed_pointer_slots(&mut self) -> bool {
         self.check_preds();
         let preds = &self.preds;
-        let jumps: Vec<u64> = self
-            .blocks
-            .values()
-            .filter(|block| {
-                block.terminator == Terminator::IndirectJump
-                    && block
-                        .successors
-                        .contains(&Edge::IndirectJump { slot: None })
-            })
-            .filter_map(|block| block.instructions.last().map(Instruction::ip))
-            .filter(|site| !self.slot_checked.contains(site))
-            .collect();
+        let blocks: Vec<&BasicBlock> = self.blocks.values().collect();
+        let jumps: Vec<u64> = par_flat_map(self.threads, &blocks, |block, out| {
+            if block.terminator == Terminator::IndirectJump
+                && block
+                    .successors
+                    .contains(&Edge::IndirectJump { slot: None })
+                && let Some(site) = block.instructions.last().map(Instruction::ip)
+                && !self.slot_checked.contains(&site)
+            {
+                out.push(site);
+            }
+        });
         let found: Vec<(u64, Option<(u64, u64)>)> = par_map(self.threads, &jumps, |&site| {
             let hit = self.jump_trace(site, preds).and_then(|(trace, _)| {
                 let instrs: Vec<&Instruction> = trace.iter().map(|s| s.instr).collect();
@@ -1467,30 +1587,35 @@ impl<'i, 'a> Discovery<'i, 'a> {
             return progress;
         }
 
-        let mut rip_jumps: Vec<(u64, u64)> = Vec::new();
-        let mut rip_calls: Vec<(u64, u64)> = Vec::new();
-        for block in self.blocks.values() {
-            if block.terminator == Terminator::IndirectJump
-                && let Some(site) = block.instructions.last().map(Instruction::ip)
-                && !self.slot_checked.contains(&site)
-            {
-                for edge in &block.successors {
-                    if let Edge::IndirectJump { slot: Some(slot) } = *edge {
-                        rip_jumps.push((site, slot));
+        // `(is call, site, slot, relocated code target of the slot)`, read-only and in block
+        // order; jumps are applied before calls, as before.
+        let blocks: Vec<&BasicBlock> = self.blocks.values().collect();
+        let found: Vec<(bool, u64, u64, Option<u64>)> =
+            par_flat_map(self.threads, &blocks, |block, out| {
+                if block.terminator == Terminator::IndirectJump
+                    && let Some(site) = block.instructions.last().map(Instruction::ip)
+                    && !self.slot_checked.contains(&site)
+                {
+                    for edge in &block.successors {
+                        if let Edge::IndirectJump { slot: Some(slot) } = *edge {
+                            out.push((false, site, slot, self.relocated_code_target(slot)));
+                        }
                     }
                 }
-            }
-            for call in &block.calls {
-                if let CallTarget::Indirect { slot: Some(slot) } = call.target
-                    && !self.slot_checked.contains(&call.site)
-                {
-                    rip_calls.push((call.site, slot));
+                for call in &block.calls {
+                    if let CallTarget::Indirect { slot: Some(slot) } = call.target
+                        && !self.slot_checked.contains(&call.site)
+                    {
+                        out.push((true, call.site, slot, self.relocated_code_target(slot)));
+                    }
                 }
-            }
-        }
-        for (site, slot) in rip_jumps {
+            });
+        drop(blocks);
+        let (rip_calls, rip_jumps): (Vec<_>, Vec<_>) =
+            found.into_iter().partition(|&(call, ..)| call);
+        for (_, site, slot, target) in rip_jumps {
             self.slot_checked.insert(site);
-            if let Some(target) = self.relocated_code_target(slot) {
+            if let Some(target) = target {
                 self.pointer_slots.insert(site, (slot, target));
                 if !self.entries.contains(&target) {
                     self.add_function(target);
@@ -1498,9 +1623,9 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
             }
         }
-        for (site, slot) in rip_calls {
+        for (_, site, _, target) in rip_calls {
             self.slot_checked.insert(site);
-            if let Some(target) = self.relocated_code_target(slot)
+            if let Some(target) = target
                 && !self.entries.contains(&target)
             {
                 self.add_function(target);
@@ -1520,12 +1645,18 @@ impl<'i, 'a> Discovery<'i, 'a> {
         if !has_relocs && table.is_empty() {
             return false;
         }
-        let mut data_vas: BTreeSet<u64> = BTreeSet::new();
-        let mut code_entries: BTreeSet<u64> = BTreeSet::new();
-        for block in self.blocks.values() {
-            if !self.vtable_scanned_blocks.insert((block.start, block.end)) {
-                continue;
+        // The blocks not scanned yet in this shape, scanned as a parallel wave (read-only); the
+        // found addresses are sets, so the merge order does not matter.
+        let blocks: Vec<&BasicBlock> = self.blocks.values().collect();
+        // `Scanned(start, end)` for every block scanned now, then what it references.
+        let found: Vec<VtableScan> = par_flat_map(self.threads, &blocks, |block, out| {
+            if self
+                .vtable_scanned_blocks
+                .contains(&(block.start, block.end))
+            {
+                return;
             }
+            out.push(VtableScan::Scanned(block.start, block.end));
             for instr in &block.instructions {
                 if !instr.is_ip_rel_memory_operand() {
                     continue;
@@ -1540,7 +1671,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 }
                 match self.image.region_of(target) {
                     Region::Data if has_relocs && !self.scanned_data_refs.contains(&target) => {
-                        data_vas.insert(target);
+                        out.push(VtableScan::Data(target));
                     }
                     Region::Code
                         if instr.mnemonic() == Mnemonic::Lea
@@ -1549,11 +1680,33 @@ impl<'i, 'a> Discovery<'i, 'a> {
                             && table.function_at(target) == Some(target)
                             && self.image.code_bytes(target).is_ok() =>
                     {
-                        code_entries.insert(target);
+                        out.push(VtableScan::Code(target));
                     }
                     _ => {}
                 }
             }
+        });
+        drop(blocks);
+        let mut data_vas: BTreeSet<u64> = BTreeSet::new();
+        let mut code_entries: BTreeSet<u64> = BTreeSet::new();
+        let mut scanned: Vec<(u64, u64)> = Vec::new();
+        for item in found {
+            match item {
+                VtableScan::Scanned(start, end) => scanned.push((start, end)),
+                VtableScan::Data(va) => {
+                    data_vas.insert(va);
+                }
+                VtableScan::Code(va) => {
+                    code_entries.insert(va);
+                }
+            }
+        }
+        if scanned.len() > self.vtable_scanned_blocks.len() / 8 {
+            // Both sorted: rebuilding from the concatenation merges two runs.
+            let old = std::mem::take(&mut self.vtable_scanned_blocks);
+            self.vtable_scanned_blocks = old.into_iter().chain(scanned).collect();
+        } else {
+            self.vtable_scanned_blocks.extend(scanned);
         }
 
         let mut progress = false;
@@ -1797,9 +1950,13 @@ impl<'i, 'a> Discovery<'i, 'a> {
             }
         }
 
+        // The block map as a sorted vector: membership lists hold indices into it.
+        let blocks: Vec<(u64, BasicBlock)> = std::mem::take(&mut self.blocks).into_iter().collect();
+        let starts: Vec<u64> = blocks.iter().map(|&(start, _)| start).collect();
+
         // Membership: blocks reachable from each entry through intra-function edges (one
         // independent walk per entry, run as a parallel wave).
-        let members: Vec<Vec<u64>> = par_map(self.threads, &entries, |&entry| {
+        let members: Vec<Vec<usize>> = par_map(self.threads, &entries, |&entry| {
             let mut seen: BTreeSet<u64> = BTreeSet::new();
             let mut stack: Vec<u64> = vec![entry];
             stack.extend(roots.get(&entry).into_iter().flatten().rev());
@@ -1808,11 +1965,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 if !seen.insert(va) {
                     continue;
                 }
-                let Some(block) = self.blocks.get(&va) else {
+                let Ok(index) = starts.binary_search(&va) else {
                     continue;
                 };
-                list.push(va);
-                for edge in &block.successors {
+                list.push(index);
+                for edge in &blocks[index].1.successors {
                     if let Some(target) = edge.intra_target()
                         && (target == entry || !self.entries.contains(&target))
                     {
@@ -1822,66 +1979,99 @@ impl<'i, 'a> Discovery<'i, 'a> {
             }
             list
         });
-        let mut refcount: BTreeMap<u64, usize> = BTreeMap::new();
-        for &va in members.iter().flatten() {
-            let count = refcount.entry(va).or_default();
-            *count = count.saturating_add(1);
-        }
 
-        // Materialise: move a block into its last owner, clone it for earlier ones.
-        let mut functions = BTreeMap::new();
-        for (entry, list) in entries.into_iter().zip(members) {
-            let mut function = Function {
-                entry,
-                blocks: BTreeMap::new(),
-                callees: BTreeSet::new(),
-                resume_targets: BTreeSet::new(),
+        // A block moves into its last owner (in entry order); the earlier owners get copies.
+        let mut owner: Vec<usize> = vec![usize::MAX; blocks.len()];
+        let mut shared: BTreeMap<usize, BasicBlock> = BTreeMap::new();
+        for (function, list) in members.iter().enumerate() {
+            for &index in list {
+                if owner[index] != usize::MAX && !shared.contains_key(&index) {
+                    shared.insert(index, blocks[index].1.clone());
+                }
+                owner[index] = function;
+            }
+        }
+        let mut moved: Vec<Vec<(usize, BasicBlock)>> = Vec::new();
+        moved.resize_with(entries.len(), Vec::new);
+        let mut unowned = Vec::new();
+        for (index, (start, block)) in blocks.into_iter().enumerate() {
+            match owner[index] {
+                usize::MAX => unowned.push((start, block)),
+                function => moved[function].push((index, block)),
+            }
+        }
+        self.blocks = unowned.into_iter().collect();
+        type Owned = Mutex<Vec<(usize, BasicBlock)>>;
+        let moved: Vec<(usize, Owned)> = moved.into_iter().map(Mutex::new).enumerate().collect();
+
+        // Materialise every function (a parallel wave): its blocks with the intra-function edges
+        // into other entries rewritten to tail calls, its callees and resume targets. The block
+        // successors before a rewrite come back for `Session::reclaim`.
+        type Built = (Function, Vec<(u64, Vec<Edge>)>);
+        let built: Vec<Built> = par_map(self.threads, &moved, |(function, own)| {
+            let entry = entries[*function];
+            let mut own = std::mem::take(
+                &mut *own
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            for &index in &members[*function] {
+                if owner[index] != *function {
+                    own.push((index, shared[&index].clone()));
+                }
+            }
+            own.sort_unstable_by_key(|&(index, _)| index);
+            let mut rewritten = Vec::new();
+            let mut callees = BTreeSet::new();
+            let tail_call = |edge: &Edge| {
+                edge.intra_target()
+                    .is_some_and(|target| target != entry && self.entries.contains(&target))
             };
-            for va in list {
-                let remaining = refcount.get_mut(&va).map(|count| {
-                    *count = count.saturating_sub(1);
-                    *count
-                });
-                let block = if remaining == Some(0) {
-                    self.blocks.remove(&va)
-                } else {
-                    self.blocks.get(&va).cloned()
-                };
-                let Some(mut block) = block else {
-                    continue;
-                };
-                let tail_call = |edge: &Edge| {
-                    edge.intra_target()
-                        .is_some_and(|target| target != entry && self.entries.contains(&target))
-                };
-                if block.successors.iter().any(tail_call) {
-                    self.rewritten
-                        .entry(va)
-                        .or_insert_with(|| block.successors.clone());
-                    for edge in &mut block.successors {
-                        if tail_call(edge)
-                            && let Some(target) = edge.intra_target()
-                        {
-                            *edge = Edge::TailCall(target);
+            let blocks: BTreeMap<u64, BasicBlock> = own
+                .into_iter()
+                .map(|(index, mut block)| {
+                    let va = starts[index];
+                    if block.successors.iter().any(tail_call) {
+                        rewritten.push((va, block.successors.clone()));
+                        for edge in &mut block.successors {
+                            if tail_call(edge)
+                                && let Some(target) = edge.intra_target()
+                            {
+                                *edge = Edge::TailCall(target);
+                            }
                         }
                     }
-                }
-                for call in &block.calls {
-                    if let CallTarget::Direct(target) = call.target
-                        && self.entries.contains(&target)
-                    {
-                        function.callees.insert(target);
+                    for call in &block.calls {
+                        if let CallTarget::Direct(target) = call.target
+                            && self.entries.contains(&target)
+                        {
+                            callees.insert(target);
+                        }
                     }
-                }
-                function.blocks.insert(va, block);
-            }
+                    (va, block)
+                })
+                .collect();
             let owned = roots.get(&entry).into_iter().flatten();
-            function.resume_targets = owned
+            let resume_targets = owned
                 .chain(self.return_sites.iter())
                 .copied()
-                .filter(|va| function.blocks.contains_key(va))
+                .filter(|va| blocks.contains_key(va))
                 .collect();
-            functions.insert(entry, function);
+            let function = Function {
+                entry,
+                blocks,
+                callees,
+                resume_targets,
+            };
+            (function, rewritten)
+        });
+        let mut functions = BTreeMap::new();
+        for (function, rewritten) in built {
+            // Every copy of a block had the same successors before its rewrite.
+            for (va, successors) in rewritten {
+                self.rewritten.entry(va).or_insert(successors);
+            }
+            functions.insert(function.entry, function);
         }
         functions
     }

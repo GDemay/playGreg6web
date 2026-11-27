@@ -22,7 +22,9 @@ use iced_x86::{Decoder, DecoderOptions, FlowControl, Mnemonic};
 
 use crate::cfg::{BasicBlock, Edge, Terminator};
 use crate::code_image::{CodeImage, Region};
-use crate::discover::{Analysis, DiscoveryTimings, Phase, Session, default_threads};
+use crate::discover::{
+    Analysis, DiscoveryTimings, Phase, Session, default_threads, drop_in_background,
+};
 use crate::image::{BaseRelocKind, GuestImage};
 use crate::pe::{ImportedSymbol, Pe64};
 use crate::reloc::{RelocKind, RelocationMap};
@@ -1012,26 +1014,39 @@ fn refined_rounds(
             break;
         }
         // A new no-return function that decoded code calls ends blocks that are already decoded:
-        // start over then.
+        // start over then (without taking the blocks back first).
         let keep = continue_rounds
             && !diverged
-            && session.as_mut().is_some_and(|state| {
-                state.reclaim(analysis);
-                new_thunks.is_empty() || state.add_no_return(&new_thunks)
-            });
+            && session
+                .as_ref()
+                .is_some_and(|state| !state.calls_directly(&analysis, &new_thunks));
         if diverged {
             timings.diverged_rounds += 1;
         }
         match session.as_mut() {
-            Some(state) if keep => state.add_entries(new_entries.iter().copied()),
-            _ => session = None,
+            Some(state) if keep => {
+                state.reclaim(analysis);
+                if !new_thunks.is_empty() {
+                    let added = state.add_no_return(&new_thunks);
+                    debug_assert!(added, "calls_directly and add_no_return disagree");
+                }
+                state.add_entries(new_entries.iter().copied());
+            }
+            _ => {
+                if let Some(state) = session.take() {
+                    state.discard();
+                }
+                drop_in_background(analysis);
+            }
         }
         added.extend(new_entries.iter().copied());
         known_entries.extend(new_entries.iter().copied());
         thunks.extend(new_thunks.iter().copied());
         known_no_return.extend(new_thunks.iter().copied());
     }
-    drop(session);
+    if let Some(state) = session {
+        state.discard();
+    }
     image.entry_points = known_entries.into_iter().collect();
     image.no_return = known_no_return.into_iter().collect();
     result.expect("max_rounds >= 1 returns on the final iteration")

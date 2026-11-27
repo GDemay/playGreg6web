@@ -96,6 +96,18 @@ round. Making those visit only blocks changed since their last pass, and continu
 through a no-return addition (retracting the decoded tails of the affected calls), are the
 remaining Phase 0-style wins; neither needs the match records of Phase 1.
 
+Phase 0d (measured, same output): the full-map scans that only read the block map (late resume
+targets, pointer-slot and vtable seeds, relocations) run as `par_map` waves whose results are
+applied in block order; the membership walk works on a sorted block vector and materialises the
+functions in parallel (each block moves to its last owner, shared blocks are cloned first);
+`Session::reclaim` merges the returned blocks as sorted runs and bulk-builds the map; a round
+that starts over no longer reclaims first (`Session::calls_directly`); dropped round state is
+freed on a background thread; `decode_block` decodes into a reused buffer. Paired runs on a
+loaded machine: 51-73 s on `main` vs 32-40 s (one outlier at 62 s); per phase, late resume
+targets 6-9 s -> 1.5 s, vtable seeds 5-9 s -> 2.7-3.2 s, relocations 5-7 s -> 2.5-4 s,
+functions 12-16 s -> 5.7-7.8 s, and the untimed reclaim/drop time between rounds (reclaims
+and the restart drop, 10-14 s) -> about 3 s. Decoding (11-13 s, serial) is now the largest phase.
+
 ## What a discovery rule can reach (measured)
 
 Same executable, refined discovery (435,719 functions, 4,001,806 blocks, 23,481,703
