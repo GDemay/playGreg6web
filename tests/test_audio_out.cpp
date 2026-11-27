@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 #include "os/audio_out.h"
@@ -20,6 +21,26 @@ void check_impl(bool cond, const char* expr, int line) {
 
 int main() {
     namespace ao = playgta6::os::audio_out;
+
+    {  // underruns are classified: recent pushes -> host starved, long push gap -> guest stalled
+        ao::JitterBuffer jb;
+        jb.configure(1000, 100);
+        std::vector<float> in(2 * 100, 0.1f), out(2 * 50);
+        jb.push(in.data(), 100, 1000000);
+        CHECK(jb.pop(out.data(), 50, 1010000) == 50);
+        CHECK(jb.pop(out.data(), 50, 1020000) == 50);
+        CHECK(jb.pop(out.data(), 50, 1030000) == 0);  // dry 30 ms after the last push
+        CHECK(jb.stats().underruns == 1 && jb.stats().underruns_host_starved == 1 &&
+              jb.stats().underruns_guest_stalled == 0);
+        jb.push(in.data(), 100, 2000000);
+        CHECK(jb.pop(out.data(), 50, 2010000) == 50);
+        CHECK(jb.pop(out.data(), 50, 2020000) == 50);
+        CHECK(jb.pop(out.data(), 50, 2500000) == 0);  // dry 500 ms after the last push
+        CHECK(jb.stats().underruns == 2 && jb.stats().underruns_guest_stalled == 1);
+        const std::string j2 = ao::report_json(true, 48000, jb.stats(), "");
+        CHECK(j2.find("\"underruns_host_starved\": 1") != std::string::npos);
+        CHECK(j2.find("\"underruns_guest_stalled\": 1") != std::string::npos);
+    }
 
     {  // passthrough keeps samples
         ao::Resampler r;

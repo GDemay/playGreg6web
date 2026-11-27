@@ -286,6 +286,13 @@ pub const HOST_MODULES: &[&str] = &[
     "xmem.dll",
 ];
 
+/// DLLs the host runtime itself loads for its own use (not guest-visible): declared so the runtime
+/// scan test knows about them, but never treated as implemented for guest imports (see [`host_known`]).
+pub const HOST_ONLY_DEPENDENCIES: &[&str] = &[
+    // --audio-out render thread: MMCSS "Pro Audio" (os/audio_out_wasapi.cpp).
+    "avrt.dll",
+];
+
 /// Whether the runtime implements `dll` (any spelling): a shim family of the import bridge, a
 /// module it registers ([`HOST_MODULES`]) or an API set mapped to one of those.
 pub fn host_known(dll: &str) -> bool {
