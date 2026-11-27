@@ -20,15 +20,16 @@ const create = (Type) => new Type({ fetchFn: async () => { throw Error('unexpect
 const before = create(Before);
 const after = create(After);
 const results = [];
-for (const [name, spans, entriesPerSpan] of [
+for (const [name, spans, entriesPerSpan, entryStride = 32768] of [
   ['small paired bootset control', 32, 2],
   ['dispersed paired bootset', 10000, 2],
   ['dispersed singleton bootset', 10000, 1],
+  ['dense overlapping bootset control', 1, 20000, 32],
 ]) {
   const entries = [];
   for (let i = 0; i < spans; i += 1) {
     for (let j = 0; j < entriesPerSpan; j += 1) {
-      entries.push({ path: 'synthetic/archive', offset: i * 4 * 1024 * 1024 + j * 32768, length: 65536 });
+      entries.push({ path: 'synthetic/archive', offset: i * 4 * 1024 * 1024 + j * entryStride, length: 65536 });
     }
   }
   // Reverse order exercises sorting rather than assuming the manifest is ordered.
@@ -37,20 +38,24 @@ for (const [name, spans, entriesPerSpan] of [
   assert.deepEqual(plan(after), plan(before));
   for (let i = 0; i < 3; i += 1) { plan(before); plan(after); }
   const times = { before: [], after: [] };
+  const cpuTimes = { before: [], after: [] };
   for (let i = 0; i < samples; i += 1) {
     for (const label of i % 2 ? ['after', 'before'] : ['before', 'after']) {
+      const cpuStart = process.cpuUsage();
       const start = performance.now();
       const output = plan(label === 'before' ? before : after);
       times[label].push(performance.now() - start);
+      const cpu = process.cpuUsage(cpuStart);
+      cpuTimes[label].push((cpu.user + cpu.system) / 1000);
       assert.equal(output.length, spans);
     }
   }
-  results.push({ workload: name, entries: entries.length, spans, samplesMs: times });
+  results.push({ workload: name, entries: entries.length, spans, samplesMs: times, cpuSamplesMs: cpuTimes });
 }
 console.log(JSON.stringify({
-  benchmark: 'synthetic production RangeCache._planCoalescedSpans CPU time',
+  benchmark: 'synthetic production RangeCache._planCoalescedSpans wall and process CPU time',
   environment: { node: process.version, platform: process.platform, arch: process.arch, cpu: os.cpus()[0].model },
-  sampling: '3 untimed warmups; alternating before/after order; exact deep equality before timing; one plan per sample',
+  sampling: '3 untimed warmups; alternating before/after order; exact deep equality before timing; one plan per sample; samplesMs is elapsed wall time, cpuSamplesMs is process user+system CPU time',
   unmeasured: 'browser boot time, HTTP/OPFS I/O, native runtime and game workloads',
   results,
 }, null, 2));
