@@ -1023,6 +1023,9 @@ test('W92 selectSupportedAdapterFeatures picks only supported optional features 
     'bgra8unorm-storage',
     'rg11b10ufloat-renderable',
     'texture-formats-tier1',
+    'float32-blendable',
+    'dual-source-blending',
+    'depth-clip-control',
   ]);
   assert.equal(globalThis.PlayGta6Wgpu.OPTIONAL_ADAPTER_FEATURES, OPTIONAL_ADAPTER_FEATURES);
   assert.equal(
