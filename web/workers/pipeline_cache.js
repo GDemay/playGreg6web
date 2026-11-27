@@ -13,6 +13,8 @@
   const DEFAULT_MAX_ERROR_HISTORY = 32;
   const DEFAULT_MAX_QUARANTINED_KEYS = 512;
   const DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES = DEFAULT_MAX_QUARANTINED_KEYS;
+  const DEFAULT_MAX_INTERSTAGE_MODULES = 512;
+  const DEFAULT_MAX_INTERSTAGE_INTERFACE_CACHE = 2048;
   const MAX_PIPELINE_ERROR_MESSAGE_LENGTH = 512;
   const MAX_PIPELINE_ERROR_KEY_LENGTH = 64;
   const DEFAULT_MAX_VERTEX_BUFFERS = 8;
@@ -496,6 +498,8 @@
   // WeakMaps for stable identity of opaque WebGPU objects (GPUShaderModule, GPUBindGroupLayout, etc.)
   // and user-registered WGPK/numeric shader module IDs without leaking GC references.
   const registeredObjectIds = new WeakMap();
+  const registeredShaderModuleSources = new WeakMap();
+  const moduleInterstageInterfaceCache = new WeakMap();
   const opaqueObjectIds = new WeakMap();
   const fallbackPipelineLayoutProfiles = new WeakMap();
   const gpuHandleFastCache = new WeakMap();
@@ -648,13 +652,74 @@
     shaderModuleRegistryVersion += 1;
   }
 
-  function registerShaderModuleId(gpuObject, id) {
+  function registerShaderModuleId(gpuObject, id, wgslCode) {
     if (!gpuObject || (typeof gpuObject !== 'object' && typeof gpuObject !== 'function')) {
       throw new TypeError('gpuObject must be an object');
     }
     const token = normalizeShaderId(id);
     setRegisteredObjectId(gpuObject, token);
+    if (typeof wgslCode === 'string' && wgslCode.length > 0) {
+      registeredShaderModuleSources.set(gpuObject, wgslCode);
+      moduleInterstageInterfaceCache.delete(gpuObject);
+    }
     return token;
+  }
+
+  /**
+   * Associate a `GPUShaderModule` with its WGSL source text in a GC-safe WeakMap so
+   * `WebGpuPipelineCache` can automatically inspect and patch VS<->PS inter-stage
+   * `@interpolate(flat)` / `@location(N)` mismatches without leaking module references.
+   *
+   * @param {object} gpuShaderModule
+   * @param {string} wgslCode
+   * @returns {string}
+   */
+  function registerShaderModuleSource(gpuShaderModule, wgslCode) {
+    if (
+      !gpuShaderModule ||
+      (typeof gpuShaderModule !== 'object' && typeof gpuShaderModule !== 'function')
+    ) {
+      throw new TypeError('gpuShaderModule must be an object');
+    }
+    if (typeof wgslCode !== 'string' || wgslCode.length === 0) {
+      throw new TypeError('wgslCode must be a non-empty string');
+    }
+    registeredShaderModuleSources.set(gpuShaderModule, wgslCode);
+    moduleInterstageInterfaceCache.delete(gpuShaderModule);
+    return wgslCode;
+  }
+
+  /**
+   * Retrieve WGSL source previously registered for `gpuShaderModule` (or attached directly
+   * via `.code` / `.wgsl` / `.__wgsl` / `.wgslSource`), or `null` when unavailable.
+   *
+   * @param {object | null | undefined} gpuShaderModule
+   * @returns {string | null}
+   */
+  function getRegisteredShaderModuleSource(gpuShaderModule) {
+    if (
+      !gpuShaderModule ||
+      (typeof gpuShaderModule !== 'object' && typeof gpuShaderModule !== 'function')
+    ) {
+      return null;
+    }
+    const registered = registeredShaderModuleSources.get(gpuShaderModule);
+    if (typeof registered === 'string' && registered.length > 0) {
+      return registered;
+    }
+    if (typeof gpuShaderModule.code === 'string' && gpuShaderModule.code.length > 0) {
+      return gpuShaderModule.code;
+    }
+    if (typeof gpuShaderModule.wgsl === 'string' && gpuShaderModule.wgsl.length > 0) {
+      return gpuShaderModule.wgsl;
+    }
+    if (typeof gpuShaderModule.__wgsl === 'string' && gpuShaderModule.__wgsl.length > 0) {
+      return gpuShaderModule.__wgsl;
+    }
+    if (typeof gpuShaderModule.wgslSource === 'string' && gpuShaderModule.wgslSource.length > 0) {
+      return gpuShaderModule.wgslSource;
+    }
+    return null;
   }
 
   function getOpaqueObjectId(obj) {
@@ -4259,7 +4324,12 @@
 
     const hasHelperMeta =
       Object.prototype.hasOwnProperty.call(descriptor, 'fallbackProfile') ||
-      Object.prototype.hasOwnProperty.call(descriptor, 'vertexStride');
+      Object.prototype.hasOwnProperty.call(descriptor, 'vertexStride') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'vsCode') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'fsCode') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'psCode') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'vertexCode') ||
+      Object.prototype.hasOwnProperty.call(descriptor, 'fragmentCode');
 
     // 1. Pipeline layout normalization
     const rawLayout = descriptor.layout;
@@ -4340,11 +4410,19 @@
         addReason('fallback-vertex-entrypoint');
       }
 
-      if (vertexLayoutNormalized || nextVsEntryPoint !== descriptor.vertex.entryPoint) {
+      const hasVertexCodeMeta =
+        Object.prototype.hasOwnProperty.call(descriptor.vertex, 'code') ||
+        Object.prototype.hasOwnProperty.call(descriptor.vertex, 'wgsl');
+
+      if (vertexLayoutNormalized || nextVsEntryPoint !== descriptor.vertex.entryPoint || hasVertexCodeMeta) {
         nextVertex = {
           ...descriptor.vertex,
           entryPoint: nextVsEntryPoint,
         };
+        if (hasVertexCodeMeta) {
+          delete nextVertex.code;
+          delete nextVertex.wgsl;
+        }
         if (shouldInspectBuffers && vertexLayoutNormalized) {
           nextVertex.buffers = nextBuffers;
         }
@@ -4355,6 +4433,9 @@
     let nextFragment = descriptor.fragment;
     if (descriptor.fragment && typeof descriptor.fragment === 'object') {
       let fragChanged = false;
+      const hasFragmentCodeMeta =
+        Object.prototype.hasOwnProperty.call(descriptor.fragment, 'code') ||
+        Object.prototype.hasOwnProperty.call(descriptor.fragment, 'wgsl');
       let nextFsEntryPoint = descriptor.fragment.entryPoint;
       if (
         fallbackProfile !== null &&
@@ -4384,12 +4465,16 @@
         }
       }
 
-      if (fragChanged) {
+      if (fragChanged || hasFragmentCodeMeta) {
         nextFragment = {
           ...descriptor.fragment,
           entryPoint: nextFsEntryPoint,
           targets: nextTargets,
         };
+        if (hasFragmentCodeMeta) {
+          delete nextFragment.code;
+          delete nextFragment.wgsl;
+        }
       }
     }
 
@@ -4473,7 +4558,9 @@
     }
 
     const normalized = layoutNormalized || vertexLayoutNormalized || otherNormalized;
-    if (!normalized && !hasHelperMeta) {
+    const hasStageCodeMeta =
+      nextVertex !== descriptor.vertex || nextFragment !== descriptor.fragment;
+    if (!normalized && !hasHelperMeta && !hasStageCodeMeta) {
       return {
         descriptor,
         normalized: false,
@@ -4488,6 +4575,11 @@
     if (hasHelperMeta) {
       delete nextDescriptor.fallbackProfile;
       delete nextDescriptor.vertexStride;
+      delete nextDescriptor.vsCode;
+      delete nextDescriptor.fsCode;
+      delete nextDescriptor.psCode;
+      delete nextDescriptor.vertexCode;
+      delete nextDescriptor.fragmentCode;
     }
     if (stripDepthStencil) {
       delete nextDescriptor.depthStencil;
@@ -4753,6 +4845,1354 @@
     );
   }
 
+  // --- VS<->PS Inter-Stage Compatibility Analyzer & Patcher (P1 #9) ---
+  // Resolves WebGPU (Dawn/Tint) createRenderPipeline validation failures caused by:
+  //   1. @interpolate(flat) / @interpolate(linear|perspective, ...) mismatches between VS & PS
+  //   2. Missing VS @location(N) outputs read by PS
+  //   3. Integer VS @location(N) outputs missing required @interpolate(flat)
+  //   4. Inter-stage vector component / scalar type mismatches (e.g. vec2<f32> vs vec4<f32>, u32 vs f32)
+
+  const WGSL_SHORTHAND_TYPES = Object.freeze({
+    vec2f: { canonical: 'vec2<f32>', scalar: 'f32', components: 2, isInteger: false },
+    vec3f: { canonical: 'vec3<f32>', scalar: 'f32', components: 3, isInteger: false },
+    vec4f: { canonical: 'vec4<f32>', scalar: 'f32', components: 4, isInteger: false },
+    vec2h: { canonical: 'vec2<f16>', scalar: 'f16', components: 2, isInteger: false },
+    vec3h: { canonical: 'vec3<f16>', scalar: 'f16', components: 3, isInteger: false },
+    vec4h: { canonical: 'vec4<f16>', scalar: 'f16', components: 4, isInteger: false },
+    vec2i: { canonical: 'vec2<i32>', scalar: 'i32', components: 2, isInteger: true },
+    vec3i: { canonical: 'vec3<i32>', scalar: 'i32', components: 3, isInteger: true },
+    vec4i: { canonical: 'vec4<i32>', scalar: 'i32', components: 4, isInteger: true },
+    vec2u: { canonical: 'vec2<u32>', scalar: 'u32', components: 2, isInteger: true },
+    vec3u: { canonical: 'vec3<u32>', scalar: 'u32', components: 3, isInteger: true },
+    vec4u: { canonical: 'vec4<u32>', scalar: 'u32', components: 4, isInteger: true },
+  });
+
+  const WGSL_SCALAR_TYPES = Object.freeze({
+    f32: { canonical: 'f32', scalar: 'f32', components: 1, isInteger: false },
+    f16: { canonical: 'f16', scalar: 'f16', components: 1, isInteger: false },
+    i32: { canonical: 'i32', scalar: 'i32', components: 1, isInteger: true },
+    u32: { canonical: 'u32', scalar: 'u32', components: 1, isInteger: true },
+  });
+
+  const WGSL_DEFAULT_INTERPOLATE_PERSPECTIVE = Object.freeze({
+    type: 'perspective',
+    sampling: 'center',
+    effectiveSampling: 'center',
+    explicit: false,
+    canonical: 'perspective,center',
+    wgslAttr: null,
+  });
+
+  const WGSL_DEFAULT_INTERPOLATE_FLAT = Object.freeze({
+    type: 'flat',
+    sampling: null,
+    effectiveSampling: 'first',
+    explicit: true,
+    canonical: 'flat,first',
+    wgslAttr: '@interpolate(flat)',
+  });
+
+  function stripWgslCommentsPreservingLength(src) {
+    if (typeof src !== 'string' || src.length === 0) {
+      return '';
+    }
+    const firstLine = src.indexOf('//');
+    const firstBlock = src.indexOf('/*');
+    if (firstLine === -1 && firstBlock === -1) {
+      return src;
+    }
+    const len = src.length;
+    const chunks = [];
+    let chunkStart = 0;
+    let i =
+      firstLine === -1
+        ? firstBlock
+        : firstBlock === -1
+          ? firstLine
+          : firstLine < firstBlock
+            ? firstLine
+            : firstBlock;
+    while (i < len) {
+      const ch = src.charCodeAt(i);
+      const next = i + 1 < len ? src.charCodeAt(i + 1) : 0;
+      // Line comment: // ... \n
+      if (ch === 47 && next === 47) {
+        if (i > chunkStart) {
+          chunks.push(src.slice(chunkStart, i));
+        }
+        const commentStart = i;
+        i += 2;
+        while (i < len && src.charCodeAt(i) !== 10 && src.charCodeAt(i) !== 13) {
+          i += 1;
+        }
+        chunks.push(' '.repeat(i - commentStart));
+        chunkStart = i;
+        continue;
+      }
+      // Nested block comment: /* ... */
+      if (ch === 47 && next === 42) {
+        if (i > chunkStart) {
+          chunks.push(src.slice(chunkStart, i));
+        }
+        let depth = 1;
+        let runStart = i;
+        i += 2;
+        while (i < len && depth > 0) {
+          const c = src.charCodeAt(i);
+          const n = i + 1 < len ? src.charCodeAt(i + 1) : 0;
+          if (c === 47 && n === 42) {
+            depth += 1;
+            i += 2;
+          } else if (c === 42 && n === 47) {
+            depth -= 1;
+            i += 2;
+          } else if (c === 10 || c === 13) {
+            if (i > runStart) {
+              chunks.push(' '.repeat(i - runStart));
+            }
+            chunks.push(src[i]);
+            i += 1;
+            runStart = i;
+          } else {
+            i += 1;
+          }
+        }
+        if (i > runStart) {
+          chunks.push(' '.repeat(i - runStart));
+        }
+        chunkStart = i;
+        continue;
+      }
+      const nextSlash = src.indexOf('/', i + 1);
+      if (nextSlash === -1) {
+        break;
+      }
+      i = nextSlash;
+    }
+    if (chunkStart < len) {
+      chunks.push(src.slice(chunkStart));
+    }
+    return chunks.join('');
+  }
+
+  function findMatchingDelimiter(str, openIdx, openCode, closeCode) {
+    const len = str.length;
+    if (openIdx < 0 || openIdx >= len || str.charCodeAt(openIdx) !== openCode) {
+      return -1;
+    }
+    let depth = 0;
+    for (let i = openIdx; i < len; i += 1) {
+      const c = str.charCodeAt(i);
+      if (c === openCode) {
+        depth += 1;
+      } else if (c === closeCode) {
+        depth -= 1;
+        if (depth === 0) {
+          return i;
+        }
+      }
+    }
+    return -1;
+  }
+
+  function splitTopLevelCommas(str, baseOffset) {
+    const items = [];
+    const len = str.length;
+    let paren = 0;
+    let angle = 0;
+    let brace = 0;
+    let bracket = 0;
+    let segStart = 0;
+
+    const pushSeg = (rawStart, rawEnd) => {
+      let s = rawStart;
+      let e = rawEnd;
+      while (s < e && /\s/.test(str[s])) s += 1;
+      while (e > s && /\s/.test(str[e - 1])) e -= 1;
+      if (e > s) {
+        items.push({
+          text: str.slice(s, e),
+          start: baseOffset + s,
+          end: baseOffset + e,
+        });
+      }
+    };
+
+    for (let i = 0; i < len; i += 1) {
+      const ch = str[i];
+      if (ch === '(') paren += 1;
+      else if (ch === ')' && paren > 0) paren -= 1;
+      else if (ch === '<') angle += 1;
+      else if (ch === '>' && angle > 0) angle -= 1;
+      else if (ch === '{') brace += 1;
+      else if (ch === '}' && brace > 0) brace -= 1;
+      else if (ch === '[') bracket += 1;
+      else if (ch === ']' && bracket > 0) bracket -= 1;
+      else if (ch === ',' && paren === 0 && angle === 0 && brace === 0 && bracket === 0) {
+        pushSeg(segStart, i);
+        segStart = i + 1;
+      }
+    }
+    pushSeg(segStart, len);
+    return items;
+  }
+
+  function parseWgslIoType(rawType) {
+    if (typeof rawType !== 'string') {
+      return null;
+    }
+    const cleaned = rawType.trim().replace(/[;,]+$/, '').trim();
+    if (cleaned.length === 0) {
+      return null;
+    }
+    if (Object.prototype.hasOwnProperty.call(WGSL_SCALAR_TYPES, cleaned)) {
+      return WGSL_SCALAR_TYPES[cleaned];
+    }
+    if (Object.prototype.hasOwnProperty.call(WGSL_SHORTHAND_TYPES, cleaned)) {
+      return WGSL_SHORTHAND_TYPES[cleaned];
+    }
+    const vecMatch = /^vec([234])\s*<\s*(f32|f16|i32|u32)\s*>$/.exec(cleaned);
+    if (vecMatch) {
+      const components = Number(vecMatch[1]);
+      const scalar = vecMatch[2];
+      return {
+        canonical: `vec${components}<${scalar}>`,
+        scalar,
+        components,
+        isInteger: scalar === 'i32' || scalar === 'u32',
+      };
+    }
+    return null;
+  }
+
+  function wgslScalarZero(scalar) {
+    if (scalar === 'u32') return '0u';
+    if (scalar === 'i32') return '0i';
+    if (scalar === 'f16') return '0.0h';
+    return '0.0';
+  }
+
+  function wgslZeroLiteral(typeInfo) {
+    if (!typeInfo) {
+      return 'vec4<f32>(0.0)';
+    }
+    const z = wgslScalarZero(typeInfo.scalar);
+    if (typeInfo.components === 1) {
+      return z;
+    }
+    return `${typeInfo.canonical}(${z})`;
+  }
+
+  function parseWgslInterpolate(rawArgs) {
+    if (typeof rawArgs !== 'string' || rawArgs.trim().length === 0) {
+      return WGSL_DEFAULT_INTERPOLATE_PERSPECTIVE;
+    }
+    const parts = rawArgs
+      .split(',')
+      .map((p) => p.trim().toLowerCase())
+      .filter((p) => p.length > 0);
+    if (parts.length === 0) {
+      return WGSL_DEFAULT_INTERPOLATE_PERSPECTIVE;
+    }
+    const type = parts[0];
+    const sampling = parts.length > 1 ? parts[1] : null;
+    if (type === 'flat') {
+      const effectiveSampling = sampling || 'first';
+      const wgslAttr = sampling ? `@interpolate(flat, ${sampling})` : '@interpolate(flat)';
+      return {
+        type: 'flat',
+        sampling,
+        effectiveSampling,
+        explicit: true,
+        canonical: `flat,${effectiveSampling}`,
+        wgslAttr,
+      };
+    }
+    if (type === 'linear') {
+      const effectiveSampling = sampling || 'center';
+      const wgslAttr =
+        effectiveSampling === 'center'
+          ? '@interpolate(linear)'
+          : `@interpolate(linear, ${effectiveSampling})`;
+      return {
+        type: 'linear',
+        sampling: effectiveSampling,
+        effectiveSampling,
+        explicit: true,
+        canonical: `linear,${effectiveSampling}`,
+        wgslAttr,
+      };
+    }
+    if (type === 'perspective') {
+      const effectiveSampling = sampling || 'center';
+      const wgslAttr =
+        effectiveSampling === 'center'
+          ? null
+          : `@interpolate(perspective, ${effectiveSampling})`;
+      return {
+        type: 'perspective',
+        sampling: effectiveSampling,
+        effectiveSampling,
+        explicit: true,
+        canonical: `perspective,${effectiveSampling}`,
+        wgslAttr,
+      };
+    }
+    return {
+      type,
+      sampling,
+      effectiveSampling: sampling || 'center',
+      explicit: true,
+      canonical: sampling ? `${type},${sampling}` : type,
+      wgslAttr: sampling ? `@interpolate(${type}, ${sampling})` : `@interpolate(${type})`,
+    };
+  }
+
+  function parseIoAttributes(strippedText, baseOffset) {
+    const attrs = [];
+    const attrRe = /@([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|)/g;
+    let location = null;
+    let locationAttrSpan = null;
+    let interpolate = WGSL_DEFAULT_INTERPOLATE_PERSPECTIVE;
+    let interpolateAttrSpan = null;
+    let builtin = null;
+    let builtinAttrSpan = null;
+
+    let idx = 0;
+    const len = strippedText.length;
+    while (idx < len) {
+      attrRe.lastIndex = idx;
+      const m = attrRe.exec(strippedText);
+      if (!m) break;
+      const start = m.index;
+      const name = m[1];
+      let end = start + m[0].length;
+      let args = null;
+      if (m[0].endsWith('(')) {
+        const closeParen = findMatchingDelimiter(strippedText, end - 1, 40, 41);
+        if (closeParen === -1) {
+          idx = end;
+          continue;
+        }
+        args = strippedText.slice(end, closeParen).trim();
+        end = closeParen + 1;
+      }
+      attrs.push({ name, args, start: baseOffset + start, end: baseOffset + end, relStart: start, relEnd: end });
+      if (name === 'location' && args !== null) {
+        const locMatch = /^(\d+)[ui]?$/i.exec(args.replace(/,\s*$/, '').trim());
+        if (locMatch) {
+          location = Number(locMatch[1]);
+          locationAttrSpan = { start: baseOffset + start, end: baseOffset + end };
+        }
+      } else if (name === 'interpolate' && args !== null) {
+        interpolate = parseWgslInterpolate(args);
+        interpolateAttrSpan = { start: baseOffset + start, end: baseOffset + end };
+      } else if (name === 'builtin' && args !== null) {
+        builtin = args.replace(/,\s*$/, '').trim();
+        builtinAttrSpan = { start: baseOffset + start, end: baseOffset + end };
+      }
+      idx = end;
+    }
+
+    // Build text with all attributes removed to cleanly parse `name: Type` or direct return `Type`.
+    let remainder = strippedText;
+    if (attrs.length > 0) {
+      let buf = '';
+      let cursor = 0;
+      for (let i = 0; i < attrs.length; i += 1) {
+        buf += strippedText.slice(cursor, attrs[i].relStart);
+        cursor = attrs[i].relEnd;
+      }
+      buf += strippedText.slice(cursor);
+      remainder = buf.trim();
+    } else {
+      remainder = strippedText.trim();
+    }
+
+    return {
+      attrs,
+      location,
+      locationAttrSpan,
+      interpolate,
+      interpolateAttrSpan,
+      builtin,
+      builtinAttrSpan,
+      remainder,
+    };
+  }
+
+  function findWgslStruct(stripped, structName) {
+    if (!structName || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(structName)) {
+      return null;
+    }
+    const re = new RegExp(`\\bstruct\\s+${structName}\\s*\\{`, 'g');
+    const match = re.exec(stripped);
+    if (!match) {
+      return null;
+    }
+    const structStart = match.index;
+    const openBrace = match.index + match[0].length - 1;
+    const closeBrace = findMatchingDelimiter(stripped, openBrace, 123, 125);
+    if (closeBrace === -1) {
+      return null;
+    }
+    const bodyText = stripped.slice(openBrace + 1, closeBrace);
+    const rawMembers = splitTopLevelCommas(bodyText, openBrace + 1);
+    const members = [];
+    const locations = new Map();
+    const builtins = [];
+
+    for (let i = 0; i < rawMembers.length; i += 1) {
+      const seg = rawMembers[i];
+      const parsedAttrs = parseIoAttributes(seg.text, seg.start);
+      const colonIdx = parsedAttrs.remainder.indexOf(':');
+      if (colonIdx === -1) {
+        continue;
+      }
+      const fieldName = parsedAttrs.remainder.slice(0, colonIdx).trim();
+      const rawType = parsedAttrs.remainder.slice(colonIdx + 1).trim();
+      if (!fieldName || !rawType) {
+        continue;
+      }
+      const typeInfo = parseWgslIoType(rawType);
+      const member = {
+        name: fieldName,
+        rawType,
+        typeInfo,
+        location: parsedAttrs.location,
+        locationAttrSpan: parsedAttrs.locationAttrSpan,
+        interpolate: parsedAttrs.interpolate,
+        interpolateAttrSpan: parsedAttrs.interpolateAttrSpan,
+        builtin: parsedAttrs.builtin,
+        builtinAttrSpan: parsedAttrs.builtinAttrSpan,
+        attrs: parsedAttrs.attrs,
+        spanStart: seg.start,
+        spanEnd: seg.end,
+      };
+      members.push(member);
+      if (member.location !== null) {
+        locations.set(member.location, member);
+      }
+      if (member.builtin !== null) {
+        builtins.push(member);
+      }
+    }
+
+    let lastMemberEnd = openBrace + 1;
+    let hasTrailingComma = true;
+    if (members.length > 0) {
+      lastMemberEnd = members[members.length - 1].spanEnd;
+      const tail = stripped.slice(lastMemberEnd, closeBrace);
+      hasTrailingComma = tail.indexOf(',') !== -1;
+    }
+
+    return {
+      name: structName,
+      structStart,
+      openBrace,
+      closeBrace,
+      members,
+      locations,
+      builtins,
+      lastMemberEnd,
+      hasTrailingComma,
+    };
+  }
+
+  function normalizeInterstageStageName(stage) {
+    if (typeof stage !== 'string') return null;
+    const lower = stage.trim().toLowerCase();
+    if (lower === 'vertex' || lower === 'vs') return 'vertex';
+    if (lower === 'fragment' || lower === 'fs' || lower === 'ps' || lower === 'pixel') {
+      return 'fragment';
+    }
+    return null;
+  }
+
+  function findStageEntryPoint(stripped, stageName, requestedEntryPoint) {
+    const stageAttr = stageName === 'vertex' ? 'vertex' : 'fragment';
+    const stageRe = new RegExp(`@${stageAttr}\\b`, 'g');
+    const candidates = [];
+    let m;
+    while ((m = stageRe.exec(stripped)) !== null) {
+      const attrStart = m.index;
+      const attrEnd = attrStart + m[0].length;
+      // Advance past any sibling attributes (e.g. @early_depth_test(...)) to `fn <name>(`.
+      const afterAttr = stripped.slice(attrEnd);
+      const fnMatch = /^((?:\s*(?:@[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?))*\s*)(fn)(\s+)([A-Za-z_][A-Za-z0-9_]*)\s*\(/.exec(
+        afterAttr
+      );
+      if (!fnMatch) {
+        continue;
+      }
+      const fnName = fnMatch[4];
+      const fnStart = attrEnd + fnMatch[1].length;
+      const fnNameStart = fnStart + fnMatch[2].length + fnMatch[3].length;
+      const fnNameEnd = fnNameStart + fnName.length;
+      const openParen = attrEnd + fnMatch[0].length - 1;
+      const closeParen = findMatchingDelimiter(stripped, openParen, 40, 41);
+      if (closeParen === -1) {
+        continue;
+      }
+      // Find opening `{` of function body after `)`
+      const afterParams = stripped.slice(closeParen + 1);
+      const braceRel = afterParams.indexOf('{');
+      if (braceRel === -1) {
+        continue;
+      }
+      const bodyOpen = closeParen + 1 + braceRel;
+      const bodyClose = findMatchingDelimiter(stripped, bodyOpen, 123, 125);
+      if (bodyClose === -1) {
+        continue;
+      }
+      const retHeader = afterParams.slice(0, braceRel);
+      const arrowIdx = retHeader.indexOf('->');
+      let returnTypeStart = -1;
+      let returnTypeEnd = -1;
+      let returnTypeText = '';
+      if (arrowIdx !== -1) {
+        const rawRetStart = closeParen + 1 + arrowIdx + 2;
+        let rs = rawRetStart;
+        let re = bodyOpen;
+        while (rs < re && /\s/.test(stripped[rs])) rs += 1;
+        while (re > rs && /\s/.test(stripped[re - 1])) re -= 1;
+        returnTypeStart = rs;
+        returnTypeEnd = re;
+        returnTypeText = stripped.slice(rs, re);
+      }
+
+      const candidate = {
+        entryPoint: fnName,
+        stageAttrStart: attrStart,
+        stageAttrEnd: attrEnd,
+        fnStart,
+        fnNameStart,
+        fnNameEnd,
+        openParen,
+        closeParen,
+        returnTypeStart,
+        returnTypeEnd,
+        returnTypeText,
+        bodyOpen,
+        bodyClose,
+      };
+      if (requestedEntryPoint && fnName === requestedEntryPoint) {
+        return candidate;
+      }
+      candidates.push(candidate);
+    }
+    return candidates.length > 0 ? candidates[0] : null;
+  }
+
+  /**
+   * Parse the VS output or PS input inter-stage `@location(N)` / `@interpolate(...)` interface
+   * from a WGSL shader string.
+   *
+   * @param {string} wgslCode
+   * @param {'vertex' | 'vs' | 'fragment' | 'fs' | 'ps'} stage
+   * @param {string | null | undefined} [entryPoint]
+   * @returns {object | null}
+   */
+  function parseInterstageInterface(wgslCode, stage, entryPoint) {
+    const stageName = normalizeInterstageStageName(stage);
+    if (typeof wgslCode !== 'string' || wgslCode.length === 0 || stageName === null) {
+      return null;
+    }
+    const stripped = stripWgslCommentsPreservingLength(wgslCode);
+    const ep = findStageEntryPoint(
+      stripped,
+      stageName,
+      typeof entryPoint === 'string' && entryPoint.length > 0 ? entryPoint : null
+    );
+    if (!ep) {
+      return null;
+    }
+
+    const paramsText = stripped.slice(ep.openParen + 1, ep.closeParen);
+    const rawParams = splitTopLevelCommas(paramsText, ep.openParen + 1);
+    const params = [];
+    for (let i = 0; i < rawParams.length; i += 1) {
+      const seg = rawParams[i];
+      const parsedAttrs = parseIoAttributes(seg.text, seg.start);
+      const colonIdx = parsedAttrs.remainder.indexOf(':');
+      if (colonIdx === -1) {
+        continue;
+      }
+      const paramName = parsedAttrs.remainder.slice(0, colonIdx).trim();
+      const rawType = parsedAttrs.remainder.slice(colonIdx + 1).trim();
+      params.push({
+        name: paramName,
+        rawType,
+        typeInfo: parseWgslIoType(rawType),
+        location: parsedAttrs.location,
+        locationAttrSpan: parsedAttrs.locationAttrSpan,
+        interpolate: parsedAttrs.interpolate,
+        interpolateAttrSpan: parsedAttrs.interpolateAttrSpan,
+        builtin: parsedAttrs.builtin,
+        builtinAttrSpan: parsedAttrs.builtinAttrSpan,
+        attrs: parsedAttrs.attrs,
+        spanStart: seg.start,
+        spanEnd: seg.end,
+      });
+    }
+
+    const locations = new Map();
+    const builtins = [];
+
+    if (stageName === 'vertex') {
+      if (!ep.returnTypeText) {
+        return {
+          stage: 'vertex',
+          entryPoint: ep.entryPoint,
+          ep,
+          params,
+          returnKind: 'void',
+          structName: null,
+          structInfo: null,
+          hasPositionalConstructor: false,
+          directReturn: null,
+          locations,
+          builtins,
+        };
+      }
+      const retAttrs = parseIoAttributes(ep.returnTypeText, ep.returnTypeStart);
+      if (retAttrs.builtin !== null || retAttrs.location !== null) {
+        const directTypeInfo = parseWgslIoType(retAttrs.remainder);
+        const directEntry = {
+          name: retAttrs.builtin === 'position' ? 'position' : '_pg6_ret',
+          rawType: retAttrs.remainder,
+          typeInfo: directTypeInfo,
+          location: retAttrs.location,
+          locationAttrSpan: retAttrs.locationAttrSpan,
+          interpolate: retAttrs.interpolate,
+          interpolateAttrSpan: retAttrs.interpolateAttrSpan,
+          builtin: retAttrs.builtin,
+          builtinAttrSpan: retAttrs.builtinAttrSpan,
+          attrs: retAttrs.attrs,
+          spanStart: ep.returnTypeStart,
+          spanEnd: ep.returnTypeEnd,
+        };
+        if (directEntry.location !== null) {
+          locations.set(directEntry.location, directEntry);
+        }
+        if (directEntry.builtin !== null) {
+          builtins.push(directEntry);
+        }
+        return {
+          stage: 'vertex',
+          entryPoint: ep.entryPoint,
+          ep,
+          params,
+          returnKind: 'direct',
+          structName: null,
+          structInfo: null,
+          hasPositionalConstructor: false,
+          directReturn: directEntry,
+          locations,
+          builtins,
+        };
+      }
+
+      const structName = retAttrs.remainder;
+      const structInfo = findWgslStruct(stripped, structName);
+      let hasPositionalConstructor = false;
+      if (structInfo) {
+        for (const [loc, member] of structInfo.locations.entries()) {
+          locations.set(loc, member);
+        }
+        for (let i = 0; i < structInfo.builtins.length; i += 1) {
+          builtins.push(structInfo.builtins[i]);
+        }
+        const posCtorRe = new RegExp(`\\b${structName}\\s*\\(\\s*[^\\s)]`);
+        hasPositionalConstructor = posCtorRe.test(stripped);
+      }
+
+      return {
+        stage: 'vertex',
+        entryPoint: ep.entryPoint,
+        ep,
+        params,
+        returnKind: structInfo ? 'struct' : 'unknown',
+        structName: structInfo ? structName : null,
+        structInfo,
+        hasPositionalConstructor,
+        directReturn: null,
+        locations,
+        builtins,
+      };
+    }
+
+    // Fragment stage: gather inputs from direct @location(N) params and input struct params.
+    const inputStructs = [];
+    for (let i = 0; i < params.length; i += 1) {
+      const p = params[i];
+      if (p.location !== null) {
+        locations.set(p.location, {
+          ...p,
+          source: 'param',
+          structName: null,
+        });
+      } else if (p.builtin !== null) {
+        builtins.push(p);
+      } else if (p.typeInfo === null && /^[A-Za-z_][A-Za-z0-9_]*$/.test(p.rawType)) {
+        const sInfo = findWgslStruct(stripped, p.rawType);
+        if (sInfo) {
+          inputStructs.push(sInfo);
+          for (const [loc, member] of sInfo.locations.entries()) {
+            locations.set(loc, {
+              ...member,
+              source: 'struct',
+              structName: sInfo.name,
+            });
+          }
+          for (let j = 0; j < sInfo.builtins.length; j += 1) {
+            builtins.push(sInfo.builtins[j]);
+          }
+        }
+      }
+    }
+
+    return {
+      stage: 'fragment',
+      entryPoint: ep.entryPoint,
+      ep,
+      params,
+      inputStructs,
+      locations,
+      builtins,
+    };
+  }
+
+  function resolveEffectiveTargetInterpolate(psLoc) {
+    if (psLoc.typeInfo && psLoc.typeInfo.isInteger) {
+      return psLoc.interpolate && psLoc.interpolate.type === 'flat'
+        ? psLoc.interpolate
+        : WGSL_DEFAULT_INTERPOLATE_FLAT;
+    }
+    return psLoc.interpolate || WGSL_DEFAULT_INTERPOLATE_PERSPECTIVE;
+  }
+
+  function analyzeInterstageCompatibilityFromInterfaces(vsInterface, psInterface) {
+    const flatMismatches = [];
+    const interpolateMismatches = [];
+    const missingLocations = [];
+    const typeMismatches = [];
+    const integerFlatFixes = [];
+
+    if (!vsInterface || !psInterface) {
+      return {
+        compatible: true,
+        needsPatch: false,
+        patchSignature: null,
+        flatMismatches,
+        interpolateMismatches,
+        missingLocations,
+        typeMismatches,
+        integerFlatFixes,
+        vsInterface,
+        psInterface,
+      };
+    }
+
+    const handledIntegerLocs = new Set();
+    const psLocKeys = Array.from(psInterface.locations.keys()).sort((a, b) => a - b);
+
+    for (let i = 0; i < psLocKeys.length; i += 1) {
+      const loc = psLocKeys[i];
+      const psLoc = psInterface.locations.get(loc);
+      const targetInterp = resolveEffectiveTargetInterpolate(psLoc);
+      const psTypeCanonical = psLoc.typeInfo ? psLoc.typeInfo.canonical : psLoc.rawType;
+      const vsLoc = vsInterface.locations.get(loc);
+
+      if (!vsLoc) {
+        missingLocations.push({
+          location: loc,
+          psType: psTypeCanonical,
+          psTypeInfo: psLoc.typeInfo,
+          psInterpolate: targetInterp,
+        });
+        continue;
+      }
+
+      const vsTypeInfo = vsLoc.typeInfo;
+      const psTypeInfo = psLoc.typeInfo;
+      const vsTypeCanonical = vsTypeInfo ? vsTypeInfo.canonical : vsLoc.rawType;
+      if (
+        vsTypeInfo &&
+        psTypeInfo &&
+        (vsTypeInfo.scalar !== psTypeInfo.scalar || vsTypeInfo.components !== psTypeInfo.components)
+      ) {
+        typeMismatches.push({
+          location: loc,
+          vsType: vsTypeCanonical,
+          psType: psTypeCanonical,
+          vsTypeInfo,
+          psTypeInfo,
+          vsComponents: vsTypeInfo.components,
+          psComponents: psTypeInfo.components,
+          vsScalar: vsTypeInfo.scalar,
+          psScalar: psTypeInfo.scalar,
+          targetInterpolate: targetInterp,
+        });
+      }
+
+      const vsInterp = vsLoc.interpolate || WGSL_DEFAULT_INTERPOLATE_PERSPECTIVE;
+      // Note: an integer VS output with omitted @interpolate(...) is invalid WGSL even if PS has @interpolate(flat).
+      const vsNeedsExplicitIntegerFlat =
+        Boolean(vsTypeInfo && vsTypeInfo.isInteger && vsInterp.type !== 'flat');
+      const interpDiffers =
+        vsInterp.canonical !== targetInterp.canonical || vsNeedsExplicitIntegerFlat;
+
+      if (interpDiffers) {
+        const isFlatRelated =
+          vsInterp.type === 'flat' ||
+          targetInterp.type === 'flat' ||
+          vsNeedsExplicitIntegerFlat;
+        const entry = {
+          location: loc,
+          vsInterpolate: vsInterp,
+          psInterpolate: targetInterp,
+          isFlatRelated,
+        };
+        interpolateMismatches.push(entry);
+        if (isFlatRelated) {
+          flatMismatches.push(entry);
+        }
+        if (vsNeedsExplicitIntegerFlat) {
+          integerFlatFixes.push({
+            location: loc,
+            vsType: vsTypeCanonical,
+          });
+          handledIntegerLocs.add(loc);
+        }
+      }
+    }
+
+    // Also validate any VS integer @location(N) outputs not read by PS (WGSL requires @interpolate(flat)).
+    const vsLocKeys = Array.from(vsInterface.locations.keys()).sort((a, b) => a - b);
+    for (let i = 0; i < vsLocKeys.length; i += 1) {
+      const loc = vsLocKeys[i];
+      if (handledIntegerLocs.has(loc)) {
+        continue;
+      }
+      const vsLoc = vsInterface.locations.get(loc);
+      if (
+        vsLoc.typeInfo &&
+        vsLoc.typeInfo.isInteger &&
+        (!vsLoc.interpolate || vsLoc.interpolate.type !== 'flat')
+      ) {
+        integerFlatFixes.push({
+          location: loc,
+          vsType: vsLoc.typeInfo.canonical,
+        });
+        const entry = {
+          location: loc,
+          vsInterpolate: vsLoc.interpolate || WGSL_DEFAULT_INTERPOLATE_PERSPECTIVE,
+          psInterpolate: WGSL_DEFAULT_INTERPOLATE_FLAT,
+          isFlatRelated: true,
+        };
+        interpolateMismatches.push(entry);
+        flatMismatches.push(entry);
+      }
+    }
+
+    const needsPatch =
+      interpolateMismatches.length > 0 ||
+      missingLocations.length > 0 ||
+      typeMismatches.length > 0 ||
+      integerFlatFixes.length > 0;
+
+    let patchSignature = null;
+    if (needsPatch) {
+      const sigParts = [];
+      for (let i = 0; i < interpolateMismatches.length; i += 1) {
+        const m = interpolateMismatches[i];
+        sigParts.push(`i:${m.location}=${m.psInterpolate.wgslAttr || 'default'}`);
+      }
+      for (let i = 0; i < missingLocations.length; i += 1) {
+        const m = missingLocations[i];
+        sigParts.push(`m:${m.location}=${m.psType}:${m.psInterpolate.wgslAttr || 'default'}`);
+      }
+      for (let i = 0; i < typeMismatches.length; i += 1) {
+        const m = typeMismatches[i];
+        sigParts.push(`t:${m.location}=${m.psType}:${m.targetInterpolate.wgslAttr || 'default'}`);
+      }
+      sigParts.sort();
+      patchSignature = sigParts.join(';');
+    }
+
+    return {
+      compatible: !needsPatch,
+      needsPatch,
+      patchSignature,
+      flatMismatches,
+      interpolateMismatches,
+      missingLocations,
+      typeMismatches,
+      integerFlatFixes,
+      vsInterface,
+      psInterface,
+    };
+  }
+
+  /**
+   * Analyze inter-stage `@location(N)`, `@interpolate(...)`, and type compatibility between
+   * vertex and fragment WGSL sources.
+   *
+   * @param {string} vsWgsl
+   * @param {string} psWgsl
+   * @param {{ vsEntryPoint?: string, psEntryPoint?: string }} [options]
+   * @returns {object}
+   */
+  function analyzeInterstageCompatibility(vsWgsl, psWgsl, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const vsInterface = parseInterstageInterface(vsWgsl, 'vertex', opts.vsEntryPoint);
+    const psInterface = parseInterstageInterface(psWgsl, 'fragment', opts.psEntryPoint);
+    return analyzeInterstageCompatibilityFromInterfaces(vsInterface, psInterface);
+  }
+
+  function emitWgslTypeAdapter(expr, fromTypeInfo, toTypeInfo) {
+    if (!fromTypeInfo || !toTypeInfo) {
+      return expr;
+    }
+    if (
+      fromTypeInfo.scalar === toTypeInfo.scalar &&
+      fromTypeInfo.components === toTypeInfo.components
+    ) {
+      return expr;
+    }
+
+    let currentExpr = expr;
+    let curComponents = fromTypeInfo.components;
+    const curScalar = fromTypeInfo.scalar;
+    const targetComponents = toTypeInfo.components;
+    const targetScalar = toTypeInfo.scalar;
+
+    // Step 1: Adjust component count while staying in curScalar.
+    if (curComponents > targetComponents) {
+      const swizzle = targetComponents === 1 ? 'x' : targetComponents === 2 ? 'xy' : 'xyz';
+      currentExpr = `(${currentExpr}).${swizzle}`;
+      curComponents = targetComponents;
+    } else if (curComponents < targetComponents) {
+      const padCount = targetComponents - curComponents;
+      const z = wgslScalarZero(curScalar);
+      const pads = new Array(padCount).fill(z).join(', ');
+      currentExpr = `vec${targetComponents}<${curScalar}>(${currentExpr}, ${pads})`;
+      curComponents = targetComponents;
+    }
+
+    // Step 2: Convert scalar type when needed.
+    if (curScalar !== targetScalar) {
+      const both32Bit =
+        (curScalar === 'f32' || curScalar === 'u32' || curScalar === 'i32') &&
+        (targetScalar === 'f32' || targetScalar === 'u32' || targetScalar === 'i32');
+      if (both32Bit) {
+        currentExpr = `bitcast<${toTypeInfo.canonical}>(${currentExpr})`;
+      } else {
+        currentExpr = `${toTypeInfo.canonical}(${currentExpr})`;
+      }
+    }
+
+    return currentExpr;
+  }
+
+  function pickUniqueWgslIdent(source, baseName) {
+    if (!new RegExp(`\\b${baseName}\\b`).test(source)) {
+      return baseName;
+    }
+    let idx = 1;
+    while (new RegExp(`\\b${baseName}_${idx}\\b`).test(source)) {
+      idx += 1;
+    }
+    return `${baseName}_${idx}`;
+  }
+
+  function applyTextEditsDescending(source, edits) {
+    if (!edits || edits.length === 0) {
+      return source;
+    }
+    edits.sort((a, b) => b.start - a.start || b.end - a.end);
+    let out = source;
+    for (let i = 0; i < edits.length; i += 1) {
+      const e = edits[i];
+      out = out.slice(0, e.start) + e.text + out.slice(e.end);
+    }
+    return out;
+  }
+
+  function patchVsStructInPlace(vsWgsl, vsInterface, analysis) {
+    const structInfo = vsInterface.structInfo;
+    const edits = [];
+
+    // 1. Update @interpolate(...) on existing struct members.
+    for (let i = 0; i < analysis.interpolateMismatches.length; i += 1) {
+      const mismatch = analysis.interpolateMismatches[i];
+      const member = structInfo.locations.get(mismatch.location);
+      if (!member) continue;
+      const targetAttr = mismatch.psInterpolate ? mismatch.psInterpolate.wgslAttr : null;
+
+      if (member.interpolateAttrSpan) {
+        let start = member.interpolateAttrSpan.start;
+        let end = member.interpolateAttrSpan.end;
+        if (targetAttr === null) {
+          // Remove @interpolate(...) and avoid leaving double spaces.
+          if (end < vsWgsl.length && vsWgsl[end] === ' ') {
+            end += 1;
+          } else if (start > 0 && vsWgsl[start - 1] === ' ') {
+            start -= 1;
+          }
+          edits.push({ start, end, text: '' });
+        } else {
+          edits.push({ start, end, text: targetAttr });
+        }
+      } else if (targetAttr !== null && member.locationAttrSpan) {
+        edits.push({
+          start: member.locationAttrSpan.end,
+          end: member.locationAttrSpan.end,
+          text: ` ${targetAttr}`,
+        });
+      }
+    }
+
+    // 2. Append missing @location(N) fields to struct VsOut (zero-initialized by WGSL `var out: VsOut` / `VsOut()`).
+    if (analysis.missingLocations.length > 0) {
+      const existingNames = new Set(structInfo.members.map((m) => m.name));
+      const newLines = [];
+      for (let i = 0; i < analysis.missingLocations.length; i += 1) {
+        const miss = analysis.missingLocations[i];
+        let fieldName = `_pg6_link_loc_${miss.location}`;
+        let suffix = 1;
+        while (existingNames.has(fieldName)) {
+          fieldName = `_pg6_link_loc_${miss.location}_${suffix}`;
+          suffix += 1;
+        }
+        existingNames.add(fieldName);
+        const attrPart =
+          miss.psInterpolate && miss.psInterpolate.wgslAttr
+            ? `@location(${miss.location}) ${miss.psInterpolate.wgslAttr}`
+            : `@location(${miss.location})`;
+        newLines.push(`    ${attrPart} ${fieldName}: ${miss.psType},`);
+      }
+
+      if (structInfo.members.length > 0 && !structInfo.hasTrailingComma) {
+        edits.push({
+          start: structInfo.lastMemberEnd,
+          end: structInfo.lastMemberEnd,
+          text: ',',
+        });
+      }
+
+      const beforeClose = vsWgsl.slice(Math.max(structInfo.openBrace + 1, structInfo.closeBrace - 1), structInfo.closeBrace);
+      const leadingNewline = beforeClose.endsWith('\n') ? '' : '\n';
+      edits.push({
+        start: structInfo.closeBrace,
+        end: structInfo.closeBrace,
+        text: `${leadingNewline}${newLines.join('\n')}\n`,
+      });
+    }
+
+    return applyTextEditsDescending(vsWgsl, edits);
+  }
+
+  function patchVsWithWrapperEntryPoint(vsWgsl, vsInterface, analysis) {
+    const ep = vsInterface.ep;
+    const origHelperName = pickUniqueWgslIdent(vsWgsl, `_pg6_orig_${ep.entryPoint}`);
+    const wrapperStructName = pickUniqueWgslIdent(vsWgsl, '_Pg6LinkVsOut');
+    const rawVarName = pickUniqueWgslIdent(vsWgsl, '_pg6_raw');
+    const outVarName = pickUniqueWgslIdent(vsWgsl, '_pg6_out');
+
+    const edits = [];
+
+    // 1. Remove `@vertex` from original entry point so it becomes an internal helper function.
+    let attrStart = ep.stageAttrStart;
+    let attrEnd = ep.stageAttrEnd;
+    while (attrEnd < ep.fnStart && (vsWgsl[attrEnd] === ' ' || vsWgsl[attrEnd] === '\t')) {
+      attrEnd += 1;
+    }
+    edits.push({ start: attrStart, end: attrEnd, text: '' });
+
+    // 2. Rename original entry point function.
+    edits.push({ start: ep.fnNameStart, end: ep.fnNameEnd, text: origHelperName });
+
+    // 3. Strip IO attributes from direct parameters of the helper function (WGSL forbids @location/@builtin on non-entry-point params).
+    for (let i = 0; i < vsInterface.params.length; i += 1) {
+      const p = vsInterface.params[i];
+      for (let j = 0; j < p.attrs.length; j += 1) {
+        const a = p.attrs[j];
+        if (a.name === 'location' || a.name === 'builtin' || a.name === 'interpolate') {
+          let s = a.start;
+          let e = a.end;
+          if (e < p.spanEnd && vsWgsl[e] === ' ') e += 1;
+          edits.push({ start: s, end: e, text: '' });
+        }
+      }
+    }
+
+    // 4. Strip IO attributes from direct return type OR from original output struct members.
+    if (vsInterface.returnKind === 'direct' && vsInterface.directReturn) {
+      const dr = vsInterface.directReturn;
+      for (let j = 0; j < dr.attrs.length; j += 1) {
+        const a = dr.attrs[j];
+        if (
+          a.name === 'location' ||
+          a.name === 'builtin' ||
+          a.name === 'interpolate' ||
+          a.name === 'invariant'
+        ) {
+          let s = a.start;
+          let e = a.end;
+          if (e < dr.spanEnd && vsWgsl[e] === ' ') e += 1;
+          edits.push({ start: s, end: e, text: '' });
+        }
+      }
+    } else if (vsInterface.returnKind === 'struct' && vsInterface.structInfo) {
+      const members = vsInterface.structInfo.members;
+      for (let i = 0; i < members.length; i += 1) {
+        const m = members[i];
+        for (let j = 0; j < m.attrs.length; j += 1) {
+          const a = m.attrs[j];
+          if (
+            a.name === 'location' ||
+            a.name === 'builtin' ||
+            a.name === 'interpolate' ||
+            a.name === 'invariant'
+          ) {
+            let s = a.start;
+            let e = a.end;
+            if (e < m.spanEnd && vsWgsl[e] === ' ') e += 1;
+            edits.push({ start: s, end: e, text: '' });
+          }
+        }
+      }
+    }
+
+    const transformedBase = applyTextEditsDescending(vsWgsl, edits);
+
+    // 5. Build wrapper output struct and `@vertex` entry point forwarding all original params.
+    const originalParamsVerbatim = vsWgsl.slice(ep.openParen + 1, ep.closeParen);
+    const callArgs = vsInterface.params.map((p) => p.name).join(', ');
+    const structLines = [];
+    const assignLines = [];
+    const usedFieldNames = new Set();
+
+    const reserveName = (preferred) => {
+      let name = preferred;
+      let idx = 1;
+      while (usedFieldNames.has(name)) {
+        name = `${preferred}_${idx}`;
+        idx += 1;
+      }
+      usedFieldNames.add(name);
+      return name;
+    };
+
+    const psInterface = analysis.psInterface;
+    const hasInvariantAttr = (attrs) =>
+      Array.isArray(attrs) && attrs.some((a) => a.name === 'invariant');
+
+    if (vsInterface.returnKind === 'direct' && vsInterface.directReturn) {
+      const dr = vsInterface.directReturn;
+      if (dr.builtin !== null) {
+        const bName = reserveName(dr.builtin === 'position' ? 'position' : `_pg6_builtin_${dr.builtin}`);
+        const bType = dr.typeInfo ? dr.typeInfo.canonical : dr.rawType;
+        const invPrefix = hasInvariantAttr(dr.attrs) ? '@invariant ' : '';
+        structLines.push(`    ${invPrefix}@builtin(${dr.builtin}) ${bName}: ${bType},`);
+        assignLines.push(`    ${outVarName}.${bName} = ${rawVarName};`);
+      } else if (dr.location !== null) {
+        const psLoc = psInterface ? psInterface.locations.get(dr.location) : null;
+        const targetTypeInfo = psLoc && psLoc.typeInfo ? psLoc.typeInfo : dr.typeInfo;
+        const targetType = targetTypeInfo ? targetTypeInfo.canonical : dr.rawType;
+        const targetInterp = psLoc
+          ? resolveEffectiveTargetInterpolate(psLoc)
+          : targetTypeInfo && targetTypeInfo.isInteger
+            ? WGSL_DEFAULT_INTERPOLATE_FLAT
+            : dr.interpolate;
+        const attrPart =
+          targetInterp && targetInterp.wgslAttr
+            ? `@location(${dr.location}) ${targetInterp.wgslAttr}`
+            : `@location(${dr.location})`;
+        const fName = reserveName(`_pg6_loc_${dr.location}`);
+        structLines.push(`    ${attrPart} ${fName}: ${targetType},`);
+        assignLines.push(
+          `    ${outVarName}.${fName} = ${emitWgslTypeAdapter(rawVarName, dr.typeInfo, targetTypeInfo)};`
+        );
+      }
+    } else if (vsInterface.returnKind === 'struct' && vsInterface.structInfo) {
+      const members = vsInterface.structInfo.members;
+      for (let i = 0; i < members.length; i += 1) {
+        const m = members[i];
+        if (m.builtin !== null) {
+          const bName = reserveName(m.name);
+          const bType = m.typeInfo ? m.typeInfo.canonical : m.rawType;
+          const invPrefix = hasInvariantAttr(m.attrs) ? '@invariant ' : '';
+          structLines.push(`    ${invPrefix}@builtin(${m.builtin}) ${bName}: ${bType},`);
+          assignLines.push(`    ${outVarName}.${bName} = ${rawVarName}.${m.name};`);
+        } else if (m.location !== null) {
+          const psLoc = psInterface ? psInterface.locations.get(m.location) : null;
+          const targetTypeInfo = psLoc && psLoc.typeInfo ? psLoc.typeInfo : m.typeInfo;
+          const targetType = targetTypeInfo ? targetTypeInfo.canonical : m.rawType;
+          const targetInterp = psLoc
+            ? resolveEffectiveTargetInterpolate(psLoc)
+            : targetTypeInfo && targetTypeInfo.isInteger
+              ? WGSL_DEFAULT_INTERPOLATE_FLAT
+              : m.interpolate;
+          const attrPart =
+            targetInterp && targetInterp.wgslAttr
+              ? `@location(${m.location}) ${targetInterp.wgslAttr}`
+              : `@location(${m.location})`;
+          const fName = reserveName(m.name);
+          structLines.push(`    ${attrPart} ${fName}: ${targetType},`);
+          assignLines.push(
+            `    ${outVarName}.${fName} = ${emitWgslTypeAdapter(`${rawVarName}.${m.name}`, m.typeInfo, targetTypeInfo)};`
+          );
+        }
+      }
+    }
+
+    for (let i = 0; i < analysis.missingLocations.length; i += 1) {
+      const miss = analysis.missingLocations[i];
+      const fName = reserveName(`_pg6_link_loc_${miss.location}`);
+      const attrPart =
+        miss.psInterpolate && miss.psInterpolate.wgslAttr
+          ? `@location(${miss.location}) ${miss.psInterpolate.wgslAttr}`
+          : `@location(${miss.location})`;
+      structLines.push(`    ${attrPart} ${fName}: ${miss.psType},`);
+      assignLines.push(`    ${outVarName}.${fName} = ${wgslZeroLiteral(miss.psTypeInfo)};`);
+    }
+
+    const wrapperBlock = [
+      '',
+      `struct ${wrapperStructName} {`,
+      ...structLines,
+      '}',
+      '',
+      '@vertex',
+      `fn ${ep.entryPoint}(${originalParamsVerbatim}) -> ${wrapperStructName} {`,
+      `    let ${rawVarName} = ${origHelperName}(${callArgs});`,
+      `    var ${outVarName}: ${wrapperStructName};`,
+      ...assignLines,
+      `    return ${outVarName};`,
+      '}',
+      '',
+    ].join('\n');
+
+    return `${transformedBase.trimEnd()}\n${wrapperBlock}`;
+  }
+
+  /**
+   * Patch a vertex shader WGSL string so its inter-stage `@location(N)` outputs,
+   * `@interpolate(...)` qualifiers, and types match the paired fragment shader's inputs.
+   * Returns a zero-overhead passthrough (`patched: false`) when already compatible.
+   *
+   * @param {string} vsWgsl
+   * @param {string} psWgsl
+   * @param {{ vsEntryPoint?: string, psEntryPoint?: string, analysis?: object }} [options]
+   * @returns {{
+   *   patched: boolean,
+   *   vsCode: string,
+   *   psCode: string,
+   *   patchedStage: 'vertex' | null,
+   *   flatFixes: number,
+   *   interpolateFixes: number,
+   *   missingLocationFixes: number,
+   *   typeFixes: number,
+   *   integerFlatFixes: number,
+   *   patchSignature: string | null,
+   *   analysis: object,
+   * }}
+   */
+  function patchInterstageWgsl(vsWgsl, psWgsl, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const analysis =
+      opts.analysis && typeof opts.analysis === 'object'
+        ? opts.analysis
+        : analyzeInterstageCompatibility(vsWgsl, psWgsl, opts);
+
+    if (!analysis || !analysis.needsPatch) {
+      return {
+        patched: false,
+        vsCode: vsWgsl,
+        psCode: psWgsl,
+        patchedStage: null,
+        flatFixes: 0,
+        interpolateFixes: 0,
+        missingLocationFixes: 0,
+        typeFixes: 0,
+        integerFlatFixes: 0,
+        patchSignature: null,
+        analysis,
+      };
+    }
+
+    const vsInterface = analysis.vsInterface;
+    if (!vsInterface || vsInterface.returnKind === 'void' || vsInterface.returnKind === 'unknown') {
+      return {
+        patched: false,
+        vsCode: vsWgsl,
+        psCode: psWgsl,
+        patchedStage: null,
+        flatFixes: 0,
+        interpolateFixes: 0,
+        missingLocationFixes: 0,
+        typeFixes: 0,
+        integerFlatFixes: 0,
+        patchSignature: null,
+        analysis,
+      };
+    }
+
+    const canEditStructInPlace =
+      vsInterface.returnKind === 'struct' &&
+      vsInterface.structInfo !== null &&
+      analysis.typeMismatches.length === 0 &&
+      !(analysis.missingLocations.length > 0 && vsInterface.hasPositionalConstructor);
+
+    let patchedVsCode = canEditStructInPlace
+      ? patchVsStructInPlace(vsWgsl, vsInterface, analysis)
+      : patchVsWithWrapperEntryPoint(vsWgsl, vsInterface, analysis);
+
+    if (patchedVsCode === vsWgsl) {
+      return {
+        patched: false,
+        vsCode: vsWgsl,
+        psCode: psWgsl,
+        patchedStage: null,
+        flatFixes: 0,
+        interpolateFixes: 0,
+        missingLocationFixes: 0,
+        typeFixes: 0,
+        integerFlatFixes: 0,
+        patchSignature: null,
+        analysis,
+      };
+    }
+
+    // If patching introduced f16 inter-stage types into a VS without `enable f16;`, prepend it.
+    const introducesF16 =
+      analysis.missingLocations.some((m) => m.psTypeInfo && m.psTypeInfo.scalar === 'f16') ||
+      analysis.typeMismatches.some((t) => t.psTypeInfo && t.psTypeInfo.scalar === 'f16');
+    if (introducesF16) {
+      const strippedPatched = stripWgslCommentsPreservingLength(patchedVsCode);
+      if (!/\benable\s+[^;]*\bf16\b/.test(strippedPatched)) {
+        patchedVsCode = `enable f16;\n${patchedVsCode}`;
+      }
+    }
+
+    return {
+      patched: true,
+      vsCode: patchedVsCode,
+      psCode: psWgsl,
+      patchedStage: 'vertex',
+      flatFixes: analysis.flatMismatches.length,
+      interpolateFixes: analysis.interpolateMismatches.length,
+      missingLocationFixes: analysis.missingLocations.length,
+      typeFixes: analysis.typeMismatches.length,
+      integerFlatFixes: analysis.integerFlatFixes.length,
+      patchSignature: analysis.patchSignature,
+      analysis,
+    };
+  }
+
   /**
    * LRU-bounded WebGPU RenderPipeline, ComputePipeline, and BindGroupLayout cache
    * with async compilation in-flight promise deduplication, batch prewarm, fallback-safe
@@ -4886,9 +6326,41 @@
           ? options.defaultColorFormat
           : DEFAULT_COLOR_FORMAT;
 
+      if (
+        options.enableInterstagePatching !== undefined &&
+        typeof options.enableInterstagePatching !== 'boolean'
+      ) {
+        throw new TypeError('options.enableInterstagePatching must be a boolean when provided');
+      }
+      this._enableInterstagePatching =
+        options.enableInterstagePatching !== undefined ? options.enableInterstagePatching : true;
+
+      if (options.maxInterstageModules !== undefined) {
+        this._maxInterstageModules = validatePositiveInt(
+          options.maxInterstageModules,
+          'maxInterstageModules'
+        );
+      } else if (options.maxPatchedShaderModules !== undefined) {
+        this._maxInterstageModules = validatePositiveInt(
+          options.maxPatchedShaderModules,
+          'maxPatchedShaderModules'
+        );
+      } else {
+        this._maxInterstageModules = DEFAULT_MAX_INTERSTAGE_MODULES;
+      }
+
+      this._maxInterstageInterfaceCache = validatePositiveInt(
+        options.maxInterstageInterfaceCache !== undefined
+          ? options.maxInterstageInterfaceCache
+          : DEFAULT_MAX_INTERSTAGE_INTERFACE_CACHE,
+        'maxInterstageInterfaceCache'
+      );
+
       this._renderPipelines = new Map();
       this._computePipelines = new Map();
       this._bindGroupLayouts = new Map();
+      this._interstagePatchedModules = new Map();
+      this._interstageInterfaceCache = new Map();
       this._fastRenderLookup = new Map();
       this._fastComputeLookup = new Map();
       this._fastRenderIntHash = new Map();
@@ -4953,19 +6425,329 @@
         fallbackSamplerBindingsSynthesized: 0,
         blendPipelineVariants: 0,
         srgbPipelineVariants: 0,
+        interstagePatchedPipelines: 0,
+        interstageFlatFixes: 0,
+        interstageMissingLocationFixes: 0,
+        interstageInterpolateFixes: 0,
+        interstageTypeFixes: 0,
+        interstageIntegerFlatFixes: 0,
+        interstageModuleCacheHits: 0,
+        interstageModuleCacheMisses: 0,
+        interstageModuleEvictions: 0,
       };
     }
 
     /**
      * Associate a `GPUShaderModule` with its WGPK 64-bit hash or numeric ID
-     * so descriptors referencing it hash deterministically.
+     * (and optional WGSL source text) so descriptors referencing it hash deterministically
+     * and participate in automatic VS<->PS inter-stage compatibility patching.
      *
      * @param {object} shaderModule
      * @param {bigint | number | string} hashOrId
+     * @param {string} [wgslCode]
      * @returns {string}
      */
-    registerShaderModule(shaderModule, hashOrId) {
-      return registerShaderModuleId(shaderModule, hashOrId);
+    registerShaderModule(shaderModule, hashOrId, wgslCode) {
+      return registerShaderModuleId(shaderModule, hashOrId, wgslCode);
+    }
+
+    /**
+     * Associate a `GPUShaderModule` with its WGSL source text so render pipelines using it
+     * can automatically detect and patch VS<->PS `@interpolate(flat)` / `@location(N)` mismatches.
+     *
+     * @param {object} shaderModule
+     * @param {string} wgslCode
+     * @returns {string}
+     */
+    registerShaderModuleSource(shaderModule, wgslCode) {
+      return registerShaderModuleSource(shaderModule, wgslCode);
+    }
+
+    _resolveStageWgslSource(stage, moduleObj, rawDescriptor, opts) {
+      if (stage === 'vertex') {
+        if (opts && typeof opts.vsCode === 'string' && opts.vsCode.length > 0) return opts.vsCode;
+        if (opts && typeof opts.vertexCode === 'string' && opts.vertexCode.length > 0) return opts.vertexCode;
+        if (rawDescriptor) {
+          if (typeof rawDescriptor.vsCode === 'string' && rawDescriptor.vsCode.length > 0) {
+            return rawDescriptor.vsCode;
+          }
+          if (typeof rawDescriptor.vertexCode === 'string' && rawDescriptor.vertexCode.length > 0) {
+            return rawDescriptor.vertexCode;
+          }
+          if (rawDescriptor.vertex && typeof rawDescriptor.vertex === 'object') {
+            if (typeof rawDescriptor.vertex.code === 'string' && rawDescriptor.vertex.code.length > 0) {
+              return rawDescriptor.vertex.code;
+            }
+            if (typeof rawDescriptor.vertex.wgsl === 'string' && rawDescriptor.vertex.wgsl.length > 0) {
+              return rawDescriptor.vertex.wgsl;
+            }
+          }
+        }
+      } else if (stage === 'fragment') {
+        if (opts && typeof opts.fsCode === 'string' && opts.fsCode.length > 0) return opts.fsCode;
+        if (opts && typeof opts.psCode === 'string' && opts.psCode.length > 0) return opts.psCode;
+        if (opts && typeof opts.fragmentCode === 'string' && opts.fragmentCode.length > 0) {
+          return opts.fragmentCode;
+        }
+        if (rawDescriptor) {
+          if (typeof rawDescriptor.fsCode === 'string' && rawDescriptor.fsCode.length > 0) {
+            return rawDescriptor.fsCode;
+          }
+          if (typeof rawDescriptor.psCode === 'string' && rawDescriptor.psCode.length > 0) {
+            return rawDescriptor.psCode;
+          }
+          if (typeof rawDescriptor.fragmentCode === 'string' && rawDescriptor.fragmentCode.length > 0) {
+            return rawDescriptor.fragmentCode;
+          }
+          if (rawDescriptor.fragment && typeof rawDescriptor.fragment === 'object') {
+            if (typeof rawDescriptor.fragment.code === 'string' && rawDescriptor.fragment.code.length > 0) {
+              return rawDescriptor.fragment.code;
+            }
+            if (typeof rawDescriptor.fragment.wgsl === 'string' && rawDescriptor.fragment.wgsl.length > 0) {
+              return rawDescriptor.fragment.wgsl;
+            }
+          }
+        }
+      }
+
+      const fromModule = getRegisteredShaderModuleSource(moduleObj);
+      if (fromModule !== null) {
+        return fromModule;
+      }
+
+      // If this is a known G34 built-in fallback module and ShaderFallbackRouter is loaded,
+      // recover its template WGSL automatically so mixed fallback-VS + real-PS pairs still link cleanly.
+      const fallbackProfile = detectModuleFallbackProfile(moduleObj);
+      if (
+        fallbackProfile !== null &&
+        typeof globalThis !== 'undefined' &&
+        globalThis.PlayGta6ShaderFallbackRouter &&
+        globalThis.PlayGta6ShaderFallbackRouter.BUILTIN_FALLBACK_PROFILES
+      ) {
+        const templates = globalThis.PlayGta6ShaderFallbackRouter.BUILTIN_FALLBACK_PROFILES[fallbackProfile];
+        if (templates && typeof templates[stage] === 'string' && templates[stage].length > 0) {
+          return templates[stage];
+        }
+      }
+
+      return null;
+    }
+
+    _getCachedInterstageInterface(moduleObj, wgslCode, stage, entryPoint) {
+      const epKey = typeof entryPoint === 'string' && entryPoint.length > 0 ? entryPoint : '';
+      const wgslLen = wgslCode.length;
+      if (moduleObj && (typeof moduleObj === 'object' || typeof moduleObj === 'function')) {
+        const modEntry = moduleInterstageInterfaceCache.get(moduleObj);
+        if (
+          modEntry !== undefined &&
+          modEntry.wgslLen === wgslLen &&
+          modEntry.stage === stage &&
+          modEntry.epKey === epKey &&
+          modEntry.wgslHead === wgslCode.slice(0, 48) &&
+          modEntry.wgslTail === wgslCode.slice(-48)
+        ) {
+          return modEntry.parsed;
+        }
+      }
+
+      // Key by stage + entryPoint + length + 64-bit FNV-1a hash without retaining the raw WGSL string (#1077).
+      const wgslHash = fnv1a64Hex(wgslCode);
+      const wgslHead = wgslCode.slice(0, 48);
+      const wgslTail = wgslCode.slice(-48);
+      const cacheKey = `${stage}:${epKey}:${wgslLen}:${wgslHash}`;
+      const cached = this._interstageInterfaceCache.get(cacheKey);
+      if (
+        cached !== undefined &&
+        cached.wgslLen === wgslLen &&
+        cached.wgslHead === wgslHead &&
+        cached.wgslTail === wgslTail
+      ) {
+        // Refresh LRU recency
+        this._interstageInterfaceCache.delete(cacheKey);
+        this._interstageInterfaceCache.set(cacheKey, cached);
+        if (moduleObj && (typeof moduleObj === 'object' || typeof moduleObj === 'function')) {
+          moduleInterstageInterfaceCache.set(moduleObj, {
+            wgslLen,
+            wgslHead,
+            wgslTail,
+            stage,
+            epKey,
+            parsed: cached.parsed,
+          });
+        }
+        return cached.parsed;
+      }
+
+      const parsed = parseInterstageInterface(wgslCode, stage, epKey || null);
+      this._interstageInterfaceCache.set(cacheKey, {
+        wgslLen,
+        wgslHead,
+        wgslTail,
+        parsed,
+      });
+      while (this._interstageInterfaceCache.size > this._maxInterstageInterfaceCache) {
+        const oldestKey = this._interstageInterfaceCache.keys().next().value;
+        this._interstageInterfaceCache.delete(oldestKey);
+      }
+      if (moduleObj && (typeof moduleObj === 'object' || typeof moduleObj === 'function')) {
+        moduleInterstageInterfaceCache.set(moduleObj, {
+          wgslLen,
+          wgslHead,
+          wgslTail,
+          stage,
+          epKey,
+          parsed,
+        });
+      }
+      return parsed;
+    }
+
+    _applyInterstageCompatibility(effectiveDescriptor, rawDescriptor, opts) {
+      if (
+        !this._enableInterstagePatching ||
+        (opts && opts.enableInterstagePatching === false) ||
+        !effectiveDescriptor ||
+        !effectiveDescriptor.vertex ||
+        !effectiveDescriptor.vertex.module ||
+        !effectiveDescriptor.fragment ||
+        !effectiveDescriptor.fragment.module
+      ) {
+        return { descriptor: effectiveDescriptor, patched: false };
+      }
+
+      const vsModule = effectiveDescriptor.vertex.module;
+      const fsModule = effectiveDescriptor.fragment.module;
+      const vsCode = this._resolveStageWgslSource('vertex', vsModule, rawDescriptor, opts);
+      const fsCode = this._resolveStageWgslSource('fragment', fsModule, rawDescriptor, opts);
+      if (!vsCode || !fsCode) {
+        return { descriptor: effectiveDescriptor, patched: false };
+      }
+
+      const vsEntryPoint = effectiveDescriptor.vertex.entryPoint;
+      const fsEntryPoint = effectiveDescriptor.fragment.entryPoint;
+      const vsIface = this._getCachedInterstageInterface(vsModule, vsCode, 'vertex', vsEntryPoint);
+      const psIface = this._getCachedInterstageInterface(fsModule, fsCode, 'fragment', fsEntryPoint);
+      if (!vsIface || !psIface) {
+        return { descriptor: effectiveDescriptor, patched: false };
+      }
+
+      const analysis = analyzeInterstageCompatibilityFromInterfaces(vsIface, psIface);
+      if (!analysis.needsPatch) {
+        return { descriptor: effectiveDescriptor, patched: false };
+      }
+
+      const vsToken = resolveGpuHandleToken(vsModule) || `wgsl:${fnv1a64Hex(vsCode)}`;
+      const patchKey = `${vsToken}|${vsIface.entryPoint || 'vs_main'}|${analysis.patchSignature}`;
+
+      let cachedMod = this._interstagePatchedModules.get(patchKey);
+      if (cachedMod !== undefined) {
+        // Refresh LRU recency
+        this._interstagePatchedModules.delete(patchKey);
+        this._interstagePatchedModules.set(patchKey, cachedMod);
+        this._stats.interstageModuleCacheHits += 1;
+      } else {
+        if (typeof this._device.createShaderModule !== 'function') {
+          return { descriptor: effectiveDescriptor, patched: false };
+        }
+        const patchResult = patchInterstageWgsl(vsCode, fsCode, {
+          vsEntryPoint,
+          psEntryPoint: fsEntryPoint,
+          analysis,
+        });
+        if (!patchResult.patched) {
+          return { descriptor: effectiveDescriptor, patched: false };
+        }
+
+        const baseLabel =
+          typeof vsModule.label === 'string' && vsModule.label.length > 0
+            ? vsModule.label
+            : vsToken;
+        const patchedLabel = `${baseLabel}:interstage`;
+
+        let patchedModule;
+        try {
+          patchedModule = this._device.createShaderModule({
+            label: patchedLabel,
+            code: patchResult.vsCode,
+          });
+        } catch (_compileErr) {
+          // Never fail pipeline creation solely due to speculative inter-stage patching.
+          return { descriptor: effectiveDescriptor, patched: false };
+        }
+        if (
+          !patchedModule ||
+          (typeof patchedModule !== 'object' && typeof patchedModule !== 'function')
+        ) {
+          return { descriptor: effectiveDescriptor, patched: false };
+        }
+
+        // Register deterministic ID directly on the brand-new patchedModule without bumping
+        // global shaderModuleRegistryVersion (avoids invalidating warm fast-lookup caches for
+        // unrelated pipelines), and avoid pinning patched WGSL strings in WeakMap (#1077).
+        registeredObjectIds.set(patchedModule, `interstage:${patchKey}`);
+
+        cachedMod = {
+          module: patchedModule,
+          flatFixes: patchResult.flatFixes,
+          interpolateFixes: patchResult.interpolateFixes,
+          missingLocationFixes: patchResult.missingLocationFixes,
+          typeFixes: patchResult.typeFixes,
+          integerFlatFixes: patchResult.integerFlatFixes,
+          patchSignature: patchResult.patchSignature,
+        };
+        this._interstagePatchedModules.set(patchKey, cachedMod);
+        this._stats.interstageModuleCacheMisses += 1;
+
+        while (this._interstagePatchedModules.size > this._maxInterstageModules) {
+          const oldestKey = this._interstagePatchedModules.keys().next().value;
+          this._interstagePatchedModules.delete(oldestKey);
+          this._stats.interstageModuleEvictions += 1;
+        }
+      }
+
+      this._stats.interstagePatchedPipelines += 1;
+      this._stats.interstageFlatFixes += cachedMod.flatFixes;
+      this._stats.interstageMissingLocationFixes += cachedMod.missingLocationFixes;
+      this._stats.interstageInterpolateFixes += cachedMod.interpolateFixes;
+      this._stats.interstageTypeFixes += cachedMod.typeFixes;
+      this._stats.interstageIntegerFlatFixes += cachedMod.integerFlatFixes;
+
+      const patchedDescriptor = {
+        ...effectiveDescriptor,
+        vertex: {
+          ...effectiveDescriptor.vertex,
+          module: cachedMod.module,
+        },
+      };
+
+      return {
+        descriptor: patchedDescriptor,
+        patched: true,
+        patchSummary: cachedMod,
+      };
+    }
+
+    /**
+     * Return a detailed snapshot of VS<->PS inter-stage compatibility patching and
+     * bounded patched-module LRU cache telemetry.
+     */
+    getInterstageStats() {
+      return {
+        enabled: this._enableInterstagePatching,
+        patchedPipelines: this._stats.interstagePatchedPipelines,
+        flatFixes: this._stats.interstageFlatFixes,
+        interpolateFixes: this._stats.interstageInterpolateFixes,
+        missingLocationFixes: this._stats.interstageMissingLocationFixes,
+        typeFixes: this._stats.interstageTypeFixes,
+        integerFlatFixes: this._stats.interstageIntegerFlatFixes,
+        patchedModuleCacheSize: this._interstagePatchedModules.size,
+        maxPatchedModules: this._maxInterstageModules,
+        moduleCacheHits: this._stats.interstageModuleCacheHits,
+        moduleCacheMisses: this._stats.interstageModuleCacheMisses,
+        moduleCacheEvictions: this._stats.interstageModuleEvictions,
+        interfaceCacheSize: this._interstageInterfaceCache.size,
+        maxInterfaceCache: this._maxInterstageInterfaceCache,
+      };
     }
 
     _deviceVertexLimits() {
@@ -6341,6 +8123,8 @@
         this._generation += 1;
         this._renderPipelines.clear();
         this._computePipelines.clear();
+        this._interstagePatchedModules.clear();
+        this._interstageInterfaceCache.clear();
         this._inFlightRender.clear();
         this._inFlightCompute.clear();
         this._inFlightPriorities.clear();
@@ -6668,18 +8452,21 @@
       this._stats.renderMisses += 1;
       this._recordNormalizationStats(norm);
 
+      const interstage = this._applyInterstageCompatibility(effectiveDescriptor, descriptor, opts);
+      const compileDescriptor = interstage.descriptor;
+
       const canRetryAutoLayout =
-        effectiveDescriptor.layout !== 'auto' &&
+        compileDescriptor.layout !== 'auto' &&
         Boolean((opts && opts.retryWithAutoLayout === true) || norm.fallbackProfile !== null);
 
       const t0 = this._now();
       let pipeline;
       try {
-        pipeline = this._device.createRenderPipeline(effectiveDescriptor);
+        pipeline = this._device.createRenderPipeline(compileDescriptor);
       } catch (err) {
         if (canRetryAutoLayout) {
           const retryDescriptor = {
-            ...effectiveDescriptor,
+            ...compileDescriptor,
             layout: 'auto',
           };
           try {
@@ -6740,7 +8527,7 @@
         const emptyErr = new Error('createRenderPipeline returned empty pipeline');
         if (canRetryAutoLayout) {
           const retryDescriptor = {
-            ...effectiveDescriptor,
+            ...compileDescriptor,
             layout: 'auto',
           };
           try {
@@ -6936,8 +8723,11 @@
       this._stats.renderMisses += 1;
       this._recordNormalizationStats(norm);
 
+      const interstage = this._applyInterstageCompatibility(effectiveDescriptor, descriptor, opts);
+      const compileDescriptor = interstage.descriptor;
+
       const canRetryAutoLayout =
-        effectiveDescriptor.layout !== 'auto' &&
+        compileDescriptor.layout !== 'auto' &&
         Boolean((opts && opts.retryWithAutoLayout === true) || norm.fallbackProfile !== null);
 
       const t0 = this._now();
@@ -6946,7 +8736,7 @@
         try {
           let pipeline;
           try {
-            pipeline = this._device.createRenderPipeline(effectiveDescriptor);
+            pipeline = this._device.createRenderPipeline(compileDescriptor);
           } catch (err) {
             if (!canRetryAutoLayout) {
               this._recordPipelineError('render', err, {
@@ -6957,7 +8747,7 @@
               this._quarantineKey(key, 'render', err);
               throw err;
             }
-            const retryDescriptor = { ...effectiveDescriptor, layout: 'auto' };
+            const retryDescriptor = { ...compileDescriptor, layout: 'auto' };
             try {
               pipeline = this._device.createRenderPipeline(retryDescriptor);
               if (!pipeline) {
@@ -7074,11 +8864,11 @@
         return pipeline;
       };
 
-      const trackedPromise = invokeCreateAsync(effectiveDescriptor).then(
+      const trackedPromise = invokeCreateAsync(compileDescriptor).then(
         finishSuccess,
         (err) => {
           if (canRetryAutoLayout) {
-            const retryDescriptor = { ...effectiveDescriptor, layout: 'auto' };
+            const retryDescriptor = { ...compileDescriptor, layout: 'auto' };
             return invokeCreateAsync(retryDescriptor).then(
               (recoveredPipeline) => {
                 if (!recoveredPipeline) {
@@ -7896,6 +9686,8 @@
           }
           map.clear();
         }
+        this._interstagePatchedModules.clear();
+        this._interstageInterfaceCache.clear();
         this._invalidateFastLookups();
         this._hasNonDefaultPriority = false;
         this._stats.evictions += removed;
@@ -7997,6 +9789,15 @@
       this._stats.fallbackSamplerBindingsSynthesized = 0;
       this._stats.blendPipelineVariants = 0;
       this._stats.srgbPipelineVariants = 0;
+      this._stats.interstagePatchedPipelines = 0;
+      this._stats.interstageFlatFixes = 0;
+      this._stats.interstageMissingLocationFixes = 0;
+      this._stats.interstageInterpolateFixes = 0;
+      this._stats.interstageTypeFixes = 0;
+      this._stats.interstageIntegerFlatFixes = 0;
+      this._stats.interstageModuleCacheHits = 0;
+      this._stats.interstageModuleCacheMisses = 0;
+      this._stats.interstageModuleEvictions = 0;
       this._compileLatencyHead = 0;
       this._compileLatencyCount = 0;
       this._pipelineErrors.length = 0;
@@ -8026,6 +9827,8 @@
       this._renderPipelines.clear();
       this._computePipelines.clear();
       this._bindGroupLayouts.clear();
+      this._interstagePatchedModules.clear();
+      this._interstageInterfaceCache.clear();
       this._fallbackPipelineLayouts.clear();
       this._defaultSamplers.clear();
       this._inFlightRender.clear();
@@ -8196,6 +9999,9 @@
         fallbackSamplerBindingsSynthesized: this._stats.fallbackSamplerBindingsSynthesized,
         blendPipelineVariants: this._stats.blendPipelineVariants,
         srgbPipelineVariants: this._stats.srgbPipelineVariants,
+        interstagePatchedPipelines: this._stats.interstagePatchedPipelines,
+        interstageFlatFixes: this._stats.interstageFlatFixes,
+        interstageMissingLocationFixes: this._stats.interstageMissingLocationFixes,
         cacheBreakdown: {
           render: {
             hits: renderHits,
@@ -8261,6 +10067,8 @@
     DEFAULT_MAX_ERROR_HISTORY,
     DEFAULT_MAX_QUARANTINED_KEYS,
     DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
+    DEFAULT_MAX_INTERSTAGE_MODULES,
+    DEFAULT_MAX_INTERSTAGE_INTERFACE_CACHE,
     MAX_PIPELINE_ERROR_MESSAGE_LENGTH,
     DEFAULT_MAX_VERTEX_BUFFERS,
     DEFAULT_MAX_VERTEX_ATTRIBUTES,
@@ -8277,6 +10085,11 @@
     computeFastDescriptorHash,
     hashDescriptorKey,
     registerShaderModuleId,
+    registerShaderModuleSource,
+    getRegisteredShaderModuleSource,
+    parseInterstageInterface,
+    analyzeInterstageCompatibility,
+    patchInterstageWgsl,
     normalizeVisibility,
     normalizeFallbackProfile,
     normalizePipelinePriority,

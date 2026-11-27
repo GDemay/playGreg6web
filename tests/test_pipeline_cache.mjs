@@ -420,6 +420,9 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
     fallbackSamplerBindingsSynthesized: 0,
     blendPipelineVariants: 0,
     srgbPipelineVariants: 0,
+    interstagePatchedPipelines: 0,
+    interstageFlatFixes: 0,
+    interstageMissingLocationFixes: 0,
     cacheBreakdown: {
       render: { hits: 2, misses: 2, hitRate: 0.5 },
       compute: { hits: 1, misses: 1, hitRate: 0.5 },
@@ -908,6 +911,9 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
     fallbackSamplerBindingsSynthesized: 0,
     blendPipelineVariants: 0,
     srgbPipelineVariants: 0,
+    interstagePatchedPipelines: 0,
+    interstageFlatFixes: 0,
+    interstageMissingLocationFixes: 0,
     cacheBreakdown: {
       render: { hits: 0, misses: 0, hitRate: 0 },
       compute: { hits: 0, misses: 0, hitRate: 0 },
