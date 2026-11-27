@@ -522,9 +522,8 @@ const CRC32_TABLE = (() => {
 
 const FNV1A32_OFFSET_BASIS = 0x811c9dc5;
 const FNV1A32_PRIME = 0x01000193;
-const FNV1A64_OFFSET_BASIS = 0xcbf29ce484222325n;
-const FNV1A64_PRIME = 0x100000001b3n;
-const FNV1A64_MASK = 0xffffffffffffffffn;
+const FNV1A64_OFFSET_LOW = 0x84222325;
+const FNV1A64_OFFSET_HIGH = 0xcbf29ce4;
 
 function createSha256State() {
   const h = new Uint32Array(SHA256_INIT);
@@ -696,20 +695,29 @@ function createFnv1a32State() {
 }
 
 function createFnv1a64State() {
-  let hash = FNV1A64_OFFSET_BASIS;
+  let low = FNV1A64_OFFSET_LOW;
+  let high = FNV1A64_OFFSET_HIGH;
   return {
     reset() {
-      hash = FNV1A64_OFFSET_BASIS;
+      low = FNV1A64_OFFSET_LOW;
+      high = FNV1A64_OFFSET_HIGH;
     },
     update(bytes) {
-      let h = hash;
+      let lo = low;
+      let hi = high;
       for (let i = 0; i < bytes.byteLength; i += 1) {
-        h = ((h ^ BigInt(bytes[i])) * FNV1A64_PRIME) & FNV1A64_MASK;
+        lo = (lo ^ bytes[i]) >>> 0;
+        // FNV prime = 2^40 + 435. lo * 435 is exact in a Number
+        // (< 2^41); carry its upper word into the high half modulo 2^32.
+        const product = lo * 435;
+        hi = (Math.imul(hi, 435) + Math.imul(lo, 256) + Math.floor(product / 0x100000000)) >>> 0;
+        lo = product >>> 0;
       }
-      hash = h;
+      low = lo;
+      high = hi;
     },
     digestHex() {
-      return hash.toString(16).padStart(16, '0');
+      return high.toString(16).padStart(8, '0') + low.toString(16).padStart(8, '0');
     },
   };
 }

@@ -1462,6 +1462,37 @@ describe('incremental streaming chunk verification & schema diagnostics (W221)',
     }
   });
 
+  it('matches independent BigInt FNV64 across carries, subviews and chunk-hasher resets', () => {
+    const reference = (bytes) => {
+      let h = 0xcbf29ce484222325n;
+      for (const byte of bytes) h = ((h ^ BigInt(byte)) * 0x100000001b3n) & 0xffffffffffffffffn;
+      return h.toString(16).padStart(16, '0');
+    };
+    const inputs = [new Uint8Array(0), new Uint8Array(8193).fill(255)];
+    for (const size of [1, 7, 255, 256, 4097, 65537]) {
+      inputs.push(makeSyntheticPayload(size + 11, size).subarray(3, size + 3));
+    }
+    for (const payload of inputs) {
+      const expected = reference(payload);
+      assert.equal(computeDigest(payload, 'fnv1a64'), expected);
+      const chunkSize = 257;
+      const expectedChunkDigests = [];
+      for (let offset = 0; offset < payload.length; offset += chunkSize) {
+        expectedChunkDigests.push(reference(payload.subarray(offset, offset + chunkSize)));
+      }
+      const verifier = createIncrementalVerifier({
+        algorithm: 'fnv1a64', expectedDigest: expected, expectedSize: payload.length,
+        chunkSize, expectedChunkDigests,
+      });
+      for (let offset = 0; offset < payload.length; offset += 113) {
+        verifier.update(payload.subarray(offset, offset + 113));
+      }
+      const result = verifier.finalize();
+      assert.equal(result.digest, expected);
+      assert.equal(result.ok, true);
+    }
+  });
+
   it('guarantees single-shot vs multi-chunk streaming equivalence across algorithms, view types, and chunkings', async () => {
     const payload = makeSyntheticPayload(131072 + 373, 0x221); // ~128 KiB synthetic .pgim payload
     const algorithms = [
