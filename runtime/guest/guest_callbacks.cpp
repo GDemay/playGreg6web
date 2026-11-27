@@ -476,6 +476,9 @@ uint64_t get_proc_address_impl(uint64_t module, uint64_t name_or_ordinal) {
         found = win32::LookupExport(module, name);
     }
     if (found.address == 0) {
+        if (name.compare(0, 4, "Bink") == 0) {
+            pg6_bink_note_lookup_null(name.c_str());
+        }
         return 0;  // LookupExport set the last error
     }
     if (found.guest) {
