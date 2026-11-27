@@ -185,6 +185,9 @@
 #include <timeapi.h>
 #pragma comment(lib, "winmm.lib")
 #include "guest/minidump_writer.h"
+#ifdef _WIN32
+#include "guest/exit_backstop.h"
+#endif
 #else
 #include <execinfo.h>
 #include <pthread.h>
@@ -1518,44 +1521,22 @@ void write_outputs(bool print_summary) {
 // thread created at startup (no thread creation, heap or CRT lock needed when it fires) waits
 // kExitBackstopMs after arming, prints every thread's stack through the minidump helper and
 // terminates with the armed exit code.
-std::atomic<int> g_backstop_code{-1};
 #ifdef _WIN32
-constexpr DWORD kExitBackstopMs = 30000;
-HANDLE g_backstop_event = nullptr;
-
-// stderr without the CRT stream lock (a stuck thread may hold it).
-void raw_stderr(const char* text) {
-    DWORD written = 0;
-    WriteFile(GetStdHandle(STD_ERROR_HANDLE), text, static_cast<DWORD>(std::strlen(text)), &written, nullptr);
-}
-
-DWORD WINAPI exit_backstop_main(void*) {
-    WaitForSingleObject(g_backstop_event, INFINITE);
-    Sleep(kExitBackstopMs);
-    raw_stderr("[harness] exit backstop: the fault/stop report path did not finish within 30 s; thread stacks follow\n");
-    guest::minidump::Writer::dump_threads(nullptr, "report path stuck", 20000);
-    raw_stderr("[harness] exit backstop: terminating\n");
-    const int code = g_backstop_code.load();
-    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code >= 0 ? code : kExitWatchdog));
-    return 0;
-}
+using guest::backstop::raw_stderr;
 
 void start_exit_backstop() {
-    g_backstop_event = CreateEventA(nullptr, TRUE, FALSE, nullptr);
-    if (g_backstop_event == nullptr) return;
-    HANDLE t = CreateThread(nullptr, 64 * 1024, &exit_backstop_main, nullptr, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
-    if (t != nullptr) CloseHandle(t);
+    guest::minidump::Writer::init();
+    const std::string path = guest::minidump::select_path(g_options.report, "host", "report_stuck",
+                                                          static_cast<uint32_t>(GetCurrentProcessId()));
+    guest::backstop::start(path.c_str(), kExitWatchdog);
 }
 
-void arm_exit_backstop(int code) {
-    int expected = -1;
-    if (g_backstop_code.compare_exchange_strong(expected, code) && g_backstop_event != nullptr) SetEvent(g_backstop_event);
-}
+void arm_exit_backstop(int code) { guest::backstop::arm(code); }
 #else
+std::atomic<int> g_backstop_code{-1};
 void start_exit_backstop() {}
 void arm_exit_backstop(int code) { g_backstop_code.store(code); }
 #endif
-
 [[noreturn]] void terminate_now(int code) {
     playgta6::guest::host_input::silence_host_rumble();
     std::fflush(nullptr);
