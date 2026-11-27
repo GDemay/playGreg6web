@@ -352,3 +352,40 @@ class StopRowTests(unittest.TestCase):
             self.assertIsNone(bs.feed_stop(run, info, self.HS))
             self.assertIsNone(bs.feed_stop(run, None))
             self.assertFalse((Path(t) / "stops_seen.json").exists())
+
+
+class TimingFieldsTests(unittest.TestCase):
+    @staticmethod
+    def rep(p99_bucket="lt16", nulls=2, flush_ns=50_000_000):
+        bk = {k: 0 for k in ("lt0.5", "lt1", "lt2", "lt4", "lt8", "lt16", "lt32", "ge32")}
+        bk["lt0.5"] = 98
+        bk[p99_bucket] += 2
+        blk = {"count": 100, "max_overshoot_ms": 40.0 if p99_bucket == "ge32" else 12.0, "overshoot_ms_buckets": bk}
+        r = base()
+        r["guest_sleep"] = dict(blk)
+        r["guest_timed_wait"] = {"timed_out": dict(blk), "signalled": {"count": 5}}
+        r["bink"] = {"binding": "shim", "total_calls": 9, "lookup_null": nulls, "lookup_null_names": ["BinkFoo"],
+                     "open_log": [{"path": "a"}]}
+        r["gpu_work"]["flush_buffer_ns"] = flush_ns
+        r["gpu_work"]["flush_uniform_ns"] = 10_000_000
+        return r
+
+    def test_summary_lines(self):
+        out = bs.summarize(self.rep())
+        self.assertIn("guest_sleep: 100 calls, overshoot p50 <=0.5 ms, p99 <=12.0 ms", out)
+        self.assertIn("guest_timed_wait: 100 calls", out)
+        self.assertIn("bink lookups: 2 null (BinkFoo), 1 opens logged", out)
+        self.assertIn("gpu flush: flush_buffer 10.000 ms/frame, flush_uniform 2.000 ms/frame", out)
+
+    def test_absent_fields_skipped(self):
+        out = bs.summarize(base())
+        self.assertNotIn("guest_sleep", out)
+        self.assertNotIn("gpu flush", out)
+
+    def test_compare_directions(self):
+        out = bs.compare(self.rep(), self.rep(p99_bucket="ge32", nulls=5, flush_ns=10_000_000))
+        rows = {ln.split()[0]: ln for ln in out.splitlines() if ln.startswith(("guest_", "bink.", "gpu_work.flush"))}
+        self.assertIn("REGRESSION", rows["bink.lookup_null"])
+        self.assertIn("improvement", rows["gpu_work.flush_buffer_ms_per_frame"])
+        self.assertIn("REGRESSION", rows["guest_sleep.overshoot_p99_ms"])
+        self.assertIn("REGRESSION", rows["guest_timed_wait.overshoot_p99_ms"])
