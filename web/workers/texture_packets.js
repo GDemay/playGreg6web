@@ -15,8 +15,8 @@
 //   calls with every field cleanly overwritten on each upload (W303).
 // - Sub-region dirty-rect bounds clamping & validation against mip dimensions (respecting 4x4
 //   physical mip sizes for BC1..BC7 tail mips) to prevent WebGPU out-of-bounds validation errors.
-// - Safe `SharedArrayBuffer`-backed view copying before `queue.writeTexture` /
-//   `copyBufferToTexture`.
+// - Direct SharedArrayBuffer writes when WebGPU accepts them; cached legacy TypeError
+//   fallback and huge/chunked uploads retain bounded snapshots before queue writes.
 // - Sanitized telemetry counters (`createTexture2Count`, `rowPitchRepackCount`, `sabCopyCount`,
 //   `uploadCount`, `uploadsCount`, `uploadBytes`, `uploadBytesTotal`, `reusedDescriptorCount`,
 //   `clampedSubRegionCount`, `zeroCopyUploads`, `scratchRepackUploads`,
@@ -2141,6 +2141,8 @@
       this._reusableDecodeCreate1 = createTextureDecodeScratch(false);
       this._reusableDecodeCreate2 = createTextureDecodeScratch(true);
       this._pendingStagedTextures = new Set();
+      this._sharedDirectQueue = null;
+      this._sharedDirectSupported = null;
 
       this.stats = this._createEmptyStats();
       this.lastError = null;
@@ -2417,6 +2419,8 @@
       this._textureMeta.clear();
       this._textureObjMeta = new WeakMap();
       this._pendingStagedTextures.clear();
+      this._sharedDirectQueue = null;
+      this._sharedDirectSupported = null;
       this._scratchPool.reset();
       this._clearReusableDescriptorRefs();
       this.stats = this._createEmptyStats();
@@ -2438,6 +2442,8 @@
       this._textureMeta.clear();
       this._textureObjMeta = new WeakMap();
       this._pendingStagedTextures.clear();
+      this._sharedDirectQueue = null;
+      this._sharedDirectSupported = null;
       this._scratchPool.destroy();
       this._clearReusableDescriptorRefs();
       this.stats = this._createEmptyStats();
@@ -2980,11 +2986,6 @@
         }
       }
 
-      const prepared = this._prepareDirectWriteDataInto(this._reusablePreparedData, src);
-      if (prepared.copiedFromSab) {
-        this.stats.sabCopyCount += 1;
-      }
-
       const reusedDest = this._fillCopyTexture(
         texture,
         effMipLevel,
@@ -2996,7 +2997,36 @@
       const reusedLayout = this._fillDataLayout(layoutOffset, layoutBytesPerRow, layoutRowsPerImage);
       const reusedSize = hasSize ? this._fillCopySize(effW, effH, effD) : rawSizeFallback;
 
-      queue.writeTexture(reusedDest, prepared.data, reusedLayout, reusedSize);
+      // https://www.w3.org/TR/webgpu/#dom-gpuqueue-writetexture (§19.2)
+      // accepts AllowSharedBufferSource and copies its contents on
+      // the content timeline, before this call returns. Probe using the actual
+      // write; older implementations synchronously reject SAB views with TypeError.
+      // Huge/chunked uploads retain their existing bounded scratch path above.
+      if (queue !== this._sharedDirectQueue) {
+        this._sharedDirectQueue = queue;
+        this._sharedDirectSupported = null;
+      }
+      let wroteShared = false;
+      if (src.byteLength <= chunkMax && isSharedBuffer(src.buffer) && this._sharedDirectSupported !== false) {
+        try {
+          queue.writeTexture(reusedDest, src, reusedLayout, reusedSize);
+          this._sharedDirectSupported = true;
+          wroteShared = true;
+        } catch (error) {
+          if (!(error instanceof TypeError) && (!error || error.name !== 'TypeError')) throw error;
+          this._sharedDirectSupported = false;
+        }
+      }
+      const prepared = this._reusablePreparedData;
+      if (wroteShared) {
+        prepared.data = src;
+        prepared.copiedFromSab = false;
+        prepared.reusedScratch = false;
+      } else {
+        this._prepareDirectWriteDataInto(prepared, src);
+        if (prepared.copiedFromSab) this.stats.sabCopyCount += 1;
+        queue.writeTexture(reusedDest, prepared.data, reusedLayout, reusedSize);
+      }
 
       this.stats.reusedDescriptorCount += 1;
       this._recordUploadCount();
@@ -3019,8 +3049,8 @@
 
     /**
      * Safe `queue.writeTexture` wrapper that takes a zero-copy direct upload path
-     * for non-shared views, copies `SharedArrayBuffer`-backed views into a
-     * reusable non-shared scratch `Uint8Array`, clamps sub-region dirty rects
+     * for non-shared and supported nonchunked shared views, with a reusable
+     * snapshot fallback for legacy queues. Clamps sub-region dirty rects
      * against mip bounds, and reuses pre-allocated WebGPU descriptor structs.
      */
     writeTexture(destination, data, dataLayout, size, textureId) {

@@ -314,6 +314,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 ---
 
+- [ ] **Web performance #2081 — Nonchunked shared texture sources** — `IN PROGRESS` (#2081, @GDemay). Native WebGPU shared-source writes avoid application snapshots when supported; cached legacy fallback and huge-upload chunking preserved. No game FPS claim.
+
 ## Track 5: Browser Shell, Streaming I/O & Audio (`web/`, `server/`, `tools/`, JS + Python + Rust)
 **Goal:** Fast, resilient browser loading, streaming, caching, and audio playback.
 
