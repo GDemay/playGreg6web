@@ -3,6 +3,7 @@
 #include "guest/com_bridge.h"
 #include "os/guest_window.h"
 #include "os/vmem.h"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -80,6 +81,23 @@ int main(int argc,char** argv) {
   if(e.size()<sizeof(playgta6::GpuPacketHeader)+sizeof(w))throw std::runtime_error("tail missing");
   std::memcpy(&w,e.data()+sizeof(playgta6::GpuPacketHeader),sizeof(w));
   if(w.dst_offset!=(bytes/4096)*4096||w.data_len!=bytes%4096||e.data()[e.size()-1]!=77)throw std::runtime_error("tail wrong");
+  // Verification must fully initialize/read fragmented staging, including an unmarked page.
+  const uint64_t misses=gw::verify_misses();
+  *static_cast<uint8_t*>(gw::translate(cpu+99))=55;
+  gw::set_write_marks_verified(true);
+  gpu::CommandEncoder verified;flush(verified);
+  if(verified.size()!=sizeof(playgta6::GpuPacketHeader)+sizeof(w)+4096)throw std::runtime_error("verification packet missing");
+  std::memcpy(&w,verified.data()+sizeof(playgta6::GpuPacketHeader),sizeof(w));
+  if(w.dst_offset!=0||w.data_len!=4096||verified.data()[sizeof(playgta6::GpuPacketHeader)+sizeof(w)+99]!=55||gw::verify_misses()!=misses+1)throw std::runtime_error("fragmented verification failed");
+  gw::set_write_marks_verified(false);
+  // Direct/null and unscanned callers retain the original full staging path.
+  for(unsigned direct=0;direct<2;++direct){
+   if(!com::write_guest(cpu+100,static_cast<uint8_t>(66+direct)))throw std::runtime_error("direct write failed");
+   gpu::CommandEncoder out;gw::MarkPass unscanned;unscanned.begin();
+   if(r->flush_shadow(out,direct?&unscanned:nullptr)!=4096||out.size()!=sizeof(playgta6::GpuPacketHeader)+sizeof(w)+4096)throw std::runtime_error("direct flush failed");
+   std::memcpy(&w,out.data()+sizeof(playgta6::GpuPacketHeader),sizeof(w));
+   if(w.dst_offset!=0||w.data_len!=4096||out.data()[sizeof(playgta6::GpuPacketHeader)+sizeof(w)+100]!=66+direct)throw std::runtime_error("direct payload failed");
+  }
   if(!gw::unmap_slot(base+mapped_bytes-gw::kSlotBytes))throw std::runtime_error("unmap failed");
   gpu::CommandEncoder hole;flush(hole);if(hole.size())throw std::runtime_error("unmapped page changed");
  }
