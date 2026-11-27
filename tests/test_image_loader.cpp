@@ -432,6 +432,51 @@ void test_roundtrip_preferred_base() {
     CHECK(!unload_image(arena, li));
 }
 
+// Lazy commit (#2002): sections of >= 64 KiB are committed on first touch; the loader's direct
+// host-side payload read must still land (HostWriteScope), not be lost or fail.
+void test_large_section_lazy_commit() {
+    const bool was_lazy = lazy_commit_enabled();
+    set_lazy_commit(true);
+    Img img;
+    img.size = 0x42000;
+    img.entry = 0x1000;
+    img.flags = kFlagHeadersMapped;
+    img.secs = {
+        {"<headers>", 0, 0x400, R, kSectionFlagHeaders, pattern(11, 0x100), 0},
+        {".data", 0x1000, 0x30000, R | W, 0, pattern(12, 0x30000), 0xC0000040},
+        {".rdata", 0x31000, 0x11000, R, 0, pattern(13, 0x11000), 0x40000040},
+    };
+    const std::vector<uint8_t> bytes = write_container(img);
+    const std::string path = "test_image_loader_lazy.pgim";
+    std::FILE* wf = std::fopen(path.c_str(), "wb");
+    CHECK(wf != nullptr);
+    if (wf == nullptr) {
+        set_lazy_commit(was_lazy);
+        return;
+    }
+    std::fwrite(bytes.data(), 1, bytes.size(), wf);
+    std::fclose(wf);
+    std::FILE* rf = std::fopen(path.c_str(), "rb");
+    CHECK(rf != nullptr);
+    if (rf != nullptr) {
+        // Like the boot loader's file reader: fread writes straight into guest memory.
+        FunctionImageReader reader(bytes.size(), [rf](uint64_t off, void* dst, size_t len) {
+            return std::fseek(rf, static_cast<long>(off), SEEK_SET) == 0 &&
+                   std::fread(dst, 1, len, rf) == len;
+        });
+        VirtualMemoryArena arena(kDefaultArenaBase, kTestArena);
+        LoadedImage li;
+        const ImageError err = load_image(reader, arena, LoadOptions{}, li);
+        CHECK(err.ok());
+        if (err.ok()) {
+            VERIFY_MEMORY(arena, img, li);
+            CHECK(unload_image(arena, li));
+        }
+        std::fclose(rf);
+    }
+    std::remove(path.c_str());
+    set_lazy_commit(was_lazy);
+}
 void test_rebase() {
     const Img img = fixture();
     const std::vector<uint8_t> bytes = write_container(img);
@@ -1096,6 +1141,7 @@ int main() {
     test_primitives();
     test_parse_image_views();
     test_roundtrip_preferred_base();
+    test_large_section_lazy_commit();
     test_rebase();
     test_relocations_stripped();
     test_omitted_executable_bytes();

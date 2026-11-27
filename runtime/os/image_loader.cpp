@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "os/vmem.h"
 #include "os/win32_loader.h"
 
 namespace playgta6::os::pgim {
@@ -594,6 +595,9 @@ ImageError load_image(ImageReader& reader,
             if (dst == nullptr) {
                 return fail(make_error(ImageErrorCode::WriteFailed, i, s.rva + done));
             }
+            // The reader may write via the kernel (fread/ReadFile): under lazy commit that needs the
+            // pages materialised, which HostWriteScope guarantees.
+            const HostWriteScope host_write(dst, n);
             if (!reader.read(s.payload_offset + done, dst, n)) {
                 return fail(make_error(ImageErrorCode::ReadFailed, i, s.payload_offset + done));
             }
