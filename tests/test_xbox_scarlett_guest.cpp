@@ -3342,6 +3342,38 @@ void test_dstorage_same_file_parallel_reads_and_buffer_reuse() {
 
 }  // namespace
 
+// dstorage_debug_state(): an enqueued status that was not submitted shows as pending in its queue
+// and its array; once submitted and run, neither is listed.
+void test_dstorage_debug_state() {
+    Fixture fx;
+    const std::vector<uint8_t> data = pattern_data(4096);
+    os::scarlett::register_dstorage_virtual_file("G:\\data\\debug.bin", data);
+    const uint64_t factory = fx.factory();
+    const uint64_t file = fx.open_file(factory, u"G:\\data\\debug.bin");
+    const uint64_t queue = fx.create_queue(factory, 8);
+    const uint64_t status = fx.create_status(factory, 4);
+    const uint64_t dest = com::guest_alloc(4096);
+    fx.enqueue(queue, file_request(file, 0, 4096, dest, 4096));
+    fx.vcall(queue, 4, {I(status), I(2)});  // EnqueueStatus, no Submit yet
+    std::string st = ga::dstorage_debug_state();
+    CHECK(st.find("pending 2 submitted 0") != std::string::npos);
+    CHECK(st.find("1 pending, oldest index 2") != std::string::npos);
+    fx.vcall(queue, 6);  // Submit
+    CHECK(fx.wait_complete(status, 2));
+    for (int i = 0; i < 200 && ga::dstorage_debug_state().find("worker idle") == std::string::npos; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    st = ga::dstorage_debug_state();
+    CHECK(st.find("worker idle") != std::string::npos);
+    CHECK(st.find("status array") == std::string::npos);
+    CHECK(st.find("queue ") == std::string::npos);
+    fx.vcall(queue, 8);
+    CHECK(fx.vcall(status, 2) == 0);
+    CHECK(fx.vcall(queue, 2) == 0);
+    CHECK(fx.vcall(file, 2) == 0);
+    CHECK(fx.vcall(factory, 2) == 1);
+}
+
 int main() {
     test_inflate();
     test_inflate_lz77_fast_paths();
@@ -3351,6 +3383,7 @@ int main() {
     test_dstorage_option_parsing();
     test_physical_page_scatter();
     test_requests_wait_for_submit();
+    test_dstorage_debug_state();
     test_compressed_and_memory_sources();
     test_bcpack_requests();
     test_errors_and_error_record();
