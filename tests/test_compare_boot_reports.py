@@ -1783,5 +1783,102 @@ class PhaseDeltaAndMultiRunTests(unittest.TestCase):
             self.assertNotIn("playgta6_secret_dir_", err3)
 
 
+class EnhancedBrowserMemoryAndPipelineMetricsTests(unittest.TestCase):
+    tol = cbr.Tolerances()
+
+    def test_gpu_memory_renderer_memory_reflection_and_pipeline_dump_deltas(self):
+        mib = 1024 * 1024
+        ra = make_browser_report(gpu_validation_errors=5)
+        rb = make_browser_report(gpu_validation_errors=1)
+        ra.update({
+            "first_visible_frame_s": 14.0,
+            "present_fps_avg": 30.0,
+            "fps_p50": 28.5,
+            "gpu_memory": {
+                "vramBytes": 600 * mib,
+                "totalLiveGpuBytes": 300 * mib,
+                "peakBufferBytes": 120 * mib,
+                "peakTextureBytes": 240 * mib,
+            },
+            "renderer_memory": {"wasmLinearMemoryBytes": 1024 * mib},
+            "reflection_join_failures": 7,
+            "pipeline_dump": {"dumped": 40, "failed": 3},
+            "scripted_inputs_sent": 4,
+        })
+        rb.update({
+            "first_visible_frame_s": 9.0,
+            "present_fps_avg": 45.0,
+            "fps_p50": 42.0,
+            "memory_stats": {
+                "vram_peak_mb": 450.0,
+                "total_live_gpu_bytes": 200 * mib,
+                "peak_buffer_bytes": 80 * mib,
+                "peak_texture_bytes": 160 * mib,
+                "wasm_linear_memory_bytes": 768 * mib,
+            },
+            "reflection_join_failures": 0,
+            "pipeline_dump": {"dumped": 55, "failed": 0},
+            "scripted_inputs_sent": 8,
+        })
+
+        c = cbr.compare(ra, rb, self.tol)
+        result = cbr.to_result(c)
+        td = result["telemetry_delta"]
+
+        self.assertEqual(td["fps_p50_window"]["a"], 28.5)
+        self.assertEqual(td["fps_p50_window"]["b"], 42.0)
+        self.assertEqual(td["gpu_vram_mb"]["a"], 600.0)
+        self.assertEqual(td["gpu_vram_mb"]["b"], 450.0)
+        self.assertEqual(td["gpu_vram_mb"]["status"], "improved")
+        self.assertEqual(td["gpu_live_mb"]["delta"], -100.0)
+        self.assertEqual(td["gpu_peak_buffer_mb"]["delta"], -40.0)
+        self.assertEqual(td["gpu_peak_texture_mb"]["delta"], -80.0)
+        self.assertEqual(td["wasm_linear_memory_mb"]["delta"], -256.0)
+        self.assertEqual(td["reflection_join_failures"]["a"], 7)
+        self.assertEqual(td["reflection_join_failures"]["b"], 0)
+        self.assertEqual(td["reflection_join_failures"]["status"], "improved")
+        self.assertEqual(td["pipeline_dump_count"]["delta"], 15)
+        self.assertEqual(td["pipeline_dump_failed"]["b"], 0)
+        self.assertEqual(td["pipeline_dump_failed"]["status"], "improved")
+        self.assertEqual(td["scripted_inputs_sent"]["delta"], 4)
+
+        # Multi-run summary includes all new optional metrics cleanly
+        multi = cbr.build_multi_run_summary([ra, rb], labels=["before", "after"])
+        for key in (
+            "gpu_vram_mb",
+            "gpu_peak_texture_mb",
+            "wasm_linear_memory_mb",
+            "reflection_join_failures",
+            "pipeline_dump_count",
+            "pipeline_dump_failed",
+            "scripted_inputs_sent",
+        ):
+            self.assertIn(key, multi["metrics"])
+
+        md = cbr.format_multi_run_markdown(multi)
+        self.assertIn("`gpu_vram_mb`", md)
+        self.assertIn("`reflection_join_failures`", md)
+
+    def test_new_optional_metrics_reject_invalid_types_and_paths(self):
+        ra = make_report()
+        rb = make_report()
+        ra["memory_stats"] = {
+            "vram_peak_mb": r"C:\Users\secret\dump.bin",
+            "peak_texture_bytes": True,
+            "peak_buffer_bytes": -10,
+            "wasm_linear_memory_bytes": float("nan"),
+        }
+        ra["reflection_join_failures"] = "/home/alice/secret"
+        ra["pipeline_dump"] = {"dumped": False, "failed": float("inf")}
+        ra["scripted_inputs_sent"] = -3
+
+        c = cbr.compare(ra, rb, self.tol)
+        res = cbr.to_result(c)
+        self.assertNotIn("telemetry_delta", res)
+        serialized = json.dumps(res)
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("alice", serialized)
+
+
 if __name__ == "__main__":
     unittest.main()

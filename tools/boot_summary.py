@@ -354,6 +354,69 @@ def _identity(report: dict[str, Any]) -> list[str]:
     return out
 
 
+def _is_num(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _first_num(*vals: Any) -> float | None:
+    for v in vals:
+        if _is_num(v):
+            return float(v)
+    return None
+
+
+def _gpu_memory_dict(report: dict[str, Any]) -> dict[str, Any]:
+    s = _d(report.get("summary"))
+    for cand in (report.get("gpu_memory"), s.get("gpu_memory"), report.get("memory_stats"), s.get("memory_stats")):
+        if isinstance(cand, dict) and cand:
+            return cand
+    return {}
+
+
+def _renderer_memory_dict(report: dict[str, Any]) -> dict[str, Any]:
+    s = _d(report.get("summary"))
+    for cand in (report.get("renderer_memory"), s.get("renderer_memory")):
+        if isinstance(cand, dict) and cand:
+            return cand
+    return {}
+
+
+def _pipeline_dump_dict(report: dict[str, Any]) -> dict[str, Any]:
+    s = _d(report.get("summary"))
+    for cand in (report.get("pipeline_dump"), s.get("pipeline_dump")):
+        if isinstance(cand, dict) and cand:
+            return cand
+    return {}
+
+
+def _reflection_join_failures(report: dict[str, Any]) -> int | None:
+    c = _d(report.get("counters"))
+    s = _d(report.get("summary"))
+    ne = _d(report.get("native_executor"))
+    gw = _d(report.get("gpu_work"))
+    v = _first_num(
+        report.get("reflection_join_failures"),
+        c.get("reflection_join_failures"),
+        s.get("reflection_join_failures"),
+        s.get("reflectionJoinFailures"),
+        ne.get("reflection_join_failures"),
+        gw.get("reflection_join_failures"),
+    )
+    return int(v) if v is not None else None
+
+
+def _browser_gpu_validation_errors(report: dict[str, Any]) -> int | None:
+    c = _d(report.get("counters"))
+    s = _d(report.get("summary"))
+    v = _first_num(
+        c.get("gpu_validation_errors"),
+        s.get("validationErrorCount"),
+        s.get("gpu_validation_errors"),
+        report.get("gpu_validation_errors"),
+    )
+    return int(v) if v is not None else None
+
+
 def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_stops: str | None = None) -> str:
     L: list[str] = []
     L += _identity(report)
@@ -382,17 +445,34 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
                  f"({int(f['n'])} samples)")
     L += frame_time_lines(report)
     L += gpu_phase_lines(report)
+    summary_sec = _d(report.get("summary"))
     if report.get("present_fps_avg") is not None:
+        fps_p50 = _first_num(report.get("fps_p50_window"), report.get("fps_p50"), summary_sec.get("fps_p50_window"))
         L.append(f"browser fps: avg {_n(report.get('present_fps_avg')):.1f}, steady {_n(report.get('fps_steady_avg')):.1f}, "
-                 f"p50 window {_n(report.get('fps_p50_window')):.1f}, max window {_n(report.get('fps_max_window')):.1f}, "
+                 f"p50 window {_n(fps_p50):.1f}, max window {_n(report.get('fps_max_window')):.1f}, "
                  f">=30 fps in {_n(report.get('windows_ge_30fps_pct')):.0f}% of windows")
         L.append(f"browser: first visible frame {_n(report.get('first_visible_frame_s')):.1f}s, black loading "
                  f"{_n(report.get('black_loading_s')):.1f}s, heap {_n(report.get('js_heap_used_mb')):.0f}/"
                  f"{_n(report.get('js_heap_total_mb')):.0f} MB, adapter {report.get('gpu_adapter')}")
+    elif any(_is_num(report.get(k)) or _is_num(summary_sec.get(k)) for k in ("first_visible_frame_s", "black_loading_s")):
+        fvf_s = _first_num(report.get("first_visible_frame_s"), summary_sec.get("first_visible_frame_s"))
+        bl_s = _first_num(report.get("black_loading_s"), summary_sec.get("black_loading_s"))
+        hu = _first_num(report.get("js_heap_used_mb"), summary_sec.get("js_heap_used_mb"))
+        ht = _first_num(report.get("js_heap_total_mb"), summary_sec.get("js_heap_total_mb"))
+        L.append(f"browser: first visible frame {_n(fvf_s):.1f}s, black loading {_n(bl_s):.1f}s, "
+                 f"heap {_n(hu):.0f}/{_n(ht):.0f} MB, adapter {report.get('gpu_adapter') or summary_sec.get('gpu_adapter')}")
     ne = _d(report.get("native_executor"))
     gw = _d(report.get("gpu_work"))
-    errs = {k: ne.get(k) for k in ("device_errors", "device_lost", "op_errors", "packet_errors", "present_failures")
-            if _n(ne.get(k))}
+    errs: dict[str, Any] = {
+        k: ne.get(k) for k in ("device_errors", "device_lost", "op_errors", "packet_errors", "present_failures")
+        if _n(ne.get(k))
+    }
+    gve = _browser_gpu_validation_errors(report)
+    if gve is not None and gve > 0:
+        errs["gpu_validation_errors"] = gve
+    rjf = _reflection_join_failures(report)
+    if rjf is not None and rjf > 0:
+        errs["reflection_join_failures"] = rjf
     L.append("gpu errors: " + (", ".join(f"{k}={_i(v)}" for k, v in errs.items()) if errs else "none")
              + (f"; draws no_shader_module={_i(gw.get('draws_no_shader_module'))}"
                 if _n(gw.get("draws_no_shader_module")) else ""))
@@ -438,6 +518,51 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
         ga = _d(mb.get("guest_arena"))
         L.append(f"memory: arena peak {_bytes(ga.get('arena_peak_committed'))}, host private "
                  f"{_bytes(mb.get('host_private_bytes'))}, gpu visible {_bytes(mb.get('gpu_visible_bytes'))}")
+    gm = _gpu_memory_dict(report)
+    rm = _renderer_memory_dict(report)
+    if gm or rm:
+        parts: list[str] = []
+        vram_b = _first_num(gm.get("vramBytes"), gm.get("vram_bytes"))
+        if vram_b is not None:
+            parts.append(f"vram {_bytes(vram_b)}")
+        elif _is_num(gm.get("vram_peak_mb")):
+            parts.append(f"vram peak {_n(gm.get('vram_peak_mb')):.1f} MiB")
+        live_b = _first_num(gm.get("totalLiveGpuBytes"), gm.get("total_live_gpu_bytes"))
+        if live_b is not None:
+            parts.append(f"live {_bytes(live_b)}")
+        pk_buf = _first_num(gm.get("peakBufferBytes"), gm.get("peak_buffer_bytes"))
+        if pk_buf is not None:
+            parts.append(f"peak buf {_bytes(pk_buf)}")
+        pk_tex = _first_num(gm.get("peakTextureBytes"), gm.get("peak_texture_bytes"))
+        if pk_tex is not None:
+            parts.append(f"peak tex {_bytes(pk_tex)}")
+        stg = _first_num(gm.get("stagingPoolBytes"), gm.get("staging_pool_bytes"))
+        if stg is not None:
+            parts.append(f"staging {_bytes(stg)}")
+        wasm_mem = _first_num(rm.get("wasmLinearMemoryBytes"), rm.get("wasm_linear_memory_bytes"), gm.get("wasm_linear_memory_bytes"))
+        if wasm_mem is not None:
+            parts.append(f"wasm {_bytes(wasm_mem)}")
+        if parts:
+            L.append("gpu memory: " + ", ".join(parts))
+    pd = _pipeline_dump_dict(report)
+    if pd:
+        pd_bits: list[str] = []
+        for label_k, keys in (
+            ("dumped", ("dumped", "count", "total", "pipelines")),
+            ("render", ("render_pipelines", "render")),
+            ("compute", ("compute_pipelines", "compute")),
+            ("failed", ("failed", "errors")),
+        ):
+            val = _first_num(*(pd.get(k) for k in keys))
+            if val is not None:
+                pd_bits.append(f"{label_k}={_i(val)}")
+        if pd_bits:
+            L.append("pipeline dump: " + ", ".join(pd_bits))
+    elif _d(report.get("boot_options")).get("dump_pipelines_dir"):
+        L.append("pipeline dump: enabled")
+    si = _first_num(report.get("scripted_inputs_sent"), summary_sec.get("scripted_inputs_sent"), c.get("scripted_inputs_sent"))
+    if si is not None:
+        L.append(f"scripted inputs: {_i(si)} sent")
     pw = _d(report.get("pipeline_prewarm"))
     if pw:
         L.append(f"prewarm: {_i(pw.get('prewarmed'))} built, {_i(pw.get('hit_before_use'))} hit before use, "
@@ -462,10 +587,49 @@ def numeric_facts(report: dict[str, Any]) -> dict[str, float]:
                       ("gpu_work", ("draws_emitted", "draws_no_shader_module", "draws_dropped_by_bridge"))):
         for k in keys:
             v = _d(report.get(sec)).get(k)
-            if isinstance(v, (int, float)) and not isinstance(v, bool):
+            if _is_num(v):
                 facts[f"{sec}.{k}"] = float(v)
+    summary_sec = _d(report.get("summary"))
+    for k in ("present_fps_avg", "fps_steady_avg", "fps_p50_window", "fps_max_window",
+              "windows_ge_30fps_pct", "first_visible_frame_s", "black_loading_s",
+              "js_heap_used_mb", "js_heap_total_mb", "scripted_inputs_sent"):
+        v = _first_num(report.get(k), summary_sec.get(k))
+        if v is not None:
+            facts[k] = v
+    if "fps_p50_window" not in facts and _is_num(report.get("fps_p50")):
+        facts["fps_p50_window"] = float(report["fps_p50"])
+    gve = _browser_gpu_validation_errors(report)
+    if gve is not None:
+        facts["counters.gpu_validation_errors"] = float(gve)
+    rjf = _reflection_join_failures(report)
+    if rjf is not None:
+        facts["reflection_join_failures"] = float(rjf)
+    gm = _gpu_memory_dict(report)
+    for dst, keys in (
+        ("gpu_memory.vram_bytes", ("vramBytes", "vram_bytes")),
+        ("gpu_memory.total_live_gpu_bytes", ("totalLiveGpuBytes", "total_live_gpu_bytes")),
+        ("gpu_memory.peak_buffer_bytes", ("peakBufferBytes", "peak_buffer_bytes")),
+        ("gpu_memory.peak_texture_bytes", ("peakTextureBytes", "peak_texture_bytes")),
+        ("gpu_memory.staging_pool_bytes", ("stagingPoolBytes", "staging_pool_bytes")),
+        ("gpu_memory.vram_peak_mb", ("vram_peak_mb",)),
+    ):
+        val = _first_num(*(gm.get(k) for k in keys))
+        if val is not None:
+            facts[dst] = val
+    rm = _renderer_memory_dict(report)
+    wasm_mem = _first_num(rm.get("wasmLinearMemoryBytes"), rm.get("wasm_linear_memory_bytes"))
+    if wasm_mem is not None:
+        facts["renderer_memory.wasm_linear_memory_bytes"] = wasm_mem
+    pd = _pipeline_dump_dict(report)
+    for dst, keys in (
+        ("pipeline_dump.dumped", ("dumped", "count", "total", "pipelines")),
+        ("pipeline_dump.failed", ("failed", "errors")),
+    ):
+        val = _first_num(*(pd.get(k) for k in keys))
+        if val is not None:
+            facts[dst] = val
     peak = _d(_d(report.get("memory_budget")).get("guest_arena")).get("arena_peak_committed")
-    if isinstance(peak, (int, float)):
+    if _is_num(peak):
         facts["memory.arena_peak_committed"] = float(peak)
     drops = _d(_d(report.get("gpu_work")).get("drops_by_program"))
     facts["drops_total"] = float(sum(int(_n(v)) for v in drops.values()))
