@@ -1,0 +1,984 @@
+{
+  "benchmark": "synthetic native Rust public emit_module",
+  "baselineCommit": "52918dfa4d41e9f316990b06b713219dd9135aac",
+  "patchCommit": "2f67bf926c8fb352b4c3a7c6d42043518a8cd0da",
+  "environment": {
+    "os": "Linux-7.0.0-1020-azure-x86_64-with-glibc2.43",
+    "cpu": "AMD EPYC 7763 64-Core Processor",
+    "logical_cpus": 4,
+    "memory_bytes": 16759431168,
+    "compiler": "c++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+    "cmake": "cmake version 4.5.1",
+    "baseline": "52918dfa4d41e9f316990b06b713219dd9135aac",
+    "patch": "2f67bf926c8fb352b4c3a7c6d42043518a8cd0da",
+    "gate_configuration": "Release; PLAYGTA6_OPUS=OFF; PLAYGTA6_PERFORMANCE_BENCHMARKS=ON; -j4 builds only",
+    "rustc": "rustc 1.100.0 (0ef1bc386 2026-11-09)",
+    "cargo_release_profile": "opt-level=3; lto=thin; codegen-units=1"
+  },
+  "sampling": "separate prebuilt binaries; alternating order; fresh process each sample; untimed byte-for-byte complete output oracle per case",
+  "allocationMetric": "peak live allocation requested sizes tracked through System allocator wrapper; realloc net requested size; excludes fixtures; not RSS or allocator internals",
+  "unmeasured": "real title module sizes/distribution, LLVM compile/link time, browser/Wasm execution and game FPS",
+  "cases": [
+    {
+      "kind": "helper-many",
+      "fixture_mib": 40,
+      "output_sha256": "7f618df818be4d0fc64385d46ed619b9e9171ec312476001c44dc1aaddc96ab4",
+      "samples": {
+        "before": [
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 34.587159,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.914208,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 34.509644,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.975516,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 34.839817000000004,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.572574,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.719459,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          }
+        ],
+        "after": [
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.990871,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.869223,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.204919,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.819331,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 31.994369000000003,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.310342,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.319539,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "control-many",
+      "fixture_mib": 40,
+      "output_sha256": "ef56ec5d3c5359092a343a3fdc1cc077acf66d070f30e90c4a78c705ec15a7c0",
+      "samples": {
+        "before": [
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.131913,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.713879,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.518232,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.858851,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.440194999999996,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.015785,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.10402,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          }
+        ],
+        "after": [
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 31.998617,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 31.655523,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.195767000000004,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.302628,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 33.160096,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.924153,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 32.59199,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "skew",
+      "fixture_mib": 40,
+      "output_sha256": "0ef2238f5273c8a5b64ad5445af6d0794ad002f09c65602e717e76e6a652101c",
+      "samples": {
+        "before": [
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 41.030167,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 41.354487,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 43.081895,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.272258,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.97493600000001,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.005638000000005,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.127988,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          }
+        ],
+        "after": [
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 41.079091,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.823361000000006,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.019174,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.24109,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 39.268277,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 39.363334,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 40.096749,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "helper",
+      "fixture_mib": 40,
+      "output_sha256": "e70bf265ceaaa9e09f0817862cfb1d2987edb700ab0e8f60054df62b1cbc2d98",
+      "samples": {
+        "before": [
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 35.479494,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 35.612033000000004,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 35.409693,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 35.457383,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 35.486658,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 35.356374,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 34.910989,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          }
+        ],
+        "after": [
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 34.813347,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 34.709361,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 34.898055,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 34.782237,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 35.568301,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 34.824307,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 34.679425,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "raw",
+      "fixture_mib": 40,
+      "output_sha256": "5836fa3e3fab4de305d1ec587ab5f1051afd670159c62ef58749b99ad99792c0",
+      "samples": {
+        "before": [
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.425624,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.629744,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.902564999999996,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.380075,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.487838,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.603915,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.45750099999999,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          }
+        ],
+        "after": [
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.476996,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.733328,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 61.014965999999994,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.662704999999995,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 61.100526,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.900621,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 60.783028,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "crlf",
+      "fixture_mib": 40,
+      "output_sha256": "fcd0bd68f3d3289dfd808168dd4330cdcbec46c0c86398308a46d130dec94cce",
+      "samples": {
+        "before": [
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.665474,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 34.880085,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.399397,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 36.686594,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.292736999999995,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 36.076287,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.368359000000005,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          }
+        ],
+        "after": [
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 34.138979,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.314848000000005,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 34.998236,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.49241,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.713046,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 34.922502,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 35.554036999999994,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "control",
+      "fixture_mib": 0,
+      "output_sha256": "a5a60319a79cdd9a0086d0ed651c6e5df03d418524a75a56164204b86f81cb9c",
+      "samples": {
+        "before": [
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.0049099999999999994,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.0046689999999999995,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.006172,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004488,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004398,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004609,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004228,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          }
+        ],
+        "after": [
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.0046890000000000005,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004378,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004438,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004409,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004408,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.0043479999999999994,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004378,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          }
+        ]
+      }
+    }
+  ],
+  "run": "https://github.com/GDemay/playGreg6web/actions/runs/46066510153",
+  "commonHarnessCommit": "2f67bf926c8fb352b4c3a7c6d42043518a8cd0da"
+}

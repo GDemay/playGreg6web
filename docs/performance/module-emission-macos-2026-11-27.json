@@ -1,0 +1,976 @@
+{
+  "benchmark": "synthetic native Rust public emit_module",
+  "baselineCommit": "52918dfa4d41e9f316990b06b713219dd9135aac",
+  "patchCommit": "uncommitted-reserve-probe",
+  "environment": {
+    "system": "Darwin",
+    "release": "27.0.0",
+    "arch": "arm64"
+  },
+  "sampling": "separate prebuilt binaries; alternating order; fresh process each sample; untimed byte-for-byte complete output oracle per case",
+  "allocationMetric": "peak live allocation requested sizes tracked through System allocator wrapper; realloc net requested size; excludes fixtures; not RSS or allocator internals",
+  "unmeasured": "real title module sizes/distribution, LLVM compile/link time, browser/Wasm execution and game FPS",
+  "cases": [
+    {
+      "kind": "helper-many",
+      "fixture_mib": 40,
+      "output_sha256": "7f618df818be4d0fc64385d46ed619b9e9171ec312476001c44dc1aaddc96ab4",
+      "samples": {
+        "before": [
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.114084,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.88025,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 12.044832999999999,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.763625000000001,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 12.419666,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.416292,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.520917,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 60213248,
+            "peak_live_requested_bytes": 60255732,
+            "output_fnv64": "4418d59a2807425c"
+          }
+        ],
+        "after": [
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 12.118792,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 13.176916,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.429708,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.529917000000001,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.8505,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.612084,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          },
+          {
+            "kind": "helper-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.655458000000001,
+            "output_bytes": 42027479,
+            "output_capacity_bytes": 42028453,
+            "peak_live_requested_bytes": 42070937,
+            "output_fnv64": "4418d59a2807425c"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "control-many",
+      "fixture_mib": 40,
+      "output_sha256": "ef56ec5d3c5359092a343a3fdc1cc077acf66d070f30e90c4a78c705ec15a7c0",
+      "samples": {
+        "before": [
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.331124999999998,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.141165999999998,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.82975,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.575667,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.058667,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.798,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.460541000000001,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 57624576,
+            "peak_live_requested_bytes": 57666868,
+            "output_fnv64": "bb354d762abc9bdd"
+          }
+        ],
+        "after": [
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.869209,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.078584000000001,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 11.01875,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.652958,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.604458000000001,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.969750000000001,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          },
+          {
+            "kind": "control-many",
+            "fixture_mib": 40,
+            "wall_ms": 10.954958000000001,
+            "output_bytes": 42026215,
+            "output_capacity_bytes": 42027189,
+            "peak_live_requested_bytes": 42069481,
+            "output_fnv64": "bb354d762abc9bdd"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "skew",
+      "fixture_mib": 40,
+      "output_sha256": "0ef2238f5273c8a5b64ad5445af6d0794ad002f09c65602e717e76e6a652101c",
+      "samples": {
+        "before": [
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.774041,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.889541000000001,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 11.2995,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 12.235709000000002,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.713583,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.893458,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.639166,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 83887770,
+            "peak_live_requested_bytes": 83888670,
+            "output_fnv64": "a16199501fbb590b"
+          }
+        ],
+        "after": [
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.759875000000001,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.884292,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.672084,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.929291000000001,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.740708,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.996916,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          },
+          {
+            "kind": "skew",
+            "fixture_mib": 40,
+            "wall_ms": 10.715459000000001,
+            "output_bytes": 41945662,
+            "output_capacity_bytes": 41946636,
+            "peak_live_requested_bytes": 41947536,
+            "output_fnv64": "a16199501fbb590b"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "helper",
+      "fixture_mib": 40,
+      "output_sha256": "e70bf265ceaaa9e09f0817862cfb1d2987edb700ab0e8f60054df62b1cbc2d98",
+      "samples": {
+        "before": [
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 11.097249999999999,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.667833,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.914708000000001,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 11.213916000000001,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.992125,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 11.091125,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.909708,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          }
+        ],
+        "after": [
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.689167,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.776459000000001,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.688125,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.748833,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.894041,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.648541,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          },
+          {
+            "kind": "helper",
+            "fixture_mib": 40,
+            "wall_ms": 10.866042,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "01f3e9aa90eaeed5"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "raw",
+      "fixture_mib": 40,
+      "output_sha256": "5836fa3e3fab4de305d1ec587ab5f1051afd670159c62ef58749b99ad99792c0",
+      "samples": {
+        "before": [
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 15.385,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.137083,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.763833,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 13.908334,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 15.159832999999999,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.2605,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.808417,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83887968,
+            "output_fnv64": "57a7f8c27310ae00"
+          }
+        ],
+        "after": [
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 15.928208,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.342709000000001,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.625292,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.295833,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.873249999999999,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.663292,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          },
+          {
+            "kind": "raw",
+            "fixture_mib": 40,
+            "wall_ms": 14.131084,
+            "output_bytes": 41943935,
+            "output_capacity_bytes": 41943946,
+            "peak_live_requested_bytes": 83888992,
+            "output_fnv64": "57a7f8c27310ae00"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "crlf",
+      "fixture_mib": 40,
+      "output_sha256": "fcd0bd68f3d3289dfd808168dd4330cdcbec46c0c86398308a46d130dec94cce",
+      "samples": {
+        "before": [
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 12.325417,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 11.232583,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 11.781917,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 11.735333,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 10.693041000000001,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 10.664167,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 10.861333,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 83890298,
+            "peak_live_requested_bytes": 83890630,
+            "output_fnv64": "18e7eee1878f0f30"
+          }
+        ],
+        "after": [
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 10.743416999999999,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 12.164583,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 11.44125,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 11.445625,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 10.380541000000001,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 10.330708,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          },
+          {
+            "kind": "crlf",
+            "fixture_mib": 40,
+            "wall_ms": 10.394917,
+            "output_bytes": 41945199,
+            "output_capacity_bytes": 41946173,
+            "peak_live_requested_bytes": 41946505,
+            "output_fnv64": "18e7eee1878f0f30"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "control",
+      "fixture_mib": 0,
+      "output_sha256": "a5a60319a79cdd9a0086d0ed651c6e5df03d418524a75a56164204b86f81cb9c",
+      "samples": {
+        "before": [
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004625,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003875,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003709,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003541,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003916,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003708,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.0041659999999999996,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          }
+        ],
+        "after": [
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004417,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.004083,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.0036669999999999997,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003792,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003375,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003542,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          },
+          {
+            "kind": "control",
+            "fixture_mib": 0,
+            "wall_ms": 0.003666,
+            "output_bytes": 884,
+            "output_capacity_bytes": 1152,
+            "peak_live_requested_bytes": 1292,
+            "output_fnv64": "ed5c02e8a1cbbf0e"
+          }
+        ]
+      }
+    }
+  ],
+  "measuredProductionCommit": "2f67bf926c8fb352b4c3a7c6d42043518a8cd0da",
+  "status": "Exploratory Apple M5 native lane; same deterministic requested allocation/capacity reduction, no speed claim. Independent Linux run is primary."
+}
