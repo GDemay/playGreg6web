@@ -1861,6 +1861,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
 
     def _handle_dump_post(self, parsed_url: Any) -> None:
         if self.dump_root is None:
+            self._drain_small_request_body()  # avoid Windows RST (WinError 10053) on unread body
             self._send_json(
                 HTTPStatus.FORBIDDEN,
                 {"ok": False, "error": "dump endpoint disabled"},
@@ -1871,6 +1872,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         rel_url_path = parsed_url.path[len(DUMP_URL_PREFIX) :]
         resolved, err_status, err_msg = resolve_dump_target(self.dump_root, rel_url_path)
         if resolved is None:
+            self._drain_small_request_body()  # avoid Windows RST (WinError 10053) on unread body
             self._send_json(
                 err_status or HTTPStatus.BAD_REQUEST,
                 {"ok": False, "error": err_msg or "invalid dump path"},
