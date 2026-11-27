@@ -207,6 +207,24 @@ const GPU_TELEMETRY_MESSAGE_TYPES = new Set([
   'missing-shaders',
   'frame-presented',
 ]);
+const DEFAULT_MAX_IN_FLIGHT_GPU_PRESENTS = 4;
+const DEFAULT_GPU_PRESENT_BACKPRESSURE_DECAY_MS = 5000;
+// Pure/keep-alive frame lifecycle opcodes (NOP=0, BeginFrame=1, ClearColor=2, Present=7).
+// Any batch containing other opcodes (resource creation, uploads, pipelines, draws, compute, state)
+// is NEVER dropped by Present backpressure.
+const GPU_PURE_PRESENT_OPCODES = new Set([0, 1, 2, GPU_OPCODE_PRESENT]);
+const GPU_MEMORY_CANONICAL_KEYS = Object.freeze([
+  'liveBufferBytes',
+  'liveTextureBytes',
+  'peakBufferBytes',
+  'peakTextureBytes',
+  'stagingPoolBytes',
+  'totalLiveGpuBytes',
+  'pendingDeferredDestroys',
+  'pendingDeferredDestroyBytes',
+  'deferredHighWaterFlushes',
+  'vramBytes',
+]);
 const GPU_SHADER_STAGE_NAMES = Object.freeze({
   1: 'vertex',
   2: 'fragment',
@@ -936,6 +954,84 @@ function inspectGpuPacketBatchForPresent(bytes) {
   return result;
 }
 
+/**
+ * Inspect a GpuPacketHeader stream (bounded to optional `explicitByteLength`) for
+ * Present backpressure classification: identifies whether the batch contains a
+ * Present packet and whether it is a pure/keep-alive Present batch (only NOP,
+ * BeginFrame, ClearColor, Present — zero resource/state/draw/compute packets).
+ * Never throws on truncated or malformed input.
+ */
+function inspectGpuPacketBatchForBackpressure(bytes, explicitByteLength) {
+  const empty = {
+    packetCount: 0,
+    hasPresent: false,
+    isPurePresent: false,
+    truncated: false,
+  };
+  let view;
+  try {
+    view = asDataView(bytes);
+  } catch {
+    return empty;
+  }
+  if (!view) {
+    return empty;
+  }
+  const total =
+    typeof explicitByteLength === 'number' &&
+    Number.isInteger(explicitByteLength) &&
+    explicitByteLength >= 0 &&
+    explicitByteLength <= view.byteLength
+      ? explicitByteLength
+      : view.byteLength;
+  if (total === 0) {
+    return empty;
+  }
+
+  let packetCount = 0;
+  let hasPresent = false;
+  let hasNonPurePacket = false;
+  let truncated = false;
+  let offset = 0;
+
+  while (offset < total) {
+    if (offset + GPU_PACKET_HEADER_BYTES > total) {
+      truncated = true;
+      break;
+    }
+    let opcode;
+    let payloadBytes;
+    try {
+      opcode = view.getUint16(offset, true);
+      payloadBytes = view.getUint32(offset + 4, true);
+    } catch {
+      truncated = true;
+      break;
+    }
+    const payloadOffset = offset + GPU_PACKET_HEADER_BYTES;
+    const remaining = total - payloadOffset;
+    if (payloadBytes > remaining) {
+      truncated = true;
+      break;
+    }
+    if (opcode === GPU_OPCODE_PRESENT) {
+      hasPresent = true;
+    }
+    if (!GPU_PURE_PRESENT_OPCODES.has(opcode)) {
+      hasNonPurePacket = true;
+    }
+    packetCount += 1;
+    offset = payloadOffset + payloadBytes;
+  }
+
+  return {
+    packetCount,
+    hasPresent,
+    isPurePresent: hasPresent && !truncated && !hasNonPurePacket,
+    truncated,
+  };
+}
+
 function ensureTrailingSlash(base) {
   if (typeof base !== 'string' || base.length === 0) {
     return '';
@@ -1259,15 +1355,75 @@ function sanitizeRenderStateStats(raw) {
   return out;
 }
 
+function sanitizeGpuMemoryStats(rawObj, fallbackSources = null) {
+  const out = {};
+  const copyNumericFields = (src, allowAllOwnKeys) => {
+    if (!src || typeof src !== 'object' || Array.isArray(src)) {
+      return;
+    }
+    const keys = allowAllOwnKeys ? Object.keys(src) : GPU_MEMORY_CANONICAL_KEYS;
+    for (let i = 0; i < keys.length; i += 1) {
+      const key = keys[i];
+      if (out[key] !== undefined) {
+        continue;
+      }
+      const val = src[key];
+      if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+        out[key] = Number.isInteger(val) ? val : val;
+      }
+    }
+  };
+
+  if (rawObj && typeof rawObj === 'object' && !Array.isArray(rawObj)) {
+    copyNumericFields(rawObj, true);
+  }
+  if (Array.isArray(fallbackSources)) {
+    for (let i = 0; i < fallbackSources.length; i += 1) {
+      const src = fallbackSources[i];
+      if (!src || typeof src !== 'object' || Array.isArray(src)) {
+        continue;
+      }
+      if (src.gpuMemory && typeof src.gpuMemory === 'object' && !Array.isArray(src.gpuMemory)) {
+        copyNumericFields(src.gpuMemory, true);
+      }
+      copyNumericFields(src, false);
+    }
+  }
+
+  const keys = Object.keys(out);
+  if (keys.length === 0) {
+    return null;
+  }
+  if (
+    out.totalLiveGpuBytes === undefined &&
+    (out.liveBufferBytes !== undefined ||
+      out.liveTextureBytes !== undefined ||
+      out.stagingPoolBytes !== undefined)
+  ) {
+    out.totalLiveGpuBytes =
+      (out.liveBufferBytes || 0) + (out.liveTextureBytes || 0) + (out.stagingPoolBytes || 0);
+  }
+  return out;
+}
+
 function sanitizeFrameStats(eventData) {
   const rawFrameStats =
     eventData.frameStats && typeof eventData.frameStats === 'object' ? eventData.frameStats : null;
   const rawStats =
     eventData.stats && typeof eventData.stats === 'object' ? eventData.stats : null;
+  const rawGpuMemory =
+    (rawFrameStats && rawFrameStats.gpuMemory && typeof rawFrameStats.gpuMemory === 'object'
+      ? rawFrameStats.gpuMemory
+      : null) ||
+    (rawStats && rawStats.gpuMemory && typeof rawStats.gpuMemory === 'object'
+      ? rawStats.gpuMemory
+      : null) ||
+    (eventData.gpuMemory && typeof eventData.gpuMemory === 'object' ? eventData.gpuMemory : null);
 
   const hasFrameField =
     Boolean(rawFrameStats) ||
     Boolean(rawStats) ||
+    Boolean(rawGpuMemory) ||
     typeof eventData.framesPresented === 'number' ||
     typeof eventData.droppedFrames === 'number' ||
     typeof eventData.frame === 'number' ||
@@ -1392,6 +1548,27 @@ function sanitizeFrameStats(eventData) {
     frameStats.vramBytes = toNonNegativeInt(vramSrc, 0);
   }
 
+  // #1077: preserve structured WebGPU VRAM breakdown (`gpuMemory`) when reported by wgpu_worker.
+  const gpuMemoryFallbackSources = [rawFrameStats, rawStats, eventData].filter(Boolean);
+  const hasFlatGpuMemField = gpuMemoryFallbackSources.some(
+    (src) =>
+      typeof src.liveBufferBytes === 'number' ||
+      typeof src.liveTextureBytes === 'number' ||
+      typeof src.peakBufferBytes === 'number' ||
+      typeof src.peakTextureBytes === 'number' ||
+      typeof src.stagingPoolBytes === 'number' ||
+      typeof src.totalLiveGpuBytes === 'number',
+  );
+  if (rawGpuMemory || hasFlatGpuMemField) {
+    const sanitizedGpuMem = sanitizeGpuMemoryStats(rawGpuMemory, gpuMemoryFallbackSources);
+    if (sanitizedGpuMem) {
+      frameStats.gpuMemory = sanitizedGpuMem;
+      if (frameStats.vramBytes === undefined && sanitizedGpuMem.totalLiveGpuBytes !== undefined) {
+        frameStats.vramBytes = toNonNegativeInt(sanitizedGpuMem.totalLiveGpuBytes, 0);
+      }
+    }
+  }
+
   return frameStats;
 }
 
@@ -1410,7 +1587,8 @@ function isGpuTelemetryMessage(eventData) {
     (eventData.shaderFallbackStats && typeof eventData.shaderFallbackStats === 'object') ||
     (eventData.fallbackStats && typeof eventData.fallbackStats === 'object') ||
     (eventData.frameStats && typeof eventData.frameStats === 'object') ||
-    (eventData.stats && typeof eventData.stats === 'object')
+    (eventData.stats && typeof eventData.stats === 'object') ||
+    (eventData.gpuMemory && typeof eventData.gpuMemory === 'object' && !Array.isArray(eventData.gpuMemory))
   ) {
     return true;
   }
@@ -1798,6 +1976,9 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     telemetry.renderStateStats = renderStateStats;
     lastRenderStateStats = renderStateStats;
   }
+  if (telemetry.frameStats && telemetry.frameStats.gpuMemory) {
+    telemetry.gpuMemory = Object.assign({}, telemetry.frameStats.gpuMemory);
+  }
 
   // W349: preserve explicit non-black probe & adapter fields on gpu-telemetry payloads.
   const telemetrySources = [eventData, rawStats, rawFrameStats].filter(Boolean);
@@ -1903,6 +2084,9 @@ function createWorkerBootInitPayloads(msg = {}) {
     !Array.isArray(msg.swapchainOptions)
   ) {
     gpuExtra.swapchainOptions = Object.assign({}, msg.swapchainOptions);
+  }
+  if (msg && typeof msg === 'object' && typeof msg.requireNonBlackFrame === 'boolean') {
+    gpuExtra.requireNonBlackFrame = msg.requireNonBlackFrame;
   }
   return {
     ioInit: Object.assign({ init: true, dataBase: msg.dataBase }, bootFields),
@@ -10354,6 +10538,138 @@ function handleRecycledCmdBuffer(cmdBuffer) {
   return false;
 }
 
+// Orch-32 P0 #2 (#663): Bounded in-flight GPU Present backpressure.
+// Prevents hundreds of guest Present command buffers from queuing unboundedly onto
+// `gpuWorker` during shader-compile stalls (which otherwise causes multi-hundred-frame
+// compositor bursts once compilation completes), while NEVER dropping resource/state
+// creation packets and never deadlocking on worker reset/error or dropped acks.
+let _inFlightGpuPresents = 0;
+let _maxInFlightGpuPresents = DEFAULT_MAX_IN_FLIGHT_GPU_PRESENTS;
+let _coalescedPresentSubmissions = 0;
+let _pendingCoalescedPresent = null;
+let _lastGpuPresentProgressAtMs = 0;
+
+function normalizeMaxInFlightGpuPresents(value, fallback = DEFAULT_MAX_IN_FLIGHT_GPU_PRESENTS) {
+  if (typeof value === 'number' && Number.isInteger(value) && value >= 1) {
+    return value;
+  }
+  return fallback;
+}
+
+function recycleAbandonedCmdBufferToPort(entry) {
+  if (
+    !entry ||
+    !entry.wantRecycle ||
+    !entry.sourcePort ||
+    typeof entry.sourcePort.postMessage !== 'function' ||
+    !isTransferableArrayBuffer(entry.transferBuf)
+  ) {
+    return false;
+  }
+  if (
+    coordinatorPthreadPool &&
+    typeof coordinatorPthreadPool.isActiveTxPort === 'function' &&
+    !coordinatorPthreadPool.isActiveTxPort(entry.sourcePort)
+  ) {
+    return false;
+  }
+  try {
+    entry.sourcePort.postMessage(
+      { type: PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER, cmdBuffer: entry.transferBuf },
+      [entry.transferBuf],
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resetGpuPresentBackpressure(options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  _inFlightGpuPresents = 0;
+  _lastGpuPresentProgressAtMs = 0;
+  if (_pendingCoalescedPresent) {
+    recycleAbandonedCmdBufferToPort(_pendingCoalescedPresent);
+    _pendingCoalescedPresent = null;
+  }
+  if (safeOpts.resetCounters === true) {
+    _coalescedPresentSubmissions = 0;
+  }
+  if (safeOpts.maxInFlightPresents !== undefined) {
+    _maxInFlightGpuPresents = normalizeMaxInFlightGpuPresents(
+      safeOpts.maxInFlightPresents,
+      DEFAULT_MAX_IN_FLIGHT_GPU_PRESENTS,
+    );
+  }
+}
+
+function maybeDecayInFlightGpuPresents(nowMs = Date.now()) {
+  if (
+    _inFlightGpuPresents > 0 &&
+    _lastGpuPresentProgressAtMs > 0 &&
+    nowMs - _lastGpuPresentProgressAtMs >= DEFAULT_GPU_PRESENT_BACKPRESSURE_DECAY_MS
+  ) {
+    _inFlightGpuPresents = 0;
+    _lastGpuPresentProgressAtMs = nowMs;
+  }
+}
+
+function flushPendingCoalescedPresent() {
+  if (
+    !_pendingCoalescedPresent ||
+    _inFlightGpuPresents >= _maxInFlightGpuPresents ||
+    !gpuWorker ||
+    typeof gpuWorker.postMessage !== 'function'
+  ) {
+    return false;
+  }
+  const entry = _pendingCoalescedPresent;
+  _pendingCoalescedPresent = null;
+  attachActiveCoordinatorGuestMemory();
+  const gpuMsg = { cmdBuffer: entry.transferBuf, coalescePresent: true };
+  if (entry.hasExplicitByteLength) {
+    gpuMsg.byteLength = entry.effectiveByteLength;
+  }
+  if (entry.wantRecycle) {
+    gpuMsg.recycleBuffer = true;
+    enqueueRecycleTxPort(entry.sourcePort);
+  }
+  if (_inFlightGpuPresents === 0) {
+    _lastGpuPresentProgressAtMs = Date.now();
+  }
+  _inFlightGpuPresents += 1;
+  gpuWorker.postMessage(gpuMsg, [entry.transferBuf]);
+  return true;
+}
+
+function ackGpuPresentFromWorkerMessage(data) {
+  if (!data || typeof data !== 'object') {
+    return false;
+  }
+  if (data.error) {
+    resetGpuPresentBackpressure();
+    return false;
+  }
+  const isAck =
+    data.type === 'gpu-present-ack' ||
+    data.type === 'frame-stats' ||
+    data.type === 'first-present' ||
+    data.type === 'first-visible-frame' ||
+    data.type === 'visible-frame' ||
+    data.type === 'gpu-telemetry' ||
+    data.type === 'frame-presented' ||
+    (typeof data.frame === 'number' && Number.isFinite(data.frame) && data.frame > 0);
+  if (!isAck) {
+    return false;
+  }
+  if (_inFlightGpuPresents > 0) {
+    _inFlightGpuPresents = Math.max(0, _inFlightGpuPresents - 1);
+  }
+  _lastGpuPresentProgressAtMs = Date.now();
+  flushPendingCoalescedPresent();
+  return true;
+}
+
 // W345: Keep pthread GPU submits flowing through the coordinator's multiplexed `txPort`
 // so `FIRST_PRESENT` detection (`GPU_OPCODE_PRESENT = 7`), audio-ring milestone delivery,
 // and `pthreadActiveTxPorts` telemetry stay intact, while transferring the received
@@ -10397,29 +10713,30 @@ function handlePthreadWgpuSubmit(data, options = {}) {
       data.byteLength <= transferBuf.byteLength,
   );
   const effectiveByteLength = hasExplicitByteLength ? data.byteLength : transferBuf.byteLength;
-  if (!coordinatorFirstPresentEmitted && effectiveByteLength > 0) {
-    const inspectInput =
-      effectiveByteLength < transferBuf.byteLength
-        ? new Uint8Array(transferBuf, 0, effectiveByteLength)
-        : transferBuf;
-    const info = inspectGpuPacketBatchForPresent(inspectInput);
-    if (info.hasPresent) {
-      coordinatorFirstPresentEmitted = true;
-      if (
-        activeCoordinatorModuleConfig &&
-        typeof activeCoordinatorModuleConfig.notifyGuestMilestone === 'function'
-      ) {
-        try {
-          activeCoordinatorModuleConfig.notifyGuestMilestone('first_present');
-        } catch {
-          // Non-fatal audio ring milestone retry failure.
-        }
+  const batchInfo =
+    effectiveByteLength > 0
+      ? inspectGpuPacketBatchForBackpressure(transferBuf, effectiveByteLength)
+      : { packetCount: 0, hasPresent: false, isPurePresent: false, truncated: false };
+  if (!coordinatorFirstPresentEmitted && batchInfo.hasPresent) {
+    coordinatorFirstPresentEmitted = true;
+    if (
+      activeCoordinatorModuleConfig &&
+      typeof activeCoordinatorModuleConfig.notifyGuestMilestone === 'function'
+    ) {
+      try {
+        activeCoordinatorModuleConfig.notifyGuestMilestone('first_present');
+      } catch {
+        // Non-fatal audio ring milestone retry failure.
       }
-      report('[boot] FIRST_PRESENT');
     }
+    report('[boot] FIRST_PRESENT');
   }
   if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
-    attachActiveCoordinatorGuestMemory();
+    maybeDecayInFlightGpuPresents();
+    const maxInFlight =
+      options && options.maxInFlightPresents !== undefined
+        ? normalizeMaxInFlightGpuPresents(options.maxInFlightPresents, _maxInFlightGpuPresents)
+        : _maxInFlightGpuPresents;
     const sourcePort = options && options.sourcePort ? options.sourcePort : null;
     const wantRecycle = Boolean(
       isEnvelope &&
@@ -10429,6 +10746,25 @@ function handlePthreadWgpuSubmit(data, options = {}) {
         transferBuf.byteLength >= WGPU_CMD_POOL_MIN_BYTES &&
         transferBuf.byteLength <= WGPU_CMD_POOL_MAX_BYTES,
     );
+    const isBackpressuredPresent = batchInfo.hasPresent && _inFlightGpuPresents >= maxInFlight;
+    if (isBackpressuredPresent && batchInfo.isPurePresent) {
+      // Pure/keep-alive Present while gpuWorker already has maxInFlight presents queued:
+      // coalesce into a single latest pending slot so shader-compile stalls never build
+      // an unbounded multi-hundred-frame compositor burst.
+      if (_pendingCoalescedPresent) {
+        recycleAbandonedCmdBufferToPort(_pendingCoalescedPresent);
+      }
+      _pendingCoalescedPresent = {
+        transferBuf,
+        hasExplicitByteLength,
+        effectiveByteLength,
+        sourcePort,
+        wantRecycle,
+      };
+      _coalescedPresentSubmissions += 1;
+      return true;
+    }
+    attachActiveCoordinatorGuestMemory();
     const gpuMsg = { cmdBuffer: transferBuf };
     if (hasExplicitByteLength) {
       gpuMsg.byteLength = effectiveByteLength;
@@ -10436,6 +10772,18 @@ function handlePthreadWgpuSubmit(data, options = {}) {
     if (wantRecycle) {
       gpuMsg.recycleBuffer = true;
       enqueueRecycleTxPort(sourcePort);
+    }
+    if (isBackpressuredPresent) {
+      // Batch contains resource/state/draw packets alongside a Present: NEVER drop it,
+      // but signal gpuWorker to coalesce the trailing Present if still saturated.
+      gpuMsg.coalescePresent = true;
+      _coalescedPresentSubmissions += 1;
+    }
+    if (batchInfo.hasPresent) {
+      if (_inFlightGpuPresents === 0) {
+        _lastGpuPresentProgressAtMs = Date.now();
+      }
+      _inFlightGpuPresents += 1;
     }
     gpuWorker.postMessage(gpuMsg, [transferBuf]);
     return true;
@@ -10611,6 +10959,9 @@ function getLoaderStatus() {
       : null,
     sideModules,
     firstPresentEmitted: coordinatorFirstPresentEmitted,
+    inFlightGpuPresents: _inFlightGpuPresents,
+    maxInFlightPresents: _maxInFlightGpuPresents,
+    coalescedPresentSubmissions: _coalescedPresentSubmissions,
     audioRingAttached: audioRingTelemetry ? Boolean(audioRingTelemetry.audioRingAttached) : false,
     audioRingRetryCount: audioRingTelemetry ? audioRingTelemetry.audioRingRetryCount : 0,
     audioRingLastReason: audioRingTelemetry ? audioRingTelemetry.audioRingLastReason : null,
@@ -11096,6 +11447,7 @@ if (typeof self !== 'undefined') {
         return;
       }
       if (msg.type === 'teardown' || msg.type === 'destroy') {
+        resetGpuPresentBackpressure({ resetCounters: true });
         if (activeCoordinatorPipelineDumpSyncer) {
           try {
             activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
@@ -11145,6 +11497,13 @@ if (typeof self !== 'undefined') {
       return;
     }
     resetLastFaultRecord();
+    resetGpuPresentBackpressure({
+      resetCounters: true,
+      maxInFlightPresents:
+        msg.maxInFlightPresents !== undefined
+          ? msg.maxInFlightPresents
+          : DEFAULT_MAX_IN_FLIGHT_GPU_PRESENTS,
+    });
     coordinatorPthreadPool.closeTxPorts();
     if (activeCoordinatorInputBridge) {
       try {
@@ -11248,6 +11607,9 @@ if (typeof self !== 'undefined') {
       if (e.data.ready) onWorkerReady('io_worker', e.data.summary);
       else if (e.data.error) postProgress({ error: `io_worker: ${e.data.error}` });
     };
+    gpuWorker.onerror = () => {
+      resetGpuPresentBackpressure();
+    };
     gpuWorker.onmessage = (e) => {
       const data = e && e.data;
       if (!data || typeof data !== 'object') return;
@@ -11256,8 +11618,13 @@ if (typeof self !== 'undefined') {
         return;
       }
       if (data.ready) {
+        resetGpuPresentBackpressure();
         attachActiveCoordinatorGuestMemory();
         onWorkerReady('wgpu_worker', data.adapter);
+        return;
+      }
+      ackGpuPresentFromWorkerMessage(data);
+      if (data.type === 'gpu-present-ack') {
         return;
       }
       if (data.ringAttached) {
@@ -11419,6 +11786,7 @@ const exportedApi = {
   HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
+  DEFAULT_MAX_IN_FLIGHT_GPU_PRESENTS,
   INPUT_STATE_BYTES,
   INPUT_STATE_WORDS,
   DEFAULT_INPUT_BRIDGE_POLL_MS,
@@ -11470,6 +11838,8 @@ const exportedApi = {
   createWorkerBootInitPayloads,
   createWorkerBootInitPayloadsWithTransfers,
   forwardGpuWorkerMessage,
+  sanitizeFrameStats,
+  sanitizeGpuMemoryStats,
   sanitizeRenderStateStats,
   createHostImports,
   sanitizeAudioRingReason,

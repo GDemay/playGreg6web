@@ -704,9 +704,10 @@ export function extractGpuAdapterFromLogLine(line) {
 }
 
 /**
- * Parses the optional `?splashHold=1|true|on|yes` / `?splashHold=0|false|no|off`
- * query parameter (case-insensitive; last occurrence wins). Returns `true`,
- * `false`, or `null` when absent or invalid.
+ * Parses the optional `?splashHold=` / `?holdUntilVisible=` query parameter
+ * (`1`/`true`/`on`/`yes` -> `true`, `0`/`false`/`no`/`off` -> `false`;
+ * case-insensitive; last occurrence across either alias wins).
+ * Returns `true`, `false`, or `null` when absent or invalid.
  *
  * @param {string|URLSearchParams|URL|Location|object|null|undefined} search
  * @returns {boolean|null}
@@ -716,7 +717,13 @@ export function parseSplashHoldQuery(search) {
   if (!params) {
     return null;
   }
-  const raw = getLastQueryParamInsensitive(params, 'splashHold');
+  let raw = null;
+  for (const [key, value] of params.entries()) {
+    const lower = String(key).trim().toLowerCase();
+    if (lower === 'splashhold' || lower === 'holduntilvisible') {
+      raw = value;
+    }
+  }
   if (raw === null) {
     return null;
   }
@@ -1939,12 +1946,14 @@ export function bootstrapPlayGta6App(options = {}) {
     options.splashOverlayOptions && typeof options.splashOverlayOptions === 'object'
       ? options.splashOverlayOptions
       : {};
+  let holdUntilVisibleExplicit = false;
   const resolvedHoldUntilVisible = (() => {
     if (
       Object.prototype.hasOwnProperty.call(options, 'holdUntilVisible') &&
       options.holdUntilVisible !== undefined &&
       options.holdUntilVisible !== null
     ) {
+      holdUntilVisibleExplicit = true;
       return resolveBooleanOverride(options.holdUntilVisible, false);
     }
     if (
@@ -1952,9 +1961,11 @@ export function bootstrapPlayGta6App(options = {}) {
       splashOverlayOptions.holdUntilVisible !== undefined &&
       splashOverlayOptions.holdUntilVisible !== null
     ) {
+      holdUntilVisibleExplicit = true;
       return resolveBooleanOverride(splashOverlayOptions.holdUntilVisible, false);
     }
     if (parsedSplashHold !== null) {
+      holdUntilVisibleExplicit = true;
       return parsedSplashHold;
     }
     if (
@@ -2006,6 +2017,7 @@ export function bootstrapPlayGta6App(options = {}) {
     swapchainProbeErrorCount: 0,
     lastSampledMaxLuma: 0,
     suppressedBlackFrames: 0,
+    gpuMemory: null,
   };
 
   const audioTelemetry = {
@@ -2440,6 +2452,11 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     if (opfsL2Disabled) {
       fields.opfsL2Enabled = false;
+    }
+    if (typeof options.requireNonBlackFrame === 'boolean') {
+      fields.requireNonBlackFrame = options.requireNonBlackFrame;
+    } else if (holdUntilVisibleExplicit && resolvedHoldUntilVisible === false) {
+      fields.requireNonBlackFrame = false;
     }
     return fields;
   }
@@ -2956,6 +2973,7 @@ export function bootstrapPlayGta6App(options = {}) {
     wasmPerfLastFrameNowMs = null;
     wgpuFramesPresented = 0;
     gpuTelemetry.presentCount = 0;
+    gpuTelemetry.gpuMemory = null;
     if (perfMonitor && typeof perfMonitor.reset === 'function') {
       try {
         perfMonitor.reset();
@@ -3990,6 +4008,9 @@ export function bootstrapPlayGta6App(options = {}) {
     if (gpuTelemetry.blackLoadingMs !== null) {
       payload.blackLoadingMs = gpuTelemetry.blackLoadingMs;
     }
+    if (gpuTelemetry.gpuMemory !== null) {
+      payload.gpuMemory = Object.freeze({ ...gpuTelemetry.gpuMemory });
+    }
     return Object.freeze(payload);
   }
 
@@ -4698,6 +4719,13 @@ export function bootstrapPlayGta6App(options = {}) {
       } else if (probeSupportedField.value === null) {
         gpuTelemetry.swapchainProbeSupported = null;
       }
+      if (inputBridge && typeof inputBridge.setSwapchainProbeSupported === 'function') {
+        try {
+          inputBridge.setSwapchainProbeSupported(gpuTelemetry.swapchainProbeSupported);
+        } catch {
+          // Non-fatal input bridge probe sync failure.
+        }
+      }
     }
 
     const probeErrorCountField = pickFirstDefinedField(sources, [
@@ -4731,6 +4759,98 @@ export function bootstrapPlayGta6App(options = {}) {
     ]);
     if (suppressedBlackField.found && suppressedBlackField.value !== null) {
       gpuTelemetry.suppressedBlackFrames = toSafeNonNegativeInt(suppressedBlackField.value, 0);
+      matchedW83Field = true;
+    }
+
+    // #1077: ingest structured WebGPU VRAM counters (`gpuMemory`) from wgpu_worker / loader.
+    const rawGpuMemoryObj = (() => {
+      for (let i = 0; i < sources.length; i += 1) {
+        const candidate = sources[i] && sources[i].gpuMemory;
+        if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) {
+          return candidate;
+        }
+      }
+      return null;
+    })();
+    const GPU_MEM_FLAT_KEYS = [
+      'liveBufferBytes',
+      'liveTextureBytes',
+      'peakBufferBytes',
+      'peakTextureBytes',
+      'stagingPoolBytes',
+      'totalLiveGpuBytes',
+      'pendingDeferredDestroys',
+      'pendingDeferredDestroyBytes',
+      'deferredHighWaterFlushes',
+    ];
+    const extractedGpuMem = {};
+    let sawGpuMemField = false;
+    if (rawGpuMemoryObj) {
+      for (const key of Object.keys(rawGpuMemoryObj)) {
+        const val = rawGpuMemoryObj[key];
+        if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+          extractedGpuMem[key] = val;
+          sawGpuMemField = true;
+        }
+      }
+    }
+    for (let i = 0; i < sources.length; i += 1) {
+      const src = sources[i];
+      if (!src) continue;
+      for (let j = 0; j < GPU_MEM_FLAT_KEYS.length; j += 1) {
+        const key = GPU_MEM_FLAT_KEYS[j];
+        if (extractedGpuMem[key] !== undefined) continue;
+        const val = src[key];
+        if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+          extractedGpuMem[key] = val;
+          sawGpuMemField = true;
+        }
+      }
+    }
+    if (sawGpuMemField) {
+      const prev = gpuTelemetry.gpuMemory && typeof gpuTelemetry.gpuMemory === 'object'
+        ? gpuTelemetry.gpuMemory
+        : {};
+      const merged = { ...prev, ...extractedGpuMem };
+      if (typeof prev.peakBufferBytes === 'number' && typeof merged.peakBufferBytes === 'number') {
+        merged.peakBufferBytes = Math.max(prev.peakBufferBytes, merged.peakBufferBytes);
+      }
+      if (typeof merged.liveBufferBytes === 'number') {
+        merged.peakBufferBytes = Math.max(
+          typeof merged.peakBufferBytes === 'number' ? merged.peakBufferBytes : 0,
+          merged.liveBufferBytes
+        );
+      }
+      if (typeof prev.peakTextureBytes === 'number' && typeof merged.peakTextureBytes === 'number') {
+        merged.peakTextureBytes = Math.max(prev.peakTextureBytes, merged.peakTextureBytes);
+      }
+      if (typeof merged.liveTextureBytes === 'number') {
+        merged.peakTextureBytes = Math.max(
+          typeof merged.peakTextureBytes === 'number' ? merged.peakTextureBytes : 0,
+          merged.liveTextureBytes
+        );
+      }
+      if (
+        typeof prev.deferredHighWaterFlushes === 'number' &&
+        typeof merged.deferredHighWaterFlushes === 'number'
+      ) {
+        merged.deferredHighWaterFlushes = Math.max(
+          prev.deferredHighWaterFlushes,
+          merged.deferredHighWaterFlushes
+        );
+      }
+      if (
+        merged.totalLiveGpuBytes === undefined &&
+        (merged.liveBufferBytes !== undefined ||
+          merged.liveTextureBytes !== undefined ||
+          merged.stagingPoolBytes !== undefined)
+      ) {
+        merged.totalLiveGpuBytes =
+          (merged.liveBufferBytes || 0) +
+          (merged.liveTextureBytes || 0) +
+          (merged.stagingPoolBytes || 0);
+      }
+      gpuTelemetry.gpuMemory = merged;
       matchedW83Field = true;
     }
 
@@ -5726,7 +5846,13 @@ export function bootstrapPlayGta6App(options = {}) {
     notifyAudioRingGuestMilestone('first_present');
     if (inputBridge && typeof inputBridge.notifyFirstPresent === 'function') {
       try {
-        inputBridge.notifyFirstPresent();
+        if (typeof gpuTelemetry.swapchainProbeSupported === 'boolean') {
+          inputBridge.notifyFirstPresent({
+            swapchainProbeSupported: gpuTelemetry.swapchainProbeSupported,
+          });
+        } else {
+          inputBridge.notifyFirstPresent();
+        }
       } catch {
         // InputBridge milestone sync must never interrupt presentation.
       }
@@ -9018,6 +9144,7 @@ export function bootstrapPlayGta6App(options = {}) {
         Math.min(255, toSafeNonNegativeInt(gpuTelemetry.lastSampledMaxLuma, 0))
       ),
       suppressedBlackFrames: toSafeNonNegativeInt(gpuTelemetry.suppressedBlackFrames, 0),
+      gpuMemory: gpuTelemetry.gpuMemory ? Object.freeze({ ...gpuTelemetry.gpuMemory }) : null,
       bootToStartScreenMs,
       bootToIntroVideoMs,
       bootToMainMenuMs,
@@ -9089,6 +9216,7 @@ export function bootstrapPlayGta6App(options = {}) {
         Math.min(255, toSafeNonNegativeInt(gpuTelemetry.lastSampledMaxLuma, 0))
       ),
       suppressedBlackFrames: toSafeNonNegativeInt(gpuTelemetry.suppressedBlackFrames, 0),
+      gpuMemory: gpuTelemetry.gpuMemory ? Object.freeze({ ...gpuTelemetry.gpuMemory }) : null,
     });
 
     const audio = Object.freeze({
@@ -9144,6 +9272,7 @@ export function bootstrapPlayGta6App(options = {}) {
       swapchainProbeErrorCount: gpu.swapchainProbeErrorCount,
       lastSampledMaxLuma: gpu.lastSampledMaxLuma,
       suppressedBlackFrames: gpu.suppressedBlackFrames,
+      gpuMemory: gpu.gpuMemory,
       bootToStartScreenMs,
       bootToIntroVideoMs,
       bootToMainMenuMs,
@@ -9283,6 +9412,12 @@ export function bootstrapPlayGta6App(options = {}) {
       return false;
     }
     try {
+      if (
+        typeof gpuTelemetry.swapchainProbeSupported === 'boolean' &&
+        typeof inputBridge.setSwapchainProbeSupported === 'function'
+      ) {
+        inputBridge.setSwapchainProbeSupported(gpuTelemetry.swapchainProbeSupported);
+      }
       const scriptOptions = resolveInputScriptStartOptions(preset, options.inputScriptOptions);
       if (scriptOptions) {
         inputBridge.startScript(preset, scriptOptions);

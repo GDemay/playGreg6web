@@ -3163,3 +3163,34 @@ test('Greg Theft Auto asset dimensions and live elapsed-time clock replace 99%-s
   assert.equal(activeIntervals.size, 0);
   disabledInterval.controller.destroy();
 });
+
+test('Orch-32 P1 #4a: isSplashHoldQuery and SplashOverlayController unify ?holdUntilVisible= and ?splashHold=', () => {
+  for (const q of [
+    '?holdUntilVisible=1',
+    '?holdUntilVisible=true',
+    '?holdUntilVisible=on',
+    '?holdUntilVisible=yes',
+    '?HOLDUNTILVISIBLE=TRUE',
+    '?holdUntilVisible=0&splashHold=1',
+  ]) {
+    assert.equal(isSplashHoldQuery(q), true, `expected true for ${q}`);
+  }
+  for (const q of [
+    '?holdUntilVisible=0',
+    '?holdUntilVisible=false',
+    '?holdUntilVisible=off',
+    '?holdUntilVisible=no',
+    '?splashHold=1&holdUntilVisible=0',
+    '?splashHold=true&holdUntilVisible=off',
+  ]) {
+    assert.equal(isSplashHoldQuery(q), false, `expected false for ${q}`);
+  }
+
+  const viaHoldOn = createController({ locationSearch: '?holdUntilVisible=1' });
+  assert.equal(viaHoldOn.controller.getStats().holdUntilVisible, true);
+  viaHoldOn.controller.destroy();
+
+  const viaHoldOff = createController({ locationSearch: '?splashHold=1&holdUntilVisible=0' });
+  assert.equal(viaHoldOff.controller.getStats().holdUntilVisible, false);
+  viaHoldOff.controller.destroy();
+});

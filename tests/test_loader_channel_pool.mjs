@@ -727,6 +727,14 @@ test('W190 (#868): end-to-end VM boot with real Node MessageChannel delivers 1,0
 
   const GPU_BATCHES = 1050;
   const LOG_LINES = 50;
+  // Simulate a healthy (non-stalled) wgpu_worker that acks presented command buffers.
+  const origGpuPostMessage = gpuWorker.postMessage.bind(gpuWorker);
+  gpuWorker.postMessage = (msg, transfer = []) => {
+    origGpuPostMessage(msg, transfer);
+    if (msg && msg.cmdBuffer instanceof ArrayBuffer && typeof gpuWorker.onmessage === 'function') {
+      gpuWorker.onmessage({ data: { type: 'gpu-present-ack' } });
+    }
+  };
   for (let i = 0; i < LOG_LINES; i += 1) {
     const encoded = new TextEncoder().encode(`hot-log-${i}`);
     u8.set(encoded, 16);
@@ -1099,4 +1107,136 @@ test('G75 pthread warm cmdBuffer pool recycles large ArrayBuffers end-to-end and
   assert.doesNotThrow(() => {
     gpuWorker.onmessage({ data: { type: PTHREAD_TX_MSG_RECYCLE_CMD_BUFFER, cmdBuffer: lateBuf } });
   });
+});
+
+test('Orch-32 P0 #2: handlePthreadWgpuSubmit bounds in-flight pure Presents, never drops resource packets, and recovers on ack/error', () => {
+  const bus = createTrackedBroadcastBus();
+  const mcFactory = createTrackedMessageChannelFactory();
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  const loaderSource = fs.readFileSync(loaderPath, 'utf8');
+
+  const coordWorkers = new Map();
+  class BackpressureMockWorker extends MockPthreadWorker {
+    constructor(script, opts) {
+      super(script, opts);
+      coordWorkers.set(opts && opts.name ? opts.name : script, this);
+    }
+  }
+
+  const coordSelf = {
+    name: '',
+    location: { href: 'http://127.0.0.1:8080/loader.js' },
+    MessageChannel: mcFactory.TrackedMessageChannel,
+    onmessage: null,
+    postMessage() {},
+  };
+  const coordSandbox = {
+    self: coordSelf,
+    globalThis: null,
+    URL,
+    BroadcastChannel: bus.TrackedBroadcastChannel,
+    MessageChannel: mcFactory.TrackedMessageChannel,
+    Worker: BackpressureMockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    Object,
+    Array,
+    Proxy,
+    Reflect,
+    JSON,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), coordContext, { filename: resolved });
+    },
+  };
+  coordSandbox.globalThis = coordSandbox;
+  const coordContext = vm.createContext(coordSandbox);
+  vm.runInContext(loaderSource, coordContext, { filename: loaderPath });
+
+  coordSelf.onmessage({
+    data: { canvas: { id: 'c' }, width: 1280, height: 720, dataBase: '/data/' },
+  });
+  const gpuWorker = coordWorkers.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker);
+
+  const pthreadWorker = new coordSelf.Worker('./dist/runtime.js', { name: 'em-pthread-bp' });
+  const txPort = pthreadWorker.received[0].msg.__playgta6_tx_port;
+  assert.ok(txPort);
+
+  const makeResourcePlusPresentBatch = () => {
+    // CREATE_BUFFER (opcode 3, payload 16) + PRESENT (opcode 7, payload 0)
+    const buf = new ArrayBuffer(8 + 16 + 8);
+    const dv = new DataView(buf);
+    dv.setUint16(0, 3, true);
+    dv.setUint32(4, 16, true);
+    dv.setUint16(24, 7, true);
+    dv.setUint32(28, 0, true);
+    return buf;
+  };
+
+  // 1. Submit 20 pure Present batches while gpuWorker is stalled (0 acks).
+  //    Only DEFAULT_MAX_IN_FLIGHT_GPU_PRESENTS (4) must be posted; 16 are coalesced.
+  for (let i = 0; i < 20; i += 1) {
+    const pureFrame = encodeTestFramePacket(0.1, 0.2, 0.3, 1.0);
+    txPort.postMessage({ type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer: pureFrame }, [pureFrame]);
+  }
+  const postedAfterBurst = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(postedAfterBurst.length, 4);
+  assert.equal(postedAfterBurst[0].msg.coalescePresent, undefined);
+
+  const statusDuringStall = coordContext.PlayGta6Loader.getLoaderStatus();
+  assert.equal(statusDuringStall.inFlightGpuPresents, 4);
+  assert.equal(statusDuringStall.maxInFlightPresents, 4);
+  assert.equal(statusDuringStall.coalescedPresentSubmissions, 16);
+
+  // 2. Submit a batch containing resource creation + Present while still backpressured:
+  //    it MUST NEVER be dropped, and MUST be tagged with coalescePresent: true.
+  const resBatch = makeResourcePlusPresentBatch();
+  txPort.postMessage({ type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer: resBatch }, [resBatch]);
+  const postedAfterRes = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(postedAfterRes.length, 5);
+  assert.equal(postedAfterRes[4].msg.cmdBuffer, resBatch);
+  assert.equal(postedAfterRes[4].msg.coalescePresent, true);
+  assert.equal(coordContext.PlayGta6Loader.getLoaderStatus().coalescedPresentSubmissions, 17);
+  assert.equal(coordContext.PlayGta6Loader.getLoaderStatus().inFlightGpuPresents, 5);
+
+  // 3. Acks (`gpu-present-ack`, `frame-stats`, `first-present`, `first-visible-frame`, `gpu-telemetry`)
+  //    decrement inFlightGpuPresents and flush the latest pending coalesced pure Present once < max.
+  gpuWorker.onmessage({ data: { type: 'gpu-present-ack' } }); // 5 -> 4 (still == max, no flush yet)
+  assert.equal(coordContext.PlayGta6Loader.getLoaderStatus().inFlightGpuPresents, 4);
+  gpuWorker.onmessage({ data: { type: 'frame-stats', framesPresented: 2 } }); // 4 -> 3 -> flushes 1 coalesced -> 4
+  const postedAfterFlush = gpuWorker.received.filter((r) => r.msg && r.msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(postedAfterFlush.length, 6);
+  assert.equal(postedAfterFlush[5].msg.coalescePresent, true);
+  assert.equal(coordContext.PlayGta6Loader.getLoaderStatus().inFlightGpuPresents, 4);
+
+  gpuWorker.onmessage({ data: { type: 'first-present', framesPresented: 3 } });
+  gpuWorker.onmessage({ data: { type: 'first-visible-frame', framesPresented: 4 } });
+  gpuWorker.onmessage({ data: { type: 'gpu-telemetry', frameStats: { framesPresented: 5 } } });
+  assert.equal(coordContext.PlayGta6Loader.getLoaderStatus().inFlightGpuPresents, 1);
+
+  // 4. Worker error resets inFlightGpuPresents to 0 so backpressure can never deadlock.
+  gpuWorker.onmessage({ data: { error: 'simulated device lost' } });
+  assert.equal(coordContext.PlayGta6Loader.getLoaderStatus().inFlightGpuPresents, 0);
+
+  pthreadWorker.terminate();
 });
