@@ -2994,6 +2994,12 @@ class RangeCache {
 
     const coalesced = coalesceAdjacentRanges(normalizedEntries, maxGapBytes, maxMergedBytes);
 
+    const multiEntrySpans = coalesced.reduce((count, span) => count + (span.mergedCount > 1 ? 1 : 0), 0);
+    if (multiEntrySpans === 0) return coalesced.map((span) => ({ ...span, savedBytes: 0 }));
+    // For small manifests or a few dense spans, the original direct scan costs less
+    // than building an index. Index dispersed manifests with many merged spans only.
+    const useIndex = normalizedEntries.length > 128 && multiEntrySpans > 4;
+
     // Track per-span individual chunk-aligned bytes so bytesSavedByCoalescing captures
     // both overlap reduction and shared-chunk deduplication accurately.
     const byPath = new Map();
@@ -3004,15 +3010,42 @@ class RangeCache {
         list = [];
         byPath.set(e.path, list);
       }
-      list.push(e);
+      list.push(useIndex ? { ...e, order: i } : e);
+    }
+    if (useIndex) {
+      for (const list of byPath.values()) {
+        list.sort((a, b) => a.offset - b.offset);
+      }
     }
 
     return coalesced.map((span) => {
+      if (span.mergedCount <= 1) return { ...span, savedBytes: 0 };
       const pathEntries = byPath.get(span.path) || [];
       let sumIndividualAligned = 0;
-      for (let i = 0; i < pathEntries.length; i += 1) {
-        const e = pathEntries[i];
-        if (e.offset >= span.offset && e.offset + e.length <= span.end) {
+      if (!useIndex) {
+        for (const e of pathEntries) {
+          if (e.offset >= span.offset && e.offset + e.length <= span.end) {
+            sumIndividualAligned += this._chunkAlignedSpanBytes(e.offset, e.length);
+          }
+        }
+      } else {
+        // Only entries starting inside this span can contribute. Keep the end inclusive:
+        // at very large integer offsets, adding a small positive length can leave the offset unchanged.
+        let lo = 0;
+        let hi = pathEntries.length;
+        while (lo < hi) {
+          const mid = lo + Math.floor((hi - lo) / 2);
+          if (pathEntries[mid].offset < span.offset) lo = mid + 1;
+          else hi = mid;
+        }
+        const contained = [];
+        for (let i = lo; i < pathEntries.length && pathEntries[i].offset <= span.end; i += 1) {
+          const e = pathEntries[i];
+          if (e.offset + e.length <= span.end) contained.push(e);
+        }
+        // Retain input summation order even for counts above Number's exact integer range.
+        contained.sort((a, b) => a.order - b.order);
+        for (const e of contained) {
           sumIndividualAligned += this._chunkAlignedSpanBytes(e.offset, e.length);
         }
       }
