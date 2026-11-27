@@ -439,5 +439,5 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [x] **W63 — Fix Inline `detectWasm64` (`address: 'i64'` + `index: 'i64'`) in `web/index.html`** — `DONE` (PR #385, closes #384) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
   - Updates the inline HUD `detectWasm64` probe in `web/index.html` to check `address: 'i64'` with `index: 'i64'` fallback consistently across all browser entrypoints.
 
-- [ ] **Bootset coalescing-accounting CPU cost (#2049)** — `IN PROGRESS` (GDemay; no game files required).
+- [x] **Bootset coalescing-accounting CPU cost (#2049)** — `DONE` (GDemay; no game files required).
   - Bound per-span containment accounting to entries starting inside that span, preserving coalescing output and byte-savings counters. Scope: `web/workers/range_cache.js`, focused planner test and synthetic benchmark only; does not change HTTPFS cache-refetch policy or mailbox parallelism tracked by #1015.
