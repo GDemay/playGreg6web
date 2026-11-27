@@ -113,6 +113,10 @@ pub(crate) struct Step<'b> {
 /// How jump-table entries encode target virtual addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntryEncoding {
+    /// 16-bit unsigned offset added to `base` (e.g. `movzx eax, word [table + idx*2]; add rax, base`).
+    Unsigned16 { base: u64 },
+    /// 16-bit signed offset added to `base` (e.g. `movsx rax, word [table + idx*2]; add rax, base`).
+    Signed16 { base: u64 },
     /// 32-bit unsigned offset added to `base` (e.g. `__ImageBase + u32`).
     Unsigned32 { base: u64 },
     /// 32-bit signed offset added to `base` (e.g. `table_va + i32` or `anchor_va + i32`).
@@ -124,6 +128,7 @@ enum EntryEncoding {
 impl EntryEncoding {
     fn entry_size(self) -> u64 {
         match self {
+            Self::Unsigned16 { .. } | Self::Signed16 { .. } => 2,
             Self::Unsigned32 { .. } | Self::Signed32 { .. } => 4,
             Self::Absolute64 => 8,
         }
@@ -131,6 +136,16 @@ impl EntryEncoding {
 
     fn decode(self, chunk: &[u8]) -> Option<u64> {
         match self {
+            Self::Unsigned16 { base } => {
+                let bytes: [u8; 2] = chunk.try_into().ok()?;
+                let raw = u16::from_le_bytes(bytes);
+                base.checked_add(u64::from(raw))
+            }
+            Self::Signed16 { base } => {
+                let bytes: [u8; 2] = chunk.try_into().ok()?;
+                let raw = i16::from_le_bytes(bytes);
+                base.checked_add_signed(i64::from(raw))
+            }
             Self::Unsigned32 { base } => {
                 let bytes: [u8; 4] = chunk.try_into().ok()?;
                 let raw = u32::from_le_bytes(bytes);
@@ -162,8 +177,12 @@ enum Value {
         index_width: u32,
         scale: u32,
     },
-    /// A 32-bit table entry loaded into a register.
-    Entry { load: Load, signed: bool },
+    /// A 16- or 32-bit table entry loaded into a register.
+    Entry {
+        load: Load,
+        signed: bool,
+        element: u32,
+    },
     /// Resolved dispatch target address.
     Target { load: Load, encoding: EntryEncoding },
 }
@@ -436,6 +455,9 @@ struct RawGuard {
     reg: Register,
     bits: u32,
     fact: GuardFact,
+    /// Trace position where `reg` held the compared value (usually the branch site, or the
+    /// `sub`/`dec` site itself when the guard comes from flags set before modifying `reg`).
+    at: usize,
 }
 
 /// Resolve the jump table dispatched by the indirect `jmp` that ends `trace`.
@@ -483,7 +505,16 @@ pub(crate) fn resolve_in(
             leaf,
             MAX_INFERRED_ENTRIES,
         )
-        .or_else(|| infer_fn_table(image, jmp, load_site, load.table, encoding));
+        .or_else(|| {
+            infer_fn_table_capped(
+                image,
+                jmp,
+                load_site,
+                load.table,
+                encoding,
+                MAX_INFERRED_ENTRIES,
+            )
+        });
     };
     if bound.min > bound.max {
         return None;
@@ -497,11 +528,15 @@ pub(crate) fn resolve_in(
     let table_start = load.table.checked_add(bound.min.checked_mul(entry_size)?)?;
     let byte_len = count.checked_mul(entry_size)?;
     table_start.checked_add(byte_len)?;
-    // The only bound is the width of a zero-extended byte/word index (e.g. its mask or guard lies
-    // before a loop the slice does not cross): a table that ends before that range does is read
-    // as far as its entries stay inside the function, as for a table without a bound. A bound
-    // narrowed by a guard or a definition still rejects such a table.
-    let width_only = slicer.width_only && bound.min == 0 && matches!(bound.max, 0xff | 0xffff);
+    // The only bound is the width of a zero-extended byte/word or an unnarrowed logical right
+    // shift (`0x0f`, `0x1f`, `0x3f`, `0x7f`, `0xff`, ..., `0xffff`, with no guard narrowing it):
+    // a table that ends before that range does is read as far as its entries stay valid, as for a
+    // table without a bound. A bound narrowed by a guard still rejects an incomplete table.
+    let width_only = slicer.width_only
+        && bound.min == 0
+        && bound.max > 0
+        && bound.max <= 0xffff
+        && (bound.max & (bound.max + 1)) == 0;
     let infer_within_width = || {
         width_only
             .then(|| {
@@ -514,6 +549,16 @@ pub(crate) fn resolve_in(
                     leaf,
                     count_usize,
                 )
+                .or_else(|| {
+                    infer_fn_table_capped(
+                        image,
+                        jmp,
+                        load_site,
+                        load.table,
+                        encoding,
+                        count_usize,
+                    )
+                })
             })
             .flatten()
     };
@@ -522,38 +567,116 @@ pub(crate) fn resolve_in(
     };
     let owner = image.function_table.function_at(jmp.ip());
     let mut targets = Vec::with_capacity(count_usize);
+    let mut intra_ok = true;
     for chunk in bytes.chunks_exact(entry_size as usize) {
         let Some(target) = encoding.decode(chunk) else {
-            return infer_within_width();
+            intra_ok = false;
+            break;
         };
         if image.code_bytes(target).is_err() || image.function_table.function_at(target) != owner {
-            return infer_within_width();
+            intra_ok = false;
+            break;
         }
         targets.push(target);
     }
-    if targets.len() != count_usize {
-        return infer_within_width();
+    if intra_ok && targets.len() == count_usize {
+        return Some(JumpTable {
+            site: jmp.ip(),
+            load_site,
+            table: table_start,
+            targets,
+            index: bound.index,
+            inferred: false,
+            alternates: Vec::new(),
+        });
     }
-    Some(JumpTable {
-        site: jmp.ip(),
-        load_site,
-        table: table_start,
-        targets,
-        index: bound.index,
-        inferred: false,
-        alternates: Vec::new(),
-    })
+    // Bounded 64-bit absolute function-pointer table (cross-function tail-call dispatch): when
+    // intra-function validation rejected entries pointing to other functions, accept a relocated
+    // table whose every slot is either a valid function start or an unrelocated null sentinel.
+    if encoding == EntryEncoding::Absolute64
+        && !width_only
+        && let Some(fn_table) = resolve_bounded_fn_table(
+            image,
+            jmp,
+            load_site,
+            table_start,
+            count_usize,
+            bound.index,
+        )
+    {
+        return Some(fn_table);
+    }
+    infer_within_width()
 }
 
 /// Maximum number of dominating blocks synthesized into a CFG-aware jump-table trace.
-#[cfg_attr(not(test), allow(dead_code))]
 const MAX_CFG_DOM_BLOCKS: usize = 64;
+
+/// Maximum number of intra-function blocks explored when building a local dominator subgraph for
+/// [`resolve_in_subgraph`].
+const MAX_CFG_DOM_SUBGRAPH: usize = 512;
+
+/// Resolve the indirect jump at the end of `jmp_block` directly from discovery's global block map
+/// by extracting the bounded intra-function CFG reachable from `owner` and running
+/// [`resolve_in_cfg`]. Cuts the dominator chain at any block in `resume_targets`.
+pub(crate) fn resolve_in_subgraph(
+    image: &CodeImage<'_>,
+    blocks: &BTreeMap<u64, BasicBlock>,
+    entries: &BTreeSet<u64>,
+    resume_targets: &BTreeSet<u64>,
+    owner: u64,
+    jmp_block: u64,
+    leaf: Option<(u64, u64)>,
+) -> Option<JumpTable> {
+    if !blocks.contains_key(&owner) || !blocks.contains_key(&jmp_block) {
+        return None;
+    }
+    let mut sub_blocks: BTreeMap<u64, BasicBlock> = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(owner);
+    while let Some(va) = queue.pop_front() {
+        if sub_blocks.contains_key(&va) {
+            continue;
+        }
+        if sub_blocks.len() >= MAX_CFG_DOM_SUBGRAPH {
+            return None;
+        }
+        let Some(block) = blocks.get(&va) else {
+            continue;
+        };
+        let mut cloned = block.clone();
+        for edge in &mut cloned.successors {
+            if let Some(target) = edge.intra_target() {
+                if target != owner && entries.contains(&target) {
+                    *edge = Edge::TailCall(target);
+                } else if !sub_blocks.contains_key(&target) {
+                    queue.push_back(target);
+                }
+            }
+        }
+        sub_blocks.insert(va, cloned);
+    }
+    if !sub_blocks.contains_key(&jmp_block) {
+        return None;
+    }
+    let sub_resumes: BTreeSet<u64> = resume_targets
+        .iter()
+        .copied()
+        .filter(|va| sub_blocks.contains_key(va))
+        .collect();
+    let func = Function {
+        entry: owner,
+        blocks: sub_blocks,
+        callees: BTreeSet::new(),
+        resume_targets: sub_resumes,
+    };
+    resolve_in_cfg(image, &func, jmp_block, leaf)
+}
 
 /// Resolve the indirect jump at the end of `jmp_block` using CFG dominance and all-paths clobber
 /// verification, allowing multi-predecessor / diamond CFGs where the switch range check dominates
 /// `jmp_block` and holds along every path into it without any intervening arm clobbering the
 /// guarded index or table base.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn resolve_in_cfg(
     image: &CodeImage<'_>,
     func: &Function,
@@ -628,7 +751,6 @@ pub(crate) fn resolve_in_cfg(
 /// All reachable blocks that can execute strictly between the last execution of `dom` and an
 /// execution of `target` (where `dom` dominates `target`). Includes `target` itself iff `target`
 /// can loop back to itself without passing through `dom`.
-#[cfg_attr(not(test), allow(dead_code))]
 fn blocks_between(
     dom: u64,
     target: u64,
@@ -659,7 +781,6 @@ fn blocks_between(
 /// Whether every intra-function path from `dom_block` to `target` takes the same direction out of
 /// `dom_block`'s conditional branch (`Some(true)` = taken, `Some(false)` = fallthrough, `None` =
 /// both directions can reach `target` or `dom_block` is not a conditional branch).
-#[cfg_attr(not(test), allow(dead_code))]
 fn branch_direction(
     dom_block: &BasicBlock,
     target: u64,
@@ -695,7 +816,6 @@ fn branch_direction(
 }
 
 /// All 16 64-bit general-purpose registers in deterministic order.
-#[cfg_attr(not(test), allow(dead_code))]
 const ALL_GPR64: [Register; 16] = [
     Register::RAX,
     Register::RCX,
@@ -718,7 +838,6 @@ const ALL_GPR64: [Register; 16] = [
 /// Synthesize opaque clobber-barrier instructions for every GPR, memory write, and flag
 /// modification performed by any block in `between`, so the backward slicer rejects any value,
 /// table base, or guard that ANY intervening path could clobber.
-#[cfg_attr(not(test), allow(dead_code))]
 fn collect_clobber_barriers(
     func: &Function,
     between: &BTreeSet<u64>,
@@ -831,12 +950,18 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
         return UnresolvedJump::Computed;
     }
     if jmp.op0_kind() == OpKind::Memory {
-        let scaled = jmp.memory_index() != Register::None && jmp.memory_index_scale() == 8;
-        return if scaled {
-            UnresolvedJump::TableBaseUnknown
-        } else {
-            UnresolvedJump::MemoryOperand
-        };
+        let scaled = !jmp.is_ip_rel_memory_operand()
+            && jmp.memory_index() != Register::None
+            && jmp.memory_index_scale() == 8;
+        if scaled {
+            let mut slicer = Slicer::new(image, trace);
+            return if slicer.table_load(at, 0, 8, 0).is_some() {
+                UnresolvedJump::TableUnbounded
+            } else {
+                UnresolvedJump::TableBaseUnknown
+            };
+        }
+        return UnresolvedJump::MemoryOperand;
     }
     if jmp.op0_kind() != OpKind::Register {
         return UnresolvedJump::Computed;
@@ -863,12 +988,15 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
                 before = def;
                 continue;
             }
-            Mnemonic::Mov | Mnemonic::Movsxd
+            Mnemonic::Mov | Mnemonic::Movsxd | Mnemonic::Movzx | Mnemonic::Movsx
                 if instr.op_count() == 2 && instr.op1_kind() == OpKind::Memory =>
             {
                 return if is_table_read(instr) {
                     UnresolvedJump::TableBaseUnknown
-                } else if instr.op0_register().is_gpr64() && instr.memory_size().size() == 8 {
+                } else if instr.mnemonic() == Mnemonic::Mov
+                    && instr.op0_register().is_gpr64()
+                    && instr.memory_size().size() == 8
+                {
                     UnresolvedJump::LoadedPointer
                 } else {
                     UnresolvedJump::Computed
@@ -905,13 +1033,23 @@ pub(crate) fn classify(image: &CodeImage<'_>, trace: &[Step<'_>]) -> UnresolvedJ
     UnresolvedJump::Computed
 }
 
-/// `mov r32 / movsxd r64 / mov r64, [base + index*scale + disp]` with a scaled index (4 or 8).
+/// `mov r32 / movsxd r64 / mov r64 / movzx / movsx, [base + index*scale + disp]` with a scaled
+/// index (2, 4, or 8).
 fn is_table_read(instr: &Instruction) -> bool {
-    matches!(instr.mnemonic(), Mnemonic::Mov | Mnemonic::Movsxd)
+    let valid_mnemonic = matches!(
+        instr.mnemonic(),
+        Mnemonic::Mov | Mnemonic::Movsxd | Mnemonic::Movzx | Mnemonic::Movsx
+    );
+    valid_mnemonic
         && instr.op_count() == 2
         && instr.op1_kind() == OpKind::Memory
         && instr.memory_index() != Register::None
-        && matches!(instr.memory_index_scale(), 4 | 8)
+        && match instr.mnemonic() {
+            Mnemonic::Movzx | Mnemonic::Movsx => {
+                instr.memory_size().size() == 2 && instr.memory_index_scale() == 2
+            }
+            _ => matches!(instr.memory_index_scale(), 4 | 8),
+        }
 }
 
 /// Fewest leading entries an inferred table must have.
@@ -1018,7 +1156,7 @@ pub(crate) fn is_function_start(image: &CodeImage<'_>, va: u64) -> bool {
     match image.function_table.range_at(va) {
         Some(r) => r.start == va && r.function == va,
         None => {
-            va % 16 == 0
+            va.is_multiple_of(16)
                 && va
                     .checked_sub(1)
                     .and_then(|prev| image.bytes_at(prev, 1))
@@ -1027,54 +1165,140 @@ pub(crate) fn is_function_start(image: &CodeImage<'_>, va: u64) -> bool {
     }
 }
 
-/// Whether `table` is a function-pointer table found by [`infer_fn_table`]: an inferred
-/// single-level table whose every case is the start of a function other than the jumping one.
+/// Maximum consecutive unrelocated null (`0u64`) sentinel slots skipped inside a sparse relocated
+/// function-pointer table by [`infer_fn_table_capped`].
+const MAX_INTERIOR_NULL_SLOTS: usize = 4;
+
+/// Whether `table` is a relocated 64-bit function-pointer table (bounded or inferred, single or
+/// multi-base alternates): backed by PE `DIR64` data relocations and every target is the start of
+/// a function other than the jumping one.
 pub(crate) fn is_fn_table(image: &CodeImage<'_>, table: &JumpTable) -> bool {
+    if image.data_relocs.is_empty() || table.targets.is_empty() {
+        return false;
+    }
+    if table.inferred && table.targets.len() < MIN_INFERRED_ENTRIES {
+        return false;
+    }
+    let has_reloc_slot = |t: &JumpTable| {
+        image.data_relocs.contains(&t.table)
+            || t.table
+                .checked_add(8)
+                .is_some_and(|next| image.data_relocs.contains(&next))
+    };
+    if !table.tables().all(has_reloc_slot) {
+        return false;
+    }
     let owner = image.function_table.function_at(table.site);
-    table.inferred
-        && table.index.is_none()
-        && table.alternates.is_empty()
-        && table.targets.len() >= MIN_INFERRED_ENTRIES
-        && table
-            .targets
-            .iter()
-            .all(|&t| is_function_start(image, t) && (owner.is_none() || owner != Some(t)))
+    table
+        .all_targets()
+        .all(|t| is_function_start(image, t) && (owner.is_none() || owner != Some(t)))
+}
+
+/// Bounded 64-bit absolute function-pointer table (`jmp [base + idx*8]` / `mov r, [base + idx*8];
+/// jmp r`) with a proven index range `[bound.min, bound.max]`. Every slot in the proven range must
+/// be either a `DIR64`-relocated [`is_function_start`] pointer or an unrelocated `0` sentinel;
+/// dense tables stay `inferred: false` while null-padded tables become `inferred: true` (requiring
+/// at least [`MIN_INFERRED_ENTRIES`] valid function targets).
+fn resolve_bounded_fn_table(
+    image: &CodeImage<'_>,
+    jmp: &Instruction,
+    load_site: u64,
+    table_start: u64,
+    count_usize: usize,
+    index: Option<JumpTableIndex>,
+) -> Option<JumpTable> {
+    if count_usize == 0 || image.data_relocs.is_empty() {
+        return None;
+    }
+    let owner = image.function_table.function_at(jmp.ip());
+    let mut targets = Vec::with_capacity(count_usize);
+    let mut has_nulls = false;
+    let mut va = table_start;
+    for _ in 0..count_usize {
+        let raw = read(image, va, 8).and_then(|chunk| EntryEncoding::Absolute64.decode(chunk))?;
+        if image.data_relocs.contains(&va) {
+            if !is_function_start(image, raw) || (owner.is_some() && owner == Some(raw)) {
+                return None;
+            }
+            targets.push(raw);
+        } else if raw == 0 {
+            has_nulls = true;
+        } else {
+            return None;
+        }
+        va = va.checked_add(8)?;
+    }
+    if targets.is_empty() || (has_nulls && targets.len() < MIN_INFERRED_ENTRIES) {
+        return None;
+    }
+    Some(JumpTable {
+        site: jmp.ip(),
+        load_site,
+        table: table_start,
+        targets,
+        index: if has_nulls { None } else { index },
+        inferred: has_nulls,
+        alternates: Vec::new(),
+    })
 }
 
 /// An unbounded read of a 64-bit pointer table (`jmp [base + index*8]`) whose entries are
 /// function starts rather than case labels of the jumping function: a tail call through a
-/// function-pointer table. The table is read from index 0 while every slot is a base-relocated
-/// pointer (`.rdata` slots the loader rewrites, [`CodeImage::data_relocs`]) whose value is the
-/// start of a function ([`is_function_start`]); the first slot that is not ends it, so the extent stops at the
-/// next unrelocated word, symbol or table. Fewer than [`MIN_INFERRED_ENTRIES`] entries do not
-/// count. The table is never assumed complete: the lifted `switch` sends every other value
-/// through the runtime dispatcher, as for an unresolved jump. Without relocation data nothing
-/// is recognised.
-fn infer_fn_table(
+/// function-pointer table. The table is read from index 0 while every non-zero slot is a
+/// base-relocated pointer (`.rdata` slots the loader rewrites, [`CodeImage::data_relocs`]) whose
+/// value is the start of a function ([`is_function_start`]); at most one leading unrelocated `0`
+/// sentinel (for 1-based enum tables) and runs of up to [`MAX_INTERIOR_NULL_SLOTS`] unrelocated
+/// `0` slots between valid entries are skipped. The first non-zero invalid slot or longer zero
+/// run ends it, so the extent stops at the next unrelocated word, symbol, padding, or table.
+/// Fewer than [`MIN_INFERRED_ENTRIES`] entries do not count. The table is never assumed complete:
+/// the lifted `switch` sends every other value through the runtime dispatcher, as for an
+/// unresolved jump. Without relocation data nothing is recognised.
+fn infer_fn_table_capped(
     image: &CodeImage<'_>,
     jmp: &Instruction,
     load_site: u64,
     table: u64,
     encoding: EntryEncoding,
+    limit: usize,
 ) -> Option<JumpTable> {
-    if encoding != EntryEncoding::Absolute64 {
+    if encoding != EntryEncoding::Absolute64
+        || limit < MIN_INFERRED_ENTRIES
+        || image.data_relocs.is_empty()
+    {
         return None;
     }
+    let owner = image.function_table.function_at(jmp.ip());
+    let cap = limit
+        .min(MAX_INFERRED_ENTRIES)
+        .min(usize::try_from(MAX_JUMP_TABLE_ENTRIES).unwrap_or(usize::MAX));
     let mut targets = Vec::new();
     let mut va = table;
-    while targets.len() < MAX_INFERRED_ENTRIES {
-        if !image.data_relocs.contains(&va) {
-            break;
-        }
-        let Some(target) =
+    let mut consecutive_nulls: usize = 0;
+    for slot_idx in 0..cap {
+        let Some(raw) =
             read(image, va, 8).and_then(|chunk| EntryEncoding::Absolute64.decode(chunk))
         else {
             break;
         };
-        if !is_function_start(image, target) {
+        if image.data_relocs.contains(&va) {
+            if !is_function_start(image, raw) || (owner.is_some() && owner == Some(raw)) {
+                break;
+            }
+            targets.push(raw);
+            consecutive_nulls = 0;
+        } else if raw == 0 {
+            consecutive_nulls += 1;
+            // Allow at most 1 leading null at slot 0 (1-based enum table), and up to
+            // `MAX_INTERIOR_NULL_SLOTS` consecutive nulls between valid entries.
+            if (slot_idx == 0 && consecutive_nulls > 1)
+                || (targets.is_empty() && slot_idx > 0)
+                || consecutive_nulls > MAX_INTERIOR_NULL_SLOTS
+            {
+                break;
+            }
+        } else {
             break;
         }
-        targets.push(target);
         let Some(next) = va.checked_add(8) else {
             break;
         };
@@ -1405,7 +1629,11 @@ impl Slicer<'_, '_, '_, '_> {
         let instr = self.trace[at].instr;
         if instr.mnemonic() == Mnemonic::Cdqe {
             return match self.value(Register::RAX, at, depth + 1)? {
-                Value::Entry { load, .. } => Some(Value::Entry { load, signed: true }),
+                Value::Entry { load, element, .. } => Some(Value::Entry {
+                    load,
+                    signed: true,
+                    element,
+                }),
                 _ => None,
             };
         }
@@ -1438,9 +1666,10 @@ impl Slicer<'_, '_, '_, '_> {
                 if dst.is_gpr32() && instr.op1_register().is_gpr32() =>
             {
                 match self.value(instr.op1_register(), at, depth + 1)? {
-                    Value::Entry { load, .. } => Some(Value::Entry {
+                    Value::Entry { load, element, .. } => Some(Value::Entry {
                         load,
                         signed: false,
+                        element,
                     }),
                     _ => None,
                 }
@@ -1449,27 +1678,70 @@ impl Slicer<'_, '_, '_, '_> {
                 if dst.is_gpr64() && instr.op1_register().is_gpr32() =>
             {
                 match self.value(instr.op1_register(), at, depth + 1)? {
-                    Value::Entry { load, .. } => Some(Value::Entry { load, signed: true }),
+                    Value::Entry { load, element, .. } => Some(Value::Entry {
+                        load,
+                        signed: true,
+                        element,
+                    }),
                     _ => None,
                 }
+            }
+            (Mnemonic::Movzx, OpKind::Memory)
+                if (dst.is_gpr32() || dst.is_gpr64()) && instr.memory_size().size() == 2 =>
+            {
+                let load = self.table_load(at, 1, 2, depth)?;
+                Some(Value::Entry {
+                    load,
+                    signed: false,
+                    element: 2,
+                })
+            }
+            (Mnemonic::Movsx, OpKind::Memory)
+                if (dst.is_gpr32() || dst.is_gpr64()) && instr.memory_size().size() == 2 =>
+            {
+                let load = self.table_load(at, 1, 2, depth)?;
+                Some(Value::Entry {
+                    load,
+                    signed: true,
+                    element: 2,
+                })
             }
             (Mnemonic::Mov, OpKind::Memory) if dst.is_gpr32() => {
                 let load = self.table_load(at, 1, 4, depth)?;
                 Some(Value::Entry {
                     load,
                     signed: false,
+                    element: 4,
                 })
             }
             (Mnemonic::Movsxd, OpKind::Memory) if dst.is_gpr64() => {
                 let load = self.table_load(at, 1, 4, depth)?;
-                Some(Value::Entry { load, signed: true })
+                Some(Value::Entry {
+                    load,
+                    signed: true,
+                    element: 4,
+                })
             }
             (Mnemonic::Mov, OpKind::Memory) if dst.is_gpr64() => {
-                let load = self.table_load(at, 1, 8, depth)?;
-                Some(Value::Target {
-                    load,
-                    encoding: EntryEncoding::Absolute64,
-                })
+                if instr.is_ip_rel_memory_operand() {
+                    let slot = checked_rip_target(instr)?;
+                    if self.image.data_relocs.contains(&slot)
+                        && let Some(bytes) = read(self.image, slot, 8)
+                    {
+                        let va = u64::from_le_bytes(bytes.try_into().ok()?);
+                        if self.image.contains(va) {
+                            return Some(Value::Const(va));
+                        }
+                    }
+                    return None;
+                }
+                if let Some(load) = self.table_load(at, 1, 8, depth) {
+                    return Some(Value::Target {
+                        load,
+                        encoding: EntryEncoding::Absolute64,
+                    });
+                }
+                self.spilled_value(at, depth)
             }
             (Mnemonic::Add, OpKind::Register)
                 if dst.is_gpr64() && instr.op1_register().is_gpr64() =>
@@ -1492,6 +1764,44 @@ impl Slicer<'_, '_, '_, '_> {
         }
     }
 
+    /// Recover a 64-bit symbolic value reloaded from a non-indexed stack/frame slot
+    /// (`mov rBase, [rsp+0x20]` paired with an earlier `mov [rsp+0x20], rSrc` with no intervening
+    /// base modification or aliasing memory write).
+    fn spilled_value(&mut self, at: usize, depth: u32) -> Option<Value> {
+        if depth >= MAX_SLICE_DEPTH || !self.consume_step() {
+            return None;
+        }
+        let load = self.trace.get(at)?.instr;
+        if load.op_count() != 2
+            || load.op1_kind() != OpKind::Memory
+            || load.is_ip_rel_memory_operand()
+            || load.memory_index() != Register::None
+            || matches!(load.memory_segment(), Register::FS | Register::GS)
+            || load.memory_size().size() != 8
+        {
+            return None;
+        }
+        let base = load.memory_base();
+        if !base.is_gpr64() {
+            return None;
+        }
+        for i in (0..at).rev() {
+            let instr = self.trace[i].instr;
+            if instr.mnemonic() == Mnemonic::Mov
+                && instr.op_count() == 2
+                && instr.op1_kind() == OpKind::Register
+                && instr.op1_register().is_gpr64()
+                && Self::same_slot(instr, 0, load, 1)
+            {
+                return self.value(instr.op1_register(), i, depth + 1);
+            }
+            if self.writes(instr, base) || self.may_alias_slot(instr, load, 1) {
+                break;
+            }
+        }
+        None
+    }
+
     fn offset_value(val: Value, delta: i64) -> Option<Value> {
         match val {
             Value::Const(va) => va.checked_add_signed(delta).map(Value::Const),
@@ -1507,6 +1817,24 @@ impl Slicer<'_, '_, '_, '_> {
                 index_at,
                 index_width,
                 scale,
+            }),
+            Value::Target {
+                load,
+                encoding: EntryEncoding::Unsigned16 { base },
+            } => Some(Value::Target {
+                load,
+                encoding: EntryEncoding::Unsigned16 {
+                    base: base.checked_add_signed(delta)?,
+                },
+            }),
+            Value::Target {
+                load,
+                encoding: EntryEncoding::Signed16 { base },
+            } => Some(Value::Target {
+                load,
+                encoding: EntryEncoding::Signed16 {
+                    base: base.checked_add_signed(delta)?,
+                },
             }),
             Value::Target {
                 load,
@@ -1542,13 +1870,29 @@ impl Slicer<'_, '_, '_, '_> {
         let lhs = self.value(a, at, depth + 1);
         let rhs = self.value(b, at, depth + 1);
         match (lhs, rhs) {
-            (Some(Value::Const(base)), Some(Value::Entry { load, signed }))
-            | (Some(Value::Entry { load, signed }), Some(Value::Const(base))) => {
+            (
+                Some(Value::Const(base)),
+                Some(Value::Entry {
+                    load,
+                    signed,
+                    element,
+                }),
+            )
+            | (
+                Some(Value::Entry {
+                    load,
+                    signed,
+                    element,
+                }),
+                Some(Value::Const(base)),
+            ) => {
                 let adj_base = checked_disp_add(base, disp)?;
-                let encoding = if signed {
-                    EntryEncoding::Signed32 { base: adj_base }
-                } else {
-                    EntryEncoding::Unsigned32 { base: adj_base }
+                let encoding = match (element, signed) {
+                    (2, false) => EntryEncoding::Unsigned16 { base: adj_base },
+                    (2, true) => EntryEncoding::Signed16 { base: adj_base },
+                    (4, false) => EntryEncoding::Unsigned32 { base: adj_base },
+                    (4, true) => EntryEncoding::Signed32 { base: adj_base },
+                    _ => return None,
                 };
                 Some(Value::Target { load, encoding })
             }
@@ -1567,10 +1911,11 @@ impl Slicer<'_, '_, '_, '_> {
         depth: u32,
     ) -> Option<Value> {
         let table = checked_disp_add(base, disp)?;
-        if let Some((orig_idx, orig_at, orig_width, scale)) = self.scaled_index(idx, at, depth + 1)
+        if let Some((orig_idx, orig_at, orig_width, scale, byte_disp)) =
+            self.scaled_index(idx, at, depth + 1)
         {
             Some(Value::TablePtr {
-                table,
+                table: table.checked_add_signed(byte_disp)?,
                 index: orig_idx,
                 index_at: orig_at,
                 index_width: orig_width,
@@ -1631,14 +1976,14 @@ impl Slicer<'_, '_, '_, '_> {
         None
     }
 
-    /// If `reg` before `before` holds `orig_idx * scale` (with `scale` in `{2, 4, 8}`), return
-    /// `(orig_idx, orig_at, orig_width, scale)`.
+    /// If `reg` before `before` holds `orig_idx * scale + byte_disp` (with `scale` in `{2, 4, 8}`),
+    /// return `(orig_idx, orig_at, orig_width, scale, byte_disp)`.
     fn scaled_index(
         &mut self,
         reg: Register,
         before: usize,
         depth: u32,
-    ) -> Option<(Register, usize, u32, u32)> {
+    ) -> Option<(Register, usize, u32, u32, i64)> {
         if depth > MAX_SLICE_DEPTH || !self.consume_step() {
             return None;
         }
@@ -1646,10 +1991,10 @@ impl Slicer<'_, '_, '_, '_> {
         let at = self.def(reg, before)?;
         let instr = self.trace[at].instr;
         if instr.mnemonic() == Mnemonic::Cdqe {
-            let (orig, orig_at, orig_w, s) = self.scaled_index(Register::RAX, at, depth + 1)?;
-            return Some((orig, orig_at, orig_w.min(32), s));
+            let (orig, orig_at, orig_w, s, d) = self.scaled_index(Register::RAX, at, depth + 1)?;
+            return Some((orig, orig_at, orig_w.min(32), s, d));
         }
-        if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register {
+        if instr.op0_kind() != OpKind::Register {
             return None;
         }
         let dst = instr.op0_register();
@@ -1657,6 +2002,33 @@ impl Slicer<'_, '_, '_, '_> {
             return None;
         }
         let width = if dst.is_gpr32() { 32 } else { 64 };
+        // 3-operand immediate multiply: `imul dst, src, 2|4|8`.
+        if instr.mnemonic() == Mnemonic::Imul
+            && instr.op_count() == 3
+            && instr.op1_kind() == OpKind::Register
+            && ((dst.is_gpr64() && instr.op1_register().is_gpr64())
+                || (dst.is_gpr32() && instr.op1_register().is_gpr32()))
+            && let Ok(imm) = instr.try_immediate(2)
+            && let Some(factor) = match imm {
+                2 => Some(2u32),
+                4 => Some(4u32),
+                8 => Some(8u32),
+                _ => None,
+            }
+        {
+            let src = instr.op1_register();
+            if factor <= 4
+                && let Some((orig, orig_at, orig_w, s, d)) = self.scaled_index(src, at, depth + 1)
+                && s.checked_mul(factor).is_some_and(|total| total <= 8)
+                && let Some(nd) = d.checked_mul(i64::from(factor))
+            {
+                return Some((orig, orig_at, orig_w.min(width), s * factor, nd));
+            }
+            return Some((src.full_register(), at, width, factor, 0));
+        }
+        if instr.op_count() != 2 {
+            return None;
+        }
         match (instr.mnemonic(), instr.op1_kind()) {
             (Mnemonic::Mov, OpKind::Register)
                 if dst.is_gpr64() && instr.op1_register().is_gpr64() =>
@@ -1666,41 +2038,61 @@ impl Slicer<'_, '_, '_, '_> {
             (Mnemonic::Mov, OpKind::Register)
                 if dst.is_gpr32() && instr.op1_register().is_gpr32() =>
             {
-                let (orig, orig_at, orig_w, s) =
+                let (orig, orig_at, orig_w, s, d) =
                     self.scaled_index(instr.op1_register(), at, depth + 1)?;
-                Some((orig, orig_at, orig_w.min(32), s))
+                Some((orig, orig_at, orig_w.min(32), s, d))
             }
             (Mnemonic::Movsxd, OpKind::Register)
                 if dst.is_gpr64() && instr.op1_register().is_gpr32() =>
             {
-                let (orig, orig_at, orig_w, s) =
+                let (orig, orig_at, orig_w, s, d) =
                     self.scaled_index(instr.op1_register(), at, depth + 1)?;
-                Some((orig, orig_at, orig_w.min(32), s))
+                Some((orig, orig_at, orig_w.min(32), s, d))
             }
             (Mnemonic::Shl, _) if instr.try_immediate(1).is_ok() => {
                 let shift = instr.try_immediate(1).ok()?;
                 if matches!(shift, 1..=3) {
                     let factor = 1u32 << shift;
                     if factor <= 4
-                        && let Some((orig, orig_at, orig_w, s)) =
+                        && let Some((orig, orig_at, orig_w, s, d)) =
                             self.scaled_index(dst, at, depth + 1)
                         && s.checked_mul(factor).is_some_and(|total| total <= 8)
+                        && let Some(nd) = d.checked_mul(i64::from(factor))
                     {
-                        Some((orig, orig_at, orig_w.min(width), s * factor))
+                        Some((orig, orig_at, orig_w.min(width), s * factor, nd))
                     } else {
-                        Some((dst.full_register(), at, width, factor))
+                        Some((dst.full_register(), at, width, factor, 0))
                     }
                 } else {
                     None
                 }
             }
-            (Mnemonic::Add, OpKind::Register) if dst == instr.op1_register() => {
-                if let Some((orig, orig_at, orig_w, s)) = self.scaled_index(dst, at, depth + 1)
-                    && s <= 4
+            (Mnemonic::Imul, _) if instr.try_immediate(1).is_ok() => {
+                let factor = match instr.try_immediate(1).ok()? {
+                    2 => 2u32,
+                    4 => 4u32,
+                    8 => 8u32,
+                    _ => return None,
+                };
+                if factor <= 4
+                    && let Some((orig, orig_at, orig_w, s, d)) =
+                        self.scaled_index(dst, at, depth + 1)
+                    && s.checked_mul(factor).is_some_and(|total| total <= 8)
+                    && let Some(nd) = d.checked_mul(i64::from(factor))
                 {
-                    Some((orig, orig_at, orig_w.min(width), s * 2))
+                    Some((orig, orig_at, orig_w.min(width), s * factor, nd))
                 } else {
-                    Some((dst.full_register(), at, width, 2))
+                    Some((dst.full_register(), at, width, factor, 0))
+                }
+            }
+            (Mnemonic::Add, OpKind::Register) if dst == instr.op1_register() => {
+                if let Some((orig, orig_at, orig_w, s, d)) = self.scaled_index(dst, at, depth + 1)
+                    && s <= 4
+                    && let Some(nd) = d.checked_mul(2)
+                {
+                    Some((orig, orig_at, orig_w.min(width), s * 2, nd))
+                } else {
+                    Some((dst.full_register(), at, width, 2, 0))
                 }
             }
             (Mnemonic::Lea, OpKind::Memory)
@@ -1708,16 +2100,17 @@ impl Slicer<'_, '_, '_, '_> {
                     && !matches!(instr.memory_segment(), Register::FS | Register::GS)
                     && instr.memory_base().is_gpr64()
                     && instr.memory_index() == instr.memory_base()
-                    && instr.memory_index_scale() == 1
-                    && instr.memory_displacement64() == 0 =>
+                    && instr.memory_index_scale() == 1 =>
             {
                 let base = instr.memory_base();
-                if let Some((orig, orig_at, orig_w, s)) = self.scaled_index(base, at, depth + 1)
+                let disp = sign_extend(instr.memory_displacement64(), width);
+                if let Some((orig, orig_at, orig_w, s, d)) = self.scaled_index(base, at, depth + 1)
                     && s <= 4
+                    && let Some(nd) = d.checked_mul(2).and_then(|v| v.checked_add(disp))
                 {
-                    Some((orig, orig_at, orig_w.min(width), s * 2))
+                    Some((orig, orig_at, orig_w.min(width), s * 2, nd))
                 } else {
-                    Some((base.full_register(), at, width, 2))
+                    Some((base.full_register(), at, width, 2, disp))
                 }
             }
             (Mnemonic::Lea, OpKind::Memory)
@@ -1725,18 +2118,22 @@ impl Slicer<'_, '_, '_, '_> {
                     && !matches!(instr.memory_segment(), Register::FS | Register::GS)
                     && instr.memory_base() == Register::None
                     && instr.memory_index().is_gpr64()
-                    && instr.memory_displacement64() == 0
                     && matches!(instr.memory_index_scale(), 2 | 4 | 8) =>
             {
                 let idx = instr.memory_index();
                 let scale = instr.memory_index_scale();
+                let disp = sign_extend(instr.memory_displacement64(), width);
                 if scale <= 4
-                    && let Some((orig, orig_at, orig_w, s)) = self.scaled_index(idx, at, depth + 1)
+                    && let Some((orig, orig_at, orig_w, s, d)) =
+                        self.scaled_index(idx, at, depth + 1)
                     && s.checked_mul(scale).is_some_and(|total| total <= 8)
+                    && let Some(nd) = d
+                        .checked_mul(i64::from(scale))
+                        .and_then(|v| v.checked_add(disp))
                 {
-                    Some((orig, orig_at, orig_w.min(width), s * scale))
+                    Some((orig, orig_at, orig_w.min(width), s * scale, nd))
                 } else {
-                    Some((idx.full_register(), at, width, scale))
+                    Some((idx.full_register(), at, width, scale, disp))
                 }
             }
             _ => None,
@@ -1807,9 +2204,11 @@ impl Slicer<'_, '_, '_, '_> {
             for &(b, idx) in pairs {
                 if let Some(Value::Const(base_va)) = self.value(b, at, depth + 1)
                     && let Some(table) = checked_disp_add(base_va, disp)
-                    && let Some((orig_idx, orig_at, orig_width, s)) =
+                    && let Some((orig_idx, orig_at, orig_width, s, byte_disp)) =
                         self.scaled_index(idx, at, depth + 1)
                     && s == need
+                    && let Some(scaled_disp) = byte_disp.checked_mul(i64::from(scale))
+                    && let Some(table) = table.checked_add_signed(scaled_disp)
                 {
                     return Some(Load {
                         at,
@@ -1972,6 +2371,14 @@ impl Slicer<'_, '_, '_, '_> {
         }
 
         let def_b = def_at.and_then(|at| self.def_bound(at, width, depth));
+        let has_guard = acc.unsigned_upper.is_some()
+            || acc.unsigned_lower > 0
+            || acc.signed_upper.is_some()
+            || acc.signed_lower.is_some()
+            || !acc.excluded.is_empty();
+        if has_guard {
+            self.width_only = false;
+        }
         acc.resolve(def_b, width)
     }
 
@@ -2431,6 +2838,162 @@ impl Slicer<'_, '_, '_, '_> {
                     Self::shift_range(deeper, i128::from(disp), eff_bits, width)
                 }
             }
+            // Branchless switch clamp: `cmp dst, imm; cmovcc dst, src` (e.g. `cmova eax, edx`
+            // clamping an out-of-range index to a bounded default slot).
+            Mnemonic::Cmova
+            | Mnemonic::Cmovae
+            | Mnemonic::Cmovb
+            | Mnemonic::Cmovbe
+            | Mnemonic::Cmovg
+            | Mnemonic::Cmovge
+            | Mnemonic::Cmovl
+            | Mnemonic::Cmovle
+                if src_is_reg
+                    && ((dst.is_gpr32() && src.is_gpr32())
+                        || (dst.is_gpr64() && src.is_gpr64())) =>
+            {
+                self.cmov_clamp_bound(at, width, depth)
+            }
+            _ => None,
+        }
+    }
+
+    /// Map a conditional-move mnemonic to the equivalent conditional-branch mnemonic.
+    fn cmov_to_jcc(mnemonic: Mnemonic) -> Option<Mnemonic> {
+        match mnemonic {
+            Mnemonic::Cmova => Some(Mnemonic::Ja),
+            Mnemonic::Cmovae => Some(Mnemonic::Jae),
+            Mnemonic::Cmovb => Some(Mnemonic::Jb),
+            Mnemonic::Cmovbe => Some(Mnemonic::Jbe),
+            Mnemonic::Cmovg => Some(Mnemonic::Jg),
+            Mnemonic::Cmovge => Some(Mnemonic::Jge),
+            Mnemonic::Cmovl => Some(Mnemonic::Jl),
+            Mnemonic::Cmovle => Some(Mnemonic::Jle),
+            _ => None,
+        }
+    }
+
+    /// Flip a conditional branch for swapped operands (`cmp a, b` <-> `cmp b, a`).
+    fn swap_jcc(jcc: Mnemonic) -> Option<Mnemonic> {
+        match jcc {
+            Mnemonic::Ja => Some(Mnemonic::Jb),
+            Mnemonic::Jae => Some(Mnemonic::Jbe),
+            Mnemonic::Jb => Some(Mnemonic::Ja),
+            Mnemonic::Jbe => Some(Mnemonic::Jae),
+            Mnemonic::Jg => Some(Mnemonic::Jl),
+            Mnemonic::Jge => Some(Mnemonic::Jle),
+            Mnemonic::Jl => Some(Mnemonic::Jg),
+            Mnemonic::Jle => Some(Mnemonic::Jge),
+            Mnemonic::Je => Some(Mnemonic::Je),
+            Mnemonic::Jne => Some(Mnemonic::Jne),
+            _ => None,
+        }
+    }
+
+    /// Convex hull of two proven ranges of the same bit width (drops any two-level index table).
+    fn union_range(a: RangeBound, b: RangeBound) -> Option<RangeBound> {
+        match (a, b) {
+            (RangeBound::Unsigned(ua), RangeBound::Unsigned(ub)) => {
+                Some(RangeBound::Unsigned(Bound {
+                    min: ua.min.min(ub.min),
+                    max: ua.max.max(ub.max),
+                    index: None,
+                }))
+            }
+            (RangeBound::Signed { min: a_lo, max: a_hi }, RangeBound::Signed { min: b_lo, max: b_hi }) => {
+                Some(RangeBound::Signed {
+                    min: a_lo.min(b_lo),
+                    max: a_hi.max(b_hi),
+                })
+            }
+            (RangeBound::Signed { min: s_lo, max: s_hi }, RangeBound::Unsigned(u))
+            | (RangeBound::Unsigned(u), RangeBound::Signed { min: s_lo, max: s_hi }) => {
+                let u_lo = i64::try_from(u.min).ok()?;
+                let u_hi = i64::try_from(u.max).ok()?;
+                let lo = s_lo.min(u_lo);
+                let hi = s_hi.max(u_hi);
+                if lo >= 0 {
+                    Some(RangeBound::Unsigned(Bound {
+                        min: lo as u64,
+                        max: hi as u64,
+                        index: None,
+                    }))
+                } else {
+                    Some(RangeBound::Signed { min: lo, max: hi })
+                }
+            }
+        }
+    }
+
+    /// Bound of a branchless clamp `cmp dst, imm; cmovcc dst, src`: when `cmovcc` is not taken,
+    /// `dst` satisfies the negated flag condition; when taken, `dst` receives `src`. The result is
+    /// the conservative union of both branches.
+    fn cmov_clamp_bound(&mut self, at: usize, width: u32, depth: u32) -> Option<RangeBound> {
+        let instr = self.trace.get(at)?.instr;
+        let dst = instr.op0_register();
+        let src = instr.op1_register();
+        let jcc = Self::cmov_to_jcc(instr.mnemonic())?;
+        let eff_bits = if dst.is_gpr32() { 32 } else { 64 };
+        let raw = self.flag_guard_for_jcc(at, jcc, false)?;
+        if raw.reg.full_register() != dst.full_register()
+            || raw.bits != eff_bits
+            || raw.at != at
+        {
+            return None;
+        }
+        let mut acc = GuardAccumulator::default();
+        acc.add(raw.fact, mask(eff_bits));
+        let pre_dst = self.range_bound(dst, at, eff_bits, depth + 1);
+        let keep = acc.resolve(pre_dst, eff_bits)?;
+        let taken = self.range_bound(src, at, eff_bits, depth + 1)?;
+        let merged = Self::union_range(keep, taken)?;
+        if dst.is_gpr32() {
+            Self::zero_extend_range(merged, 32, width)
+        } else {
+            Some(merged)
+        }
+    }
+
+    /// Resolve a compile-time constant immediate loaded into `reg` before `before` (e.g.
+    /// `xor edx, edx` -> `0`, `mov edx, 12` -> `12`, through up to [`MAX_ALIAS_DEPTH`] copies).
+    fn const_imm(&mut self, reg: Register, before: usize, bits: u32, depth: u32) -> Option<u64> {
+        if bits == 0 || bits > 64 || depth > MAX_ALIAS_DEPTH || !self.consume_step() {
+            return None;
+        }
+        let full = reg.full_register();
+        let at = self.def(full, before)?;
+        let instr = self.trace[at].instr;
+        if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register {
+            return None;
+        }
+        let dst = instr.op0_register();
+        let dst_bits = dst.size() as u32 * 8;
+        match instr.mnemonic() {
+            Mnemonic::Xor
+                if instr.op1_kind() == OpKind::Register
+                    && dst == instr.op1_register()
+                    && (dst.is_gpr32() || dst.is_gpr64() || (!is_high_byte(dst) && dst_bits >= bits)) =>
+            {
+                Some(0)
+            }
+            Mnemonic::Mov
+                if instr.try_immediate(1).is_ok()
+                    && (dst.is_gpr32() || dst.is_gpr64() || (!is_high_byte(dst) && dst_bits >= bits)) =>
+            {
+                let v = instr.try_immediate(1).ok()? & mask(dst_bits);
+                Some(v & mask(bits))
+            }
+            Mnemonic::Mov if instr.op1_kind() == OpKind::Register => {
+                let src = instr.op1_register();
+                if dst.is_gpr64() && src.is_gpr64() {
+                    self.const_imm(src, at, bits, depth + 1)
+                } else if dst.is_gpr32() && src.is_gpr32() {
+                    self.const_imm(src, at, bits.min(32), depth + 1)
+                        .map(|v| v & mask(bits))
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -2526,6 +3089,12 @@ impl Slicer<'_, '_, '_, '_> {
     /// last flag-modifying instruction before it.
     fn guard_at(&mut self, at: usize, taken: bool) -> Option<RawGuard> {
         let jcc = self.trace.get(at)?.instr.mnemonic();
+        self.flag_guard_for_jcc(at, jcc, taken)
+    }
+
+    /// Constraint implied by evaluating `jcc` (`taken` or fallthrough) at trace position `at`
+    /// against the last flag-modifying instruction before `at`.
+    fn flag_guard_for_jcc(&mut self, at: usize, jcc: Mnemonic, taken: bool) -> Option<RawGuard> {
         for i in (0..at).rev() {
             let instr = self.trace[i].instr;
             if matches!(
@@ -2544,20 +3113,113 @@ impl Slicer<'_, '_, '_, '_> {
                     }
                     let cmp_reg = instr.op0_register();
                     let bits = cmp_reg.size() as u32 * 8;
-                    if !cmp_reg.is_gpr()
-                        || bits == 0
-                        || bits > 64
-                        || is_high_byte(cmp_reg)
-                        || (i + 1..at).any(|k| self.writes(self.trace[k].instr, cmp_reg))
-                    {
+                    if !cmp_reg.is_gpr() || bits == 0 || bits > 64 || is_high_byte(cmp_reg) {
                         return None;
                     }
-                    let imm = instr.try_immediate(1).ok()?;
+                    if let Ok(imm) = instr.try_immediate(1) {
+                        if (i + 1..at).any(|k| self.writes(self.trace[k].instr, cmp_reg)) {
+                            return None;
+                        }
+                        let fact = Self::cmp_imm_fact(jcc, taken, imm, bits)?;
+                        return Some(RawGuard {
+                            reg: cmp_reg,
+                            bits,
+                            fact,
+                            at,
+                        });
+                    }
+                    if instr.op1_kind() == OpKind::Register {
+                        let rhs = instr.op1_register();
+                        if !rhs.is_gpr() || is_high_byte(rhs) || rhs.size() != cmp_reg.size() {
+                            return None;
+                        }
+                        if let Some(imm) = self.const_imm(rhs, i, bits, 0) {
+                            if (i + 1..at).any(|k| self.writes(self.trace[k].instr, cmp_reg)) {
+                                return None;
+                            }
+                            let fact = Self::cmp_imm_fact(jcc, taken, imm, bits)?;
+                            return Some(RawGuard {
+                                reg: cmp_reg,
+                                bits,
+                                fact,
+                                at,
+                            });
+                        }
+                        if let Some(imm) = self.const_imm(cmp_reg, i, bits, 0)
+                            && let Some(swapped) = Self::swap_jcc(jcc)
+                            && !(i + 1..at).any(|k| self.writes(self.trace[k].instr, rhs))
+                        {
+                            let fact = Self::cmp_imm_fact(swapped, taken, imm, bits)?;
+                            return Some(RawGuard {
+                                reg: rhs,
+                                bits,
+                                fact,
+                                at,
+                            });
+                        }
+                    }
+                    return None;
+                }
+                Mnemonic::Sub => {
+                    if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register {
+                        return None;
+                    }
+                    let sub_reg = instr.op0_register();
+                    let bits = sub_reg.size() as u32 * 8;
+                    if !sub_reg.is_gpr() || bits == 0 || bits > 64 || is_high_byte(sub_reg) {
+                        return None;
+                    }
+                    let imm = if let Ok(v) = instr.try_immediate(1) {
+                        v
+                    } else if instr.op1_kind() == OpKind::Register {
+                        let rhs = instr.op1_register();
+                        if !rhs.is_gpr() || is_high_byte(rhs) || rhs.size() != sub_reg.size() {
+                            return None;
+                        }
+                        self.const_imm(rhs, i, bits, 0)?
+                    } else {
+                        return None;
+                    };
+                    // `sub r, imm` sets flags identically to `cmp r_before, imm`; anchor the guard
+                    // at `i` (just before `sub` writes `r`).
                     let fact = Self::cmp_imm_fact(jcc, taken, imm, bits)?;
                     return Some(RawGuard {
-                        reg: cmp_reg,
+                        reg: sub_reg,
                         bits,
                         fact,
+                        at: i,
+                    });
+                }
+                Mnemonic::Dec => {
+                    // `dec r` sets ZF/SF/OF identically to `cmp r_before, 1`, but leaves CF
+                    // unchanged — reject any CF-dependent branch condition (`ja`/`jae`/`jb`/`jbe`).
+                    if !matches!(
+                        jcc,
+                        Mnemonic::Je
+                            | Mnemonic::Jne
+                            | Mnemonic::Js
+                            | Mnemonic::Jns
+                            | Mnemonic::Jl
+                            | Mnemonic::Jle
+                            | Mnemonic::Jg
+                            | Mnemonic::Jge
+                    ) {
+                        return None;
+                    }
+                    if instr.op_count() != 1 || instr.op0_kind() != OpKind::Register {
+                        return None;
+                    }
+                    let dec_reg = instr.op0_register();
+                    let bits = dec_reg.size() as u32 * 8;
+                    if !dec_reg.is_gpr() || bits == 0 || bits > 64 || is_high_byte(dec_reg) {
+                        return None;
+                    }
+                    let fact = Self::cmp_imm_fact(jcc, taken, 1, bits)?;
+                    return Some(RawGuard {
+                        reg: dec_reg,
+                        bits,
+                        fact,
+                        at: i,
                     });
                 }
                 Mnemonic::Test | Mnemonic::And | Mnemonic::Or => {
@@ -2587,7 +3249,12 @@ impl Slicer<'_, '_, '_, '_> {
                             (Mnemonic::Je, false) | (Mnemonic::Jne, true) => GuardFact::NotEqual(0),
                             _ => return None,
                         };
-                        return Some(RawGuard { reg: r, bits, fact });
+                        return Some(RawGuard {
+                            reg: r,
+                            bits,
+                            fact,
+                            at,
+                        });
                     }
                     if instr.mnemonic() == Mnemonic::Test
                         && let Ok(imm) = instr.try_immediate(1)
@@ -2598,6 +3265,7 @@ impl Slicer<'_, '_, '_, '_> {
                                 reg: r,
                                 bits,
                                 fact: GuardFact::UnsignedUpper((!imm_u) & mask(bits)),
+                                at,
                             });
                         }
                     }
@@ -2626,6 +3294,73 @@ impl Slicer<'_, '_, '_, '_> {
                     | OpAccess::ReadCondWrite
             )
         })
+    }
+
+    /// Fixed `[rsp + disp]` or `[rbp + disp]` byte span `(base, disp, size)` for non-indexed
+    /// stack/frame slots.
+    fn fixed_frame_slot(instr: &Instruction, op: u32) -> Option<(Register, i64, u64)> {
+        if instr.op_kind(op) != OpKind::Memory
+            || instr.is_ip_rel_memory_operand()
+            || instr.memory_index() != Register::None
+            || matches!(instr.memory_segment(), Register::FS | Register::GS)
+        {
+            return None;
+        }
+        let base = instr.memory_base();
+        if !matches!(base, Register::RSP | Register::RBP) {
+            return None;
+        }
+        let size = instr.memory_size().size() as u64;
+        (size > 0).then_some((base, instr.memory_displacement64() as i64, size))
+    }
+
+    /// Whether `instr` may write memory that overlaps the slot operand `slot_instr[slot_op]`.
+    /// Two fixed `[rsp+d]`/`[rbp+d]` slots on the same unmodified frame base with non-overlapping
+    /// byte spans are provably disjoint; all other memory writes and calls return `true`.
+    fn may_alias_slot(&mut self, instr: &Instruction, slot_instr: &Instruction, slot_op: u32) -> bool {
+        if !self.writes_memory(instr) {
+            return false;
+        }
+        if matches!(
+            instr.flow_control(),
+            FlowControl::Call | FlowControl::IndirectCall
+        ) {
+            return true;
+        }
+        let Some((slot_base, slot_disp, slot_size)) = Self::fixed_frame_slot(slot_instr, slot_op)
+        else {
+            return true;
+        };
+        let slot_lo = i128::from(slot_disp);
+        let slot_hi = slot_lo + i128::from(slot_size);
+        let ii = self.info.info(instr);
+        for m in ii.used_memory() {
+            if !matches!(
+                m.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            ) {
+                continue;
+            }
+            if m.base() != slot_base
+                || m.index() != Register::None
+                || matches!(m.segment(), Register::FS | Register::GS)
+            {
+                return true;
+            }
+            let write_size = m.memory_size().size() as u64;
+            if write_size == 0 {
+                return true;
+            }
+            let w_lo = i128::from(m.displacement() as i64);
+            let w_hi = w_lo + i128::from(write_size);
+            if w_lo < slot_hi && slot_lo < w_hi {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether the memory operands of `a` (operand `a_op`) and `b` (operand `b_op`) name the same
@@ -2669,7 +3404,7 @@ impl Slicer<'_, '_, '_, '_> {
         let mut lower: u64 = 0;
         for i in (0..at).rev() {
             let instr = self.trace[i].instr;
-            if self.writes_memory(instr) || (base.is_gpr64() && self.writes(instr, base)) {
+            if self.may_alias_slot(instr, load, 1) || (base.is_gpr64() && self.writes(instr, base)) {
                 break;
             }
             if instr.mnemonic() == Mnemonic::Cmp
@@ -3046,7 +3781,7 @@ impl Slicer<'_, '_, '_, '_> {
         raw: RawGuard,
     ) -> Option<AdaptedGuard> {
         let query_chain = self.trace_alias_chain(reg, width, branch_at);
-        let guard_chain = self.trace_alias_chain(raw.reg, raw.bits, branch_at);
+        let guard_chain = self.trace_alias_chain(raw.reg, raw.bits, raw.at);
 
         let mut best_shifted: Option<(usize, AdaptedGuard)> = None;
         let mut best_direct: Option<(usize, GuardFact)> = None;
@@ -3731,7 +4466,8 @@ mod tests {
 
     #[test]
     fn stack_slot_bound_is_dropped_after_a_store_or_base_change() {
-        let stores: [fn(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>; 3] = [
+        type AsmStep = fn(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>;
+        let stores: [AsmStep; 3] = [
             |a| a.mov(dword_ptr(rsp + 0x30), r8d),
             |a| a.push(rbx),
             |a| a.call(0x1_4000_9000u64),
@@ -6061,8 +6797,10 @@ mod tests {
     /// h3:    ret
     /// ```
     /// Tables at `DATA`: TA = [h0, h1], TB = [h2, h3] at `DATA + 16`, then a zero entry.
+    type AsmSnippet = fn(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>;
+
     fn two_table_dispatch(
-        alt_base: Option<fn(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>>,
+        alt_base: Option<AsmSnippet>,
     ) -> (Vec<u8>, Vec<u8>, [u64; 4], u64) {
         let ta = DATA;
         let tb = DATA + 16;
@@ -6974,5 +7712,682 @@ mod tests {
         let jt_wo = an_wo.jump_tables.get(&jmp_wo).expect("stops cleanly before non-boundary");
         assert!(jt_wo.inferred);
         assert_eq!(jt_wo.targets, cases_wo[..2]);
+    }
+
+    #[test]
+    fn resolves_bounded_and_sparse_fn_pointer_tables() {
+        // 3 separate .pdata callee functions at aligned offsets, dispatched from a caller at TEXT.
+        let mut a = CodeAssembler::new(64).expect("asm");
+        let mut def = a.create_label();
+        a.cmp(ecx, 2).unwrap();
+        a.ja(def).unwrap();
+        a.mov(eax, ecx).unwrap();
+        lea_rip(&mut a, Register::RDX, DATA).unwrap();
+        a.jmp(qword_ptr(rdx + rax * 8)).unwrap();
+        a.set_label(&mut def).unwrap();
+        a.xor(eax, eax).unwrap();
+        a.ret().unwrap();
+        let caller = a.assemble(TEXT).expect("caller");
+        let jmp_va = find_indirect_jmp(&caller);
+
+        let fn0_off = 0x40u32;
+        let fn1_off = 0x50u32;
+        let fn2_off = 0x60u32;
+        let mut code = caller.clone();
+        code.resize(0x70, 0xcc);
+        for (i, off) in [fn0_off, fn1_off, fn2_off].into_iter().enumerate() {
+            let o = off as usize;
+            code[o] = 0xb8;
+            code[o + 1..o + 5].copy_from_slice(&((i as u32) + 10).to_le_bytes());
+            code[o + 5] = 0xc3;
+        }
+        let fn0 = TEXT + u64::from(fn0_off);
+        let fn1 = TEXT + u64::from(fn1_off);
+        let fn2 = TEXT + u64::from(fn2_off);
+        let ranges = [
+            (0, caller.len() as u32, 0),
+            (fn0_off, fn0_off + 6, fn0_off),
+            (fn1_off, fn1_off + 6, fn1_off),
+            (fn2_off, fn2_off + 6, fn2_off),
+        ];
+
+        // (a) Bounded dense Absolute64 function-pointer table -> inferred: false, TailCall edges.
+        let data_dense: Vec<u8> = [fn0, fn1, fn2]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let mut img_dense = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data_dense, false),
+            ],
+            vec![TEXT],
+        );
+        img_dense.function_table = FunctionTable::new(
+            ranges
+                .iter()
+                .map(|&(s, e, f)| FunctionRange {
+                    start: TEXT + u64::from(s),
+                    end: TEXT + u64::from(e),
+                    function: TEXT + u64::from(f),
+                })
+                .collect(),
+        );
+        for i in 0..3u64 {
+            img_dense.data_relocs.insert(DATA + i * 8);
+        }
+        let an_dense = discover(&img_dense);
+        let jt_dense = an_dense.jump_tables.get(&jmp_va).expect("bounded fn table resolves");
+        assert!(!jt_dense.inferred);
+        assert_eq!(jt_dense.targets, vec![fn0, fn1, fn2]);
+        assert!(super::is_fn_table(&img_dense, jt_dense));
+        assert!(an_dense.functions.contains_key(&fn0));
+        assert!(an_dense.functions.contains_key(&fn1));
+        assert!(an_dense.functions.contains_key(&fn2));
+        assert_eq!(
+            jump_successors(&an_dense.functions[&TEXT], jmp_va),
+            [Edge::TailCall(fn0), Edge::TailCall(fn1), Edge::TailCall(fn2)]
+        );
+
+        // (b) Without data_relocs, bounded cross-function table must stay unresolved.
+        let mut img_noreloc = img_dense.clone();
+        img_noreloc.data_relocs.clear();
+        let an_noreloc = discover(&img_noreloc);
+        assert!(an_noreloc.jump_tables.is_empty());
+
+        // (c) Bounded sparse table `[0, fn1, fn2]` -> resolves fn1, fn2 with inferred: true.
+        let data_sparse_b: Vec<u8> = [0u64, fn1, fn2]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let mut img_sb = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data_sparse_b, false),
+            ],
+            vec![TEXT],
+        );
+        img_sb.function_table = img_dense.function_table.clone();
+        img_sb.data_relocs.insert(DATA + 8);
+        img_sb.data_relocs.insert(DATA + 16);
+        let an_sb = discover(&img_sb);
+        let jt_sb = an_sb.jump_tables.get(&jmp_va).expect("bounded sparse fn table");
+        assert!(jt_sb.inferred);
+        assert_eq!(jt_sb.targets, vec![fn1, fn2]);
+
+        // (d) Unbounded sparse table `[0, fn0, 0, 0, fn1, 0,0,0,0,0, fn2]`:
+        //     skips 1 leading null and 2 interior nulls, stops at the 5-zero gap before fn2.
+        let code_unbounded = assemble_at_text(|a| {
+            lea_rip(a, Register::RDX, DATA)?;
+            a.jmp(qword_ptr(rdx + rcx * 8))?;
+            Ok(())
+        });
+        let jmp_ub = find_indirect_jmp(&code_unbounded);
+        let mut code_ub = code_unbounded.clone();
+        code_ub.resize(0x70, 0xcc);
+        for (i, off) in [fn0_off, fn1_off, fn2_off].into_iter().enumerate() {
+            let o = off as usize;
+            code_ub[o] = 0xb8;
+            code_ub[o + 1..o + 5].copy_from_slice(&((i as u32) + 10).to_le_bytes());
+            code_ub[o + 5] = 0xc3;
+        }
+        let slots = [0u64, fn0, 0, 0, fn1, 0, 0, 0, 0, 0, fn2];
+        let data_ub: Vec<u8> = slots.into_iter().flat_map(u64::to_le_bytes).collect();
+        let mut img_ub = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code_ub, true),
+                CodeSection::new(DATA, &data_ub, false),
+            ],
+            vec![TEXT],
+        );
+        img_ub.function_table = FunctionTable::new(
+            [
+                (0, code_unbounded.len() as u32, 0),
+                (fn0_off, fn0_off + 6, fn0_off),
+                (fn1_off, fn1_off + 6, fn1_off),
+                (fn2_off, fn2_off + 6, fn2_off),
+            ]
+            .iter()
+            .map(|&(s, e, f)| FunctionRange {
+                start: TEXT + u64::from(s),
+                end: TEXT + u64::from(e),
+                function: TEXT + u64::from(f),
+            })
+            .collect(),
+        );
+        for idx in [1u64, 4, 10] {
+            img_ub.data_relocs.insert(DATA + idx * 8);
+        }
+        let an_ub = discover(&img_ub);
+        let jt_ub = an_ub.jump_tables.get(&jmp_ub).expect("unbounded sparse fn table");
+        assert!(jt_ub.inferred);
+        assert_eq!(jt_ub.targets, vec![fn0, fn1]);
+
+        // (e) Negative: 2 leading nulls `[0, 0, fn0, fn1]` must NOT match an empty zero buffer.
+        let data_two_nulls: Vec<u8> = [0u64, 0, fn0, fn1]
+            .into_iter()
+            .flat_map(u64::to_le_bytes)
+            .collect();
+        let mut img_2n = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code_ub, true),
+                CodeSection::new(DATA, &data_two_nulls, false),
+            ],
+            vec![TEXT],
+        );
+        img_2n.function_table = img_ub.function_table.clone();
+        img_2n.data_relocs.insert(DATA + 16);
+        img_2n.data_relocs.insert(DATA + 24);
+        let an_2n = discover(&img_2n);
+        assert!(an_2n.jump_tables.is_empty());
+    }
+
+    #[test]
+    fn resolves_16bit_relative_offset_jump_tables() {
+        // Unsigned 16-bit offset table relative to TEXT.
+        let code_u16 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.movzx(eax, word_ptr(rdx + rax * 2))?;
+            lea_rip(a, Register::R8, TEXT)?;
+            a.add(rax, r8)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_u16 = find_four_cases(&code_u16);
+        let jmp_u16 = find_indirect_jmp(&code_u16);
+        let data_u16: Vec<u8> = cases_u16
+            .iter()
+            .flat_map(|&va| ((va - TEXT) as u16).to_le_bytes())
+            .collect();
+        let an_u16 = analyze(&code_u16, &data_u16, &[0], &[(0, code_u16.len() as u32, 0)]);
+        assert_eq!(an_u16.jump_tables[&jmp_u16].targets, cases_u16);
+
+        // Signed 16-bit offset table relative to an anchor AFTER the first cases (negative offsets!).
+        let code_i16 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.movsx(rax, word_ptr(rdx + rax * 2))?;
+            lea_rip(a, Register::R8, TEXT + 0x30)?;
+            a.add(rax, r8)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_i16 = find_four_cases(&code_i16);
+        let jmp_i16 = find_indirect_jmp(&code_i16);
+        let anchor = TEXT + 0x30;
+        let data_i16: Vec<u8> = cases_i16
+            .iter()
+            .flat_map(|&va| ((va as i64 - anchor as i64) as i16).to_le_bytes())
+            .collect();
+        let an_i16 = analyze(&code_i16, &data_i16, &[0], &[(0, code_i16.len() as u32, 0)]);
+        assert_eq!(an_i16.jump_tables[&jmp_i16].targets, cases_i16);
+    }
+
+    #[test]
+    fn resolves_stack_spilled_base_and_disjoint_slot_bound() {
+        // (a) Table base spilled to [rsp+0x20], unrelated write to [rsp+0x28], then reloaded.
+        let code_ok = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(qword_ptr(rsp + 0x20), rdx)?;
+            a.mov(qword_ptr(rsp + 0x28), r8)?; // disjoint stack slot
+            a.xor(edx, edx)?; // clobber register
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(rdx, qword_ptr(rsp + 0x20))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_ok = find_four_cases(&code_ok);
+        let jmp_ok = find_indirect_jmp(&code_ok);
+        let data_ok = rva_table(cases_ok.map(|va| (va - BASE) as u32));
+        let an_ok = analyze(&code_ok, &data_ok, &[0], &[]);
+        assert_eq!(an_ok.jump_tables[&jmp_ok].targets, cases_ok);
+
+        // (b) Negative: overlapping write to [rsp+0x24] invalidates spilled base at [rsp+0x20..0x28).
+        let code_bad = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(qword_ptr(rsp + 0x20), rdx)?;
+            a.mov(dword_ptr(rsp + 0x24), r8d)?; // overlaps [rsp+0x20..0x28)!
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(rdx, qword_ptr(rsp + 0x20))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_bad = find_four_cases(&code_bad);
+        let jmp_bad = (find_indirect_jmp(&code_bad) - TEXT) as u32;
+        let data_bad = rva_table(cases_bad.map(|va| (va - BASE) as u32));
+        assert_unresolved(&analyze(&code_bad, &data_bad, &[0], &[]), jmp_bad);
+
+        // (c) `slot_bound` tolerates disjoint stack write `[rsp+0x38]` between guard and reload.
+        let code_slot = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(dword_ptr(rsp + 0x30), 3)?;
+            a.ja(def)?;
+            a.mov(qword_ptr(rsp + 0x38), r9)?; // disjoint
+            a.mov(eax, dword_ptr(rsp + 0x30))?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_slot = find_four_cases(&code_slot);
+        let jmp_slot = find_indirect_jmp(&code_slot);
+        let data_slot = rva_table(cases_slot.map(|va| (va - BASE) as u32));
+        let an_slot = analyze(&code_slot, &data_slot, &[0], &[]);
+        assert_eq!(an_slot.jump_tables[&jmp_slot].targets, cases_slot);
+    }
+
+    #[test]
+    fn resolves_relocated_global_table_base_pointer() {
+        // `ptr_slot` at DATA holds `DATA + 0x10` (the table VA) with a DIR64 data_reloc.
+        let table_va = DATA + 0x10;
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            a.add_instruction(Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RDX,
+                MemoryOperand::with_base_displ(Register::RIP, DATA as i64),
+            )?)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax * 4))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        let mut data = Vec::new();
+        data.extend_from_slice(&table_va.to_le_bytes());
+        data.resize(0x10, 0);
+        for &va in &cases {
+            data.extend_from_slice(&((va as i64 - table_va as i64) as i32).to_le_bytes());
+        }
+
+        let mut img = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data, false),
+            ],
+            vec![TEXT],
+        );
+        // Without data_relocs on ptr_slot, must stay unresolved.
+        assert!(discover(&img).jump_tables.is_empty());
+
+        img.data_relocs.insert(DATA);
+        let an = discover(&img);
+        assert_eq!(an.jump_tables[&jmp_va].targets, cases);
+    }
+
+    #[test]
+    fn resolves_imul_scaling_and_pre_offset_lea() {
+        // (a) 3-operand `imul rax, rcx, 4` + `[rdx + rax + DATA_RVA]`.
+        let code_imul3 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.mov(ecx, ecx)?; // zero-extend to 64-bit
+            a.imul_3(rax, rcx, 4)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_i3 = find_four_cases(&code_imul3);
+        let jmp_i3 = find_indirect_jmp(&code_imul3);
+        let data_i3 = rva_table(cases_i3.map(|va| (va - BASE) as u32));
+        let an_i3 = analyze(&code_imul3, &data_i3, &[0], &[]);
+        assert_eq!(an_i3.jump_tables[&jmp_i3].targets, cases_i3);
+
+        // (b) `lea rax, [rcx*4 + 0x10]` pre-offset into table at DATA + 0x10.
+        let code_off = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.mov(ecx, ecx)?;
+            a.lea(rax, rcx * 4 + 0x10)?;
+            lea_rip(a, Register::RDX, DATA)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_off = find_four_cases(&code_off);
+        let jmp_off = find_indirect_jmp(&code_off);
+        let mut data_off = vec![0u8; 0x10];
+        for &va in &cases_off {
+            data_off.extend_from_slice(&((va as i64 - DATA as i64) as i32).to_le_bytes());
+        }
+        let an_off = analyze(&code_off, &data_off, &[0], &[]);
+        let jt_off = an_off.jump_tables.get(&jmp_off).expect("pre-offset lea resolves");
+        assert_eq!(jt_off.table, DATA + 0x10);
+        assert_eq!(jt_off.targets, cases_off);
+    }
+
+    #[test]
+    fn resolves_sub_flags_cmp_reg_const_and_cmov_clamp() {
+        // (a) `sub` flag guard: `mov eax, ecx; sub ecx, 4; jae def; ... [rdx + rax*4]`.
+        let code_sub = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(eax, ecx)?;
+            a.sub(ecx, 4)?;
+            a.jae(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sub = find_four_cases(&code_sub);
+        let jmp_sub = find_indirect_jmp(&code_sub);
+        let data_sub = rva_table(cases_sub.map(|va| (va - BASE) as u32));
+        let an_sub = analyze(&code_sub, &data_sub, &[0], &[]);
+        assert_eq!(an_sub.jump_tables[&jmp_sub].targets, cases_sub);
+
+        // (b) Negative: `dec ecx; jae def` MUST NOT treat `dec` as setting CF!
+        let code_dec_cf = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(eax, ecx)?;
+            a.dec(ecx)?;
+            a.jae(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_dcf = find_four_cases(&code_dec_cf);
+        let jmp_dcf = (find_indirect_jmp(&code_dec_cf) - TEXT) as u32;
+        let data_dcf = rva_table(cases_dcf.map(|va| (va - BASE) as u32));
+        assert_unresolved(&analyze(&code_dec_cf, &data_dcf, &[0], &[]), jmp_dcf);
+
+        // (c) `cmp reg, reg` with constant RHS AND swapped constant LHS.
+        let code_cmp_reg = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(r8d, 3)?;
+            a.cmp(r8d, ecx)?; // swapped: 3 < ecx -> default
+            a.jb(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_cr = find_four_cases(&code_cmp_reg);
+        let jmp_cr = find_indirect_jmp(&code_cmp_reg);
+        let data_cr = rva_table(cases_cr.map(|va| (va - BASE) as u32));
+        let an_cr = analyze(&code_cmp_reg, &data_cr, &[0], &[]);
+        assert_eq!(an_cr.jump_tables[&jmp_cr].targets, cases_cr);
+
+        // (d) Branchless `cmov` clamp: `mov edx, 3; cmp ecx, 3; cmova ecx, edx`.
+        let code_cmov = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(edx, 3)?;
+            a.cmp(ecx, 3)?;
+            a.cmova(ecx, edx)?;
+            lea_rip(a, Register::R8, BASE)?;
+            a.mov(eax, dword_ptr(r8 + rcx * 4 + DATA_RVA as i32))?;
+            a.add(rax, r8)?;
+            a.jmp(rax)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_cm = find_four_cases(&code_cmov);
+        let jmp_cm = find_indirect_jmp(&code_cmov);
+        let data_cm = rva_table(cases_cm.map(|va| (va - BASE) as u32));
+        let an_cm = analyze(&code_cmov, &data_cm, &[0], &[]);
+        let jt_cm = an_cm.jump_tables.get(&jmp_cm).expect("cmov clamp resolves");
+        assert!(!jt_cm.inferred);
+        assert_eq!(jt_cm.targets, cases_cm);
+    }
+
+    #[test]
+    fn resolves_non_byte_shr_width_only_and_classifies_jmp_mem_accurately() {
+        // (a) `shr eax, 26` leaves width-only [0..=0x3f] (not 0xff/0xffff) on a 4-entry table ->
+        //     must infer the 4-entry extent cleanly!
+        let code_shr = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.shr(eax, 26)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_shr = find_four_cases(&code_shr);
+        let jmp_shr = find_indirect_jmp(&code_shr);
+        let data_shr = rva_table(cases_shr.map(|va| (va - BASE) as u32));
+        let an_shr = analyze(&code_shr, &data_shr, &[0], &[(0, code_shr.len() as u32, 0)]);
+        let jt_shr = an_shr.jump_tables.get(&jmp_shr).expect("shr width-only infers");
+        assert!(jt_shr.inferred);
+        assert_eq!(jt_shr.targets, cases_shr);
+
+        // (b) Negative: `movzx eax, cl; cmp eax, 15; ja def` on a 4-entry table must NOT infer,
+        //     because the `cmp` guard narrowed the bound (`width_only` must be cleared).
+        let code_narrowed = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.movzx(eax, cl)?;
+            a.cmp(eax, 15)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_nar = find_four_cases(&code_narrowed);
+        let jmp_nar = (find_indirect_jmp(&code_narrowed) - TEXT) as u32;
+        let data_nar = rva_table(cases_nar.map(|va| (va - BASE) as u32));
+        assert_unresolved(
+            &analyze(&code_narrowed, &data_nar, &[0], &[(0, code_narrowed.len() as u32, 0)]),
+            jmp_nar,
+        );
+
+        // (c) `classify`: `jmp [rdx + rcx*8]` with known constant `rdx` (unbounded/non-code table)
+        //     classifies as `TableUnbounded`, whereas live-in `rdx` stays `TableBaseUnknown`.
+        let code_known = assemble_at_text(|a| {
+            lea_rip(a, Register::RDX, DATA)?;
+            a.jmp(qword_ptr(rdx + rcx * 8))?;
+            Ok(())
+        });
+        let jmp_known = find_indirect_jmp(&code_known);
+        let bad_data = vec![0x11u8; 32];
+        let an_known = analyze(&code_known, &bad_data, &[0], &[]);
+        assert_eq!(
+            an_known.unresolved_jumps.get(&jmp_known),
+            Some(&UnresolvedJump::TableUnbounded)
+        );
+
+        let code_unknown = assemble_at_text(|a| {
+            a.jmp(qword_ptr(rdx + rcx * 8))?;
+            Ok(())
+        });
+        let jmp_unknown = find_indirect_jmp(&code_unknown);
+        let an_unknown = analyze(&code_unknown, &bad_data, &[0], &[]);
+        assert_eq!(
+            an_unknown.unresolved_jumps.get(&jmp_unknown),
+            Some(&UnresolvedJump::TableBaseUnknown)
+        );
+    }
+
+    #[test]
+    fn discover_resolves_diamond_cfg_signed_offset_switch_end_to_end() {
+        // End-to-end `discover()` test (via `resolve_in_subgraph` wired in `discover.rs`):
+        // signed negative range `[-2, 1]` guarded BEFORE a diamond merge, shifted `+ 2` -> `[0, 3]`
+        // AFTER the merge. Neither sole-predecessor trace nor unsigned-only `reach.rs` proves this;
+        // the wired dominator-chain fallback must resolve it cleanly!
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut merge = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, -2)?;
+            a.jl(def)?;
+            a.cmp(ecx, 1)?;
+            a.jg(def)?;
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            a.mov(r9d, 1)?;
+            a.jmp(merge)?;
+            a.set_label(&mut b2)?;
+            a.mov(r9d, 2)?;
+            a.set_label(&mut merge)?;
+            a.add(ecx, 2)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases = [ips[0], ips[1], ips[2], ips[3]];
+        let jmp_va = find_indirect_jmp(&code);
+        let data = rva_table(cases.map(|va| (va - BASE) as u32));
+        let an = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let jt = an
+            .jump_tables
+            .get(&jmp_va)
+            .expect("discover resolves signed negative diamond switch end-to-end");
+        assert!(!jt.inferred);
+        assert_eq!(jt.targets, cases);
+
+        // Negative: clobbering `ecx` in one arm of the diamond MUST NOT resolve as proven.
+        let (code_clob, ips_clob) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut merge = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, -2)?;
+            a.jl(def)?;
+            a.cmp(ecx, 1)?;
+            a.jg(def)?;
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            a.mov(ecx, dword_ptr(rdi))?; // clobbers ecx in one diamond arm!
+            a.jmp(merge)?;
+            a.set_label(&mut b2)?;
+            a.mov(r9d, 2)?;
+            a.set_label(&mut merge)?;
+            a.add(ecx, 2)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases_clob = [ips_clob[0], ips_clob[1], ips_clob[2], ips_clob[3]];
+        let jmp_clob = (find_indirect_jmp(&code_clob) - TEXT) as u32;
+        let data_clob = rva_table(cases_clob.map(|va| (va - BASE) as u32));
+        assert_not_proven(
+            &analyze(&code_clob, &data_clob, &[0], &[(0, code_clob.len() as u32, 0)]),
+            jmp_clob,
+        );
     }
 }
