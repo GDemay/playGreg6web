@@ -3947,6 +3947,14 @@ static void record_present() {
     mark_first_present();
 }
 
+uint64_t boot_elapsed_ms() { return elapsed_ms(); }
+
+uint64_t boot_present_count() {
+    BootState& b = boot();
+    std::lock_guard<std::mutex> lock(b.mutex);
+    return b.present_samples.total();
+}
+
 void mark_first_present() {
     BootState& b = boot();
     uint64_t seq = 0;

@@ -22,24 +22,60 @@ void check_impl(bool cond, const char* expr, int line) {
 int main() {
     namespace ao = playgta6::os::audio_out;
 
-    {  // underruns are classified: recent pushes -> host starved, long push gap -> guest stalled
+    {  // classifier with synthetic timelines (48 kHz, 1 frame = ~20.8 us)
+        using C = ao::UnderrunCause;
+        const uint64_t U = UINT64_MAX;
+        CHECK(ao::classify_underrun(U, 0, U) == C::GuestStalled);                 // never pushed
+        CHECK(ao::classify_underrun(5000, 20000, U) == C::HostStarved);           // pushing, ring still had time
+        CHECK(ao::classify_underrun(20000, 20000, U) == C::GuestStalled);         // ring drained by itself
+        CHECK(ao::classify_underrun(60000, 500000, U) == C::GuestStalled);        // long push gap
+        CHECK(ao::classify_underrun(5000, 20000, 150000) == C::GuestStalled);     // frame hitch overlaps
+        CHECK(ao::classify_underrun(5000, 20000, 16000) == C::HostStarved);       // frames fine
+    }
+
+    {  // jitter buffer: events, host starved (render thread missed), then guest stalled (guest stopped)
         ao::JitterBuffer jb;
-        jb.configure(1000, 100);
-        std::vector<float> in(2 * 100, 0.1f), out(2 * 50);
-        jb.push(in.data(), 100, 1000000);
-        CHECK(jb.pop(out.data(), 50, 1010000) == 50);
-        CHECK(jb.pop(out.data(), 50, 1020000) == 50);
-        CHECK(jb.pop(out.data(), 50, 1030000) == 0);  // dry 30 ms after the last push
-        CHECK(jb.stats().underruns == 1 && jb.stats().underruns_host_starved == 1 &&
-              jb.stats().underruns_guest_stalled == 0);
-        jb.push(in.data(), 100, 2000000);
-        CHECK(jb.pop(out.data(), 50, 2010000) == 50);
-        CHECK(jb.pop(out.data(), 50, 2020000) == 50);
-        CHECK(jb.pop(out.data(), 50, 2500000) == 0);  // dry 500 ms after the last push
+        jb.configure(48000, 100, 48000);  // 100 frames = 2083 us
+        std::vector<float> in(2 * 4800, 0.1f), out(2 * 4800);
+        jb.note_present(7, 1000000);
+        jb.push(in.data(), 4800, 1000000);  // 100 ms of audio buffered
+        CHECK(jb.pop(out.data(), 2400, 1010000) == 2400);
+        CHECK(jb.pop(out.data(), 3000, 1020000) == 2400);  // render thread asked for too much: 600 missing
+        CHECK(jb.stats().underruns == 1 && jb.stats().underruns_host_starved == 1);  // 20 ms gap < 100 ms fill
+        const auto& e0 = jb.stats().events;
+        CHECK(e0.size() == 1 && e0[0].frames_missing == 600 && e0[0].fill_frames == 2400 && e0[0].present_index == 7);
+        CHECK(e0[0].cause == ao::UnderrunCause::HostStarved && e0[0].gap_us == 20000);
+        jb.push(in.data(), 4800, 2000000);
+        jb.note_present(8, 2000000);
+        CHECK(jb.pop(out.data(), 4800, 2010000) == 4800);
+        CHECK(jb.pop(out.data(), 100, 2400000) == 0);  // guest stopped pushing 400 ms ago (hitch)
         CHECK(jb.stats().underruns == 2 && jb.stats().underruns_guest_stalled == 1);
-        const std::string j2 = ao::report_json(true, 48000, jb.stats(), "");
+        const auto& e1 = jb.stats().events;
+        CHECK(e1.size() == 2 && e1[1].cause == ao::UnderrunCause::GuestStalled && e1[1].present_index == 8 &&
+              e1[1].gap_us == 400000);
+        const std::string j2 = ao::report_json(true, 48000, jb.stats(), "", 0, 0, 1000000);
         CHECK(j2.find("\"underruns_host_starved\": 1") != std::string::npos);
         CHECK(j2.find("\"underruns_guest_stalled\": 1") != std::string::npos);
+        CHECK(j2.find("\"cause\": \"guest_stalled\"") != std::string::npos);
+        CHECK(j2.find("\"at_ms\": 1400.0") != std::string::npos);
+        CHECK(j2.find("\"ms_since_push\": 400.0") != std::string::npos);
+        CHECK(j2.find("\"present_index\": 8") != std::string::npos);
+    }
+
+    {  // event list is bounded
+        ao::JitterBuffer jb;
+        jb.configure(1000, 10, 48000);
+        std::vector<float> in(2 * 10, 0.1f), out(2 * 10);
+        uint64_t t = 1000000;
+        for (int i = 0; i < 40; ++i) {
+            jb.push(in.data(), 10, t);
+            jb.pop(out.data(), 10, t + 100);
+            jb.pop(out.data(), 10, t + 200);
+            t += 1000000;
+        }
+        CHECK(jb.stats().underruns == 40);
+        CHECK(jb.stats().events.size() == ao::kMaxUnderrunEvents);
+        CHECK(jb.stats().events_dropped == 40 - ao::kMaxUnderrunEvents);
     }
 
     {  // passthrough keeps samples
