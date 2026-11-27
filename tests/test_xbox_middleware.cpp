@@ -701,27 +701,28 @@ void test_ffx_bvh_mf() {
     CHECK(t0 > 0);
     CHECK(t1 >= t0);
 
-    void* attrs = nullptr;
-    void* media_type = nullptr;
-    void* resolver = nullptr;
-    void* reader = nullptr;
-    CHECK(pg6_mw_mf_create_attributes(&attrs, 4u) == S_OK_HR);
-    CHECK(attrs != nullptr);
-    CHECK(pg6_mw_mf_create_media_type(&media_type) == S_OK_HR);
-    CHECK(media_type != nullptr);
-    CHECK(pg6_mw_mf_create_source_resolver(&resolver) == S_OK_HR);
-    CHECK(resolver != nullptr);
-    CHECK(pg6_mw_mf_create_source_reader_from_media_source(nullptr, attrs, &reader) ==
-          E_INVALIDARG_HR);
-    CHECK(pg6_mw_mf_create_source_reader_from_media_source(resolver, attrs, &reader) == S_OK_HR);
-    CHECK(reader != nullptr);
+    // The four object-creating imports fail cleanly (HARD_STOPS 7.4): null out pointer, E_NOTIMPL.
+    const auto kENotImpl = gdk::E_NOTIMPL_HR;
+    void* sentinel = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234u));
+    void* out = sentinel;
+    CHECK(pg6_mw_mf_create_attributes(&out, 4u) == kENotImpl);
+    CHECK(out == nullptr);
     CHECK(pg6_mw_mf_create_attributes(nullptr, 0u) == E_POINTER_HR);
-
-    static_cast<Pg6MwComObject*>(reader)->vtbl->release(reader);
-    static_cast<Pg6MwComObject*>(resolver)->vtbl->release(resolver);
-    static_cast<Pg6MwComObject*>(media_type)->vtbl->release(media_type);
-    static_cast<Pg6MwComObject*>(attrs)->vtbl->release(attrs);
-
+    out = sentinel;
+    CHECK(pg6_mw_mf_create_media_type(&out) == kENotImpl);
+    CHECK(out == nullptr);
+    CHECK(pg6_mw_mf_create_media_type(nullptr) == E_POINTER_HR);
+    out = sentinel;
+    CHECK(pg6_mw_mf_create_source_resolver(&out) == kENotImpl);
+    CHECK(out == nullptr);
+    CHECK(pg6_mw_mf_create_source_resolver(nullptr) == E_POINTER_HR);
+    out = sentinel;
+    CHECK(pg6_mw_mf_create_source_reader_from_media_source(nullptr, nullptr, &out) == kENotImpl);
+    CHECK(out == nullptr);
+    out = sentinel;
+    CHECK(pg6_mw_mf_create_source_reader_from_media_source(sentinel, sentinel, &out) == kENotImpl);
+    CHECK(out == nullptr);
+    CHECK(pg6_mw_mf_create_source_reader_from_media_source(nullptr, nullptr, nullptr) == E_POINTER_HR);
     CHECK(pg6_mw_mf_shutdown() == S_OK_HR);
 }
 

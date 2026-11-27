@@ -399,10 +399,10 @@
     X(pg6_mw_mf_startup, ok, "") \
     X(pg6_mw_mf_shutdown, ok, "") \
     X(pg6_mw_mf_get_system_time, ok, "") \
-    X(pg6_mw_mf_create_attributes, deny, "host COM: IUnknown stub with a host vtable") \
-    X(pg6_mw_mf_create_media_type, deny, "host COM: IUnknown stub with a host vtable") \
-    X(pg6_mw_mf_create_source_resolver, deny, "host COM: IUnknown stub with a host vtable") \
-    X(pg6_mw_mf_create_source_reader_from_media_source, deny, "host COM: IUnknown stub with a host vtable") \
+    X(pg6_mw_mf_create_attributes, ok, "fails cleanly: null out pointer, E_NOTIMPL, logged once (HARD_STOPS 7.4)") \
+    X(pg6_mw_mf_create_media_type, ok, "fails cleanly: null out pointer, E_NOTIMPL, logged once (HARD_STOPS 7.4)") \
+    X(pg6_mw_mf_create_source_resolver, ok, "fails cleanly: null out pointer, E_NOTIMPL, logged once (HARD_STOPS 7.4)") \
+    X(pg6_mw_mf_create_source_reader_from_media_source, ok, "fails cleanly: null out pointer, E_NOTIMPL, logged once (HARD_STOPS 7.4)") \
     /* ---- xmem / XCRDAPI / xg_xs / GameInput (O12) ---- */ \
     X(pg6_xbox_XMemAlloc, ok, "guest heap (O24); a host allocation hook, when installed, must return guest memory; guest hooks run as guest routines") \
     X(pg6_xbox_XMemSetAllocationHooks, ok, "guest routine addresses are integers") \
