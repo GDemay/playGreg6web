@@ -95,6 +95,8 @@
   const GREG_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes']);
   const GREG_DISABLED_VALUES = new Set(['0', 'false', 'off', 'no']);
   const SPLASH_HOLD_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes']);
+  const SPLASH_HOLD_DISABLED_VALUES = new Set(['0', 'false', 'off', 'no']);
+  const SPLASH_HOLD_QUERY_KEYS = new Set(['splashhold', 'holduntilvisible']);
   const DISMISS_REASONS = Object.freeze({
     FIRST_PRESENT: 'first_present',
     FIRST_VISIBLE_FRAME: 'first_visible_frame',
@@ -432,18 +434,80 @@
     return true;
   }
 
+  function readLastMatchingQueryParam(search, targetKeys) {
+    if (search === null || search === undefined || search === '') {
+      return null;
+    }
+    try {
+      let params = null;
+      if (typeof URLSearchParams === 'function' && search instanceof URLSearchParams) {
+        params = search;
+      } else {
+        let raw = null;
+        if (typeof search === 'string') {
+          raw = search;
+        } else if (typeof search === 'object' && typeof search.search === 'string') {
+          raw = search.search;
+        }
+        if (typeof raw !== 'string' || raw.length === 0) {
+          return null;
+        }
+        const hashIdx = raw.indexOf('#');
+        const withoutHash = hashIdx >= 0 ? raw.slice(0, hashIdx) : raw;
+        const qIdx = withoutHash.indexOf('?');
+        const query = qIdx >= 0 ? withoutHash.slice(qIdx + 1) : withoutHash;
+        if (!query) {
+          return null;
+        }
+        if (typeof URLSearchParams === 'function') {
+          params = new URLSearchParams(query);
+        } else {
+          let lastValue = null;
+          for (const part of query.split('&')) {
+            if (!part) continue;
+            const eqIdx = part.indexOf('=');
+            const rawKey = eqIdx >= 0 ? part.slice(0, eqIdx) : part;
+            const rawVal = eqIdx >= 0 ? part.slice(eqIdx + 1) : '';
+            const key = decodeURIComponent(rawKey).trim().toLowerCase();
+            if (targetKeys.has(key)) {
+              lastValue = decodeURIComponent(rawVal).trim().toLowerCase();
+            }
+          }
+          return lastValue;
+        }
+      }
+
+      if (!params) {
+        return null;
+      }
+      let lastValue = null;
+      for (const [key, value] of params.entries()) {
+        if (targetKeys.has(String(key).trim().toLowerCase())) {
+          lastValue = String(value).trim().toLowerCase();
+        }
+      }
+      return lastValue;
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * Detect whether a URL query string / URLSearchParams / Location enables holding
    * the splash overlay past `FIRST_PRESENT` until `notifyFirstVisibleFrame()`
-   * (e.g. `?splashHold=1`, `?splashHold=true`, `?splashHold=on`, `?splashHold=yes`).
+   * (accepts both `?splashHold=` and `?holdUntilVisible=`, recognizing
+   * `1`/`true`/`on`/`yes` as true and `0`/`false`/`off`/`no` as false; last occurrence wins).
    * Never throws.
    *
    * @param {unknown} search
    * @returns {boolean}
    */
   function isSplashHoldQuery(search) {
-    const value = readLastQueryParam(search, 'splashhold');
-    return value !== null && SPLASH_HOLD_ENABLED_VALUES.has(value);
+    const value = readLastMatchingQueryParam(search, SPLASH_HOLD_QUERY_KEYS);
+    if (value === null || SPLASH_HOLD_DISABLED_VALUES.has(value)) {
+      return false;
+    }
+    return SPLASH_HOLD_ENABLED_VALUES.has(value);
   }
 
   function isEditableEventTarget(target) {

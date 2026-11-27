@@ -244,6 +244,7 @@ export const DEFAULT_MOUSE_LOOK_PIXELS_FOR_FULL = 40;
 export const DEFAULT_MOUSE_LOOK_DECAY = 0.55;
 export const IDLE_GAMEPAD_POLL_INTERVAL_MS = 500;
 export const DEFAULT_VISIBLE_FRAME_FALLBACK_MS = 2000;
+export const PROBE_SUPPORTED_VISIBLE_FRAME_FALLBACK_MS = 180000;
 export const FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS = 500;
 export const FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS = 220;
 
@@ -2251,6 +2252,8 @@ export class InputBridge {
     this._yieldedPending = null;
     this._firstPresentNotified = false;
     this._firstVisibleFrameNotified = false;
+    this._swapchainProbeSupported =
+      typeof opts.swapchainProbeSupported === 'boolean' ? opts.swapchainProbeSupported : null;
     this._scriptButtons = 0;
     this._scriptLx = 0;
     this._scriptLy = 0;
@@ -3550,6 +3553,7 @@ export class InputBridge {
       this._yieldedPending = {
         trigger: pending.trigger,
         visibleFrameFallbackMs: pending.visibleFrameFallbackMs,
+        hasExplicitVisibleFrameFallbackMs: Boolean(pending.hasExplicitVisibleFrameFallbackMs),
         firstPresentTimeoutMs: pending.firstPresentTimeoutMs,
         reanchorOnFirstVisibleFrame: pending.reanchorOnFirstVisibleFrame,
         setTimeoutFn: pending.setTimeoutFn,
@@ -3638,16 +3642,62 @@ export class InputBridge {
     return false;
   }
 
+  _resolveEffectiveVisibleFrameFallbackMs(pending) {
+    if (!pending) return DEFAULT_VISIBLE_FRAME_FALLBACK_MS;
+    if (pending.hasExplicitVisibleFrameFallbackMs) {
+      return pending.visibleFrameFallbackMs;
+    }
+    if (this._swapchainProbeSupported === true) {
+      return PROBE_SUPPORTED_VISIBLE_FRAME_FALLBACK_MS;
+    }
+    return pending.visibleFrameFallbackMs;
+  }
+
+  /**
+   * Updates whether the WebGPU swapchain non-black pixel probe is supported.
+   * When `true` (and no explicit `visibleFrameFallbackMs` override was passed),
+   * `FIRST_VISIBLE_FRAME` scripts wait for the real visible frame (up to the
+   * 180 s safety fallback) instead of firing `FIRST_PRESENT_FALLBACK` after 2 s
+   * and burning presses during black pre-`BINK_OPEN` boot.
+   */
+  setSwapchainProbeSupported(supported) {
+    const normalized = typeof supported === 'boolean' ? supported : null;
+    const prev = this._swapchainProbeSupported;
+    this._swapchainProbeSupported = normalized;
+    if (
+      prev !== normalized &&
+      !this.disposed &&
+      this._pendingScript &&
+      this._pendingScript.trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
+      !this._pendingScript.hasExplicitVisibleFrameFallbackMs &&
+      this._firstPresentNotified &&
+      !this._firstVisibleFrameNotified
+    ) {
+      this._armPendingTimer(
+        this._pendingScript,
+        this._resolveEffectiveVisibleFrameFallbackMs(this._pendingScript),
+        'FIRST_PRESENT_FALLBACK'
+      );
+    }
+    return this._swapchainProbeSupported;
+  }
+
   /**
    * Notifies the bridge that the guest runtime has reached `FIRST_PRESENT`.
    * Starts any scripted preset armed with `startOn: 'FIRST_PRESENT'` immediately,
    * and arms (or immediately triggers when `visibleFrameFallbackMs === 0`) the bounded
    * non-stalling fallback for presets armed with `startOn: 'FIRST_VISIBLE_FRAME'` so a
    * dark Start Screen holding the splash overlay can never stall scripted input forever.
+   * When `swapchainProbeSupported === true` (and no custom `visibleFrameFallbackMs` was
+   * explicitly provided), uses `PROBE_SUPPORTED_VISIBLE_FRAME_FALLBACK_MS` (180 s) so
+   * black pre-`BINK_OPEN` frames do not burn scripted presses prematurely.
    * Returns `true` if a pending script started synchronously.
    */
-  notifyFirstPresent() {
+  notifyFirstPresent(meta) {
     if (this.disposed) return false;
+    if (meta && typeof meta === 'object' && typeof meta.swapchainProbeSupported === 'boolean') {
+      this._swapchainProbeSupported = meta.swapchainProbeSupported;
+    }
     this._firstPresentNotified = true;
     const pending = this._pendingScript;
     if (!pending) return false;
@@ -3657,7 +3707,7 @@ export class InputBridge {
     if (pending.trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME) {
       return this._armPendingTimer(
         pending,
-        pending.visibleFrameFallbackMs,
+        this._resolveEffectiveVisibleFrameFallbackMs(pending),
         'FIRST_PRESENT_FALLBACK'
       );
     }
@@ -3737,10 +3787,14 @@ export class InputBridge {
     if (this.disposed) return null;
     const opts = options || {};
     const startTrigger = normalizeStartTrigger(opts.startOn, opts.waitForFirstVisibleFrame);
-    const visibleFrameFallbackMs =
-      opts.visibleFrameFallbackMs !== undefined && opts.visibleFrameFallbackMs !== null
-        ? validateNonNegativeFinite(opts.visibleFrameFallbackMs, 'visibleFrameFallbackMs')
-        : DEFAULT_VISIBLE_FRAME_FALLBACK_MS;
+    const hasExplicitVisibleFrameFallbackMs =
+      opts.visibleFrameFallbackMs !== undefined && opts.visibleFrameFallbackMs !== null;
+    const visibleFrameFallbackMs = hasExplicitVisibleFrameFallbackMs
+      ? validateNonNegativeFinite(opts.visibleFrameFallbackMs, 'visibleFrameFallbackMs')
+      : DEFAULT_VISIBLE_FRAME_FALLBACK_MS;
+    if (typeof opts.swapchainProbeSupported === 'boolean') {
+      this._swapchainProbeSupported = opts.swapchainProbeSupported;
+    }
     const firstPresentTimeoutMs = validateOptionalTimeoutMs(
       opts.firstPresentTimeoutMs,
       'firstPresentTimeoutMs'
@@ -3844,6 +3898,7 @@ export class InputBridge {
       player,
       trigger: startTrigger,
       visibleFrameFallbackMs,
+      hasExplicitVisibleFrameFallbackMs,
       firstPresentTimeoutMs,
       reanchorOnFirstVisibleFrame,
       setTimeoutFn,
@@ -3856,7 +3911,11 @@ export class InputBridge {
       startTrigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
       this._firstPresentNotified
     ) {
-      this._armPendingTimer(pending, visibleFrameFallbackMs, 'FIRST_PRESENT_FALLBACK');
+      this._armPendingTimer(
+        pending,
+        this._resolveEffectiveVisibleFrameFallbackMs(pending),
+        'FIRST_PRESENT_FALLBACK'
+      );
     } else if (firstPresentTimeoutMs !== null) {
       this._armPendingTimer(pending, firstPresentTimeoutMs, 'FIRST_PRESENT_TIMEOUT');
     }
@@ -3960,6 +4019,7 @@ export class InputBridge {
         player: this._scriptPlayer,
         trigger: pendingSpec.trigger,
         visibleFrameFallbackMs: pendingSpec.visibleFrameFallbackMs,
+        hasExplicitVisibleFrameFallbackMs: Boolean(pendingSpec.hasExplicitVisibleFrameFallbackMs),
         firstPresentTimeoutMs: pendingSpec.firstPresentTimeoutMs,
         reanchorOnFirstVisibleFrame: pendingSpec.reanchorOnFirstVisibleFrame,
         setTimeoutFn: pendingSpec.setTimeoutFn,
@@ -3971,7 +4031,11 @@ export class InputBridge {
         trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
         this._firstPresentNotified
       ) {
-        this._armPendingTimer(pending, pending.visibleFrameFallbackMs, 'FIRST_PRESENT_FALLBACK');
+        this._armPendingTimer(
+          pending,
+          this._resolveEffectiveVisibleFrameFallbackMs(pending),
+          'FIRST_PRESENT_FALLBACK'
+        );
       } else if (pending.firstPresentTimeoutMs !== null) {
         this._armPendingTimer(pending, pending.firstPresentTimeoutMs, 'FIRST_PRESENT_TIMEOUT');
       }
@@ -4026,6 +4090,7 @@ export class InputBridge {
       userInputCount: this._userInputCount,
       firstPresentNotified: this._firstPresentNotified,
       firstVisibleFrameNotified: this._firstVisibleFrameNotified,
+      swapchainProbeSupported: this._swapchainProbeSupported,
       activePreset: script.activePreset,
       preset: script.preset,
       scriptedPressesSent: script.scriptedPressesSent,

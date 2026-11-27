@@ -1538,3 +1538,107 @@ test('W362 InputBridge re-anchors chrome-to-ingame to FIRST_VISIBLE_FRAME, write
   bridge.destroy();
   assert.equal(clock.pendingTimeouts(), 0);
 });
+
+test('Orch-32 P1 #4b: swapchainProbeSupported=true prevents 2s FIRST_PRESENT_FALLBACK from burning presses during black boot', async () => {
+  const { PROBE_SUPPORTED_VISIBLE_FRAME_FALLBACK_MS } = await import('../web/input/input_bridge.js');
+  assert.equal(PROBE_SUPPORTED_VISIBLE_FRAME_FALLBACK_MS, 180000);
+
+  // 1. With swapchainProbeSupported: true, FIRST_PRESENT does NOT fire the 2s fallback during a
+  //    90s black pre-BINK_OPEN boot; zero presses are burned until real FIRST_VISIBLE_FRAME arrives.
+  const clock1 = createFakeClockAndTimers(0);
+  const bridge1 = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+    swapchainProbeSupported: true,
+  });
+  bridge1.startScript('chrome-menu-flow-4', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    nowFn: clock1.nowFn,
+    setTimeoutFn: clock1.setTimeoutFn,
+    clearTimeoutFn: clock1.clearTimeoutFn,
+  });
+  assert.equal(bridge1.notifyFirstPresent(), false);
+
+  // Advance 90s (45x past old 2s fallback): MUST still be pending with 0 presses burned!
+  clock1.advanceBy(90000);
+  assert.equal(bridge1.getStats().scriptPending, true);
+  assert.equal(bridge1.getStats().scriptActive, false);
+  assert.equal(bridge1.getStats().scriptedPressesSent, 0);
+  assert.equal(bridge1.getStats().swapchainProbeSupported, true);
+
+  // Real FIRST_VISIBLE_FRAME arrives at +90s -> starts cleanly and lands crisp +500ms A press!
+  assert.equal(bridge1.notifyFirstVisibleFrame(), true);
+  assert.equal(bridge1.getStats().scriptPending, false);
+  assert.equal(bridge1.getStats().scriptActive, true);
+  assert.equal(bridge1.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+  clock1.advanceBy(FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS);
+  assert.equal(bridge1.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge1.getStats().scriptedPressesSent, 1);
+  bridge1.destroy();
+  assert.equal(clock1.pendingTimeouts(), 0);
+
+  // 2. Late setSwapchainProbeSupported(true) arriving after notifyFirstPresent() (before 2s)
+  //    re-arms from the 2s fallback to the 180s safety fallback cleanly.
+  const clock2 = createFakeClockAndTimers(0);
+  const bridge2 = new InputBridge({ windowObj: null, documentObj: null, navigatorObj: null });
+  bridge2.startScript('chrome-menu-flow-4', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    nowFn: clock2.nowFn,
+    setTimeoutFn: clock2.setTimeoutFn,
+    clearTimeoutFn: clock2.clearTimeoutFn,
+  });
+  bridge2.notifyFirstPresent();
+  clock2.advanceBy(500);
+  bridge2.setSwapchainProbeSupported(true);
+  clock2.advanceBy(80000);
+  assert.equal(bridge2.getStats().scriptPending, true);
+  assert.equal(bridge2.getStats().scriptedPressesSent, 0);
+  // At 180s safety deadline (100s more), safety fallback fires so it can never hang forever.
+  clock2.advanceBy(100000);
+  assert.equal(bridge2.getStats().scriptActive, true);
+  assert.equal(bridge2.getStats().scriptStartedOn, 'FIRST_PRESENT_FALLBACK');
+  bridge2.destroy();
+  assert.equal(clock2.pendingTimeouts(), 0);
+
+  // 3. Explicit caller visibleFrameFallbackMs override is still honored even with swapchainProbeSupported=true,
+  //    and swapchainProbeSupported=false keeps the 2000ms fallback unchanged.
+  const clock3 = createFakeClockAndTimers(0);
+  const bridge3 = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+    swapchainProbeSupported: true,
+  });
+  bridge3.startScript('chrome-menu-flow-4', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    visibleFrameFallbackMs: 3500,
+    nowFn: clock3.nowFn,
+    setTimeoutFn: clock3.setTimeoutFn,
+    clearTimeoutFn: clock3.clearTimeoutFn,
+  });
+  bridge3.notifyFirstPresent();
+  clock3.advanceBy(3499);
+  assert.equal(bridge3.getStats().scriptPending, true);
+  clock3.advanceBy(1);
+  assert.equal(bridge3.getStats().scriptStartedOn, 'FIRST_PRESENT_FALLBACK');
+  bridge3.destroy();
+
+  const clock4 = createFakeClockAndTimers(0);
+  const bridge4 = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+    swapchainProbeSupported: false,
+  });
+  bridge4.startScript('chrome-menu-flow-4', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    nowFn: clock4.nowFn,
+    setTimeoutFn: clock4.setTimeoutFn,
+    clearTimeoutFn: clock4.clearTimeoutFn,
+  });
+  bridge4.notifyFirstPresent();
+  clock4.advanceBy(DEFAULT_VISIBLE_FRAME_FALLBACK_MS);
+  assert.equal(bridge4.getStats().scriptStartedOn, 'FIRST_PRESENT_FALLBACK');
+  bridge4.destroy();
+});
