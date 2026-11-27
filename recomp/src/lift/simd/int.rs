@@ -525,12 +525,26 @@ impl FunctionLifter<'_> {
             IOp::AddSatU => self.intr(Intr::UAddSat, ty, &[&a, &b]),
             IOp::SubSatS => self.intr(Intr::SSubSat, ty, &[&a, &b]),
             IOp::SubSatU => self.intr(Intr::USubSat, ty, &[&a, &b]),
-            IOp::MulHiS | IOp::MulHiU | IOp::MulHrs => {
+            IOp::MulHrs => {
+                // Native Wasm `i16x8.q15mulr_sat_s` matches x86 `pmulhrsw` on all 2^32 - 1 pairs
+                // except `(-32768, -32768)` where Wasm saturates to +32767 (`0x7FFF`) while x86
+                // wraps to -32768 (`0x8000`). Subtracting `sext(both == -32768)` (`0x7FFF - (-1)
+                // = 0x8000`) restores bit-exact x86 semantics in 5 ops (3 ops when `a == b`).
+                let q = self.intr(Intr::Q15MulrSatSigned, ty, &[&a, &b]);
+                let min16 = ty.splat("-32768");
+                let ea = self.val(&format!("icmp eq <8 x i16> {a}, {min16}"));
+                let both = if same_reg(ins, f.a, f.b) {
+                    ea
+                } else {
+                    let eb = self.val(&format!("icmp eq <8 x i16> {b}, {min16}"));
+                    self.val(&format!("and <8 x i1> {ea}, {eb}"))
+                };
+                let m = self.val(&format!("sext <8 x i1> {both} to <8 x i16>"));
+                self.val(&format!("sub <8 x i16> {q}, {m}"))
+            }
+            IOp::MulHiS | IOp::MulHiU => {
                 // Split into low/high `<4 x i16>` -> `<4 x i32>` extmul halves, then pick the
-                // result `i16` lanes directly with one `shufflevector`:
-                // - pmulhw/pmulhuw: odd `i16` lanes [1,3,5,7,9,11,13,15] (3 ops: 2 extmul + shuffle)
-                // - pmulhrsw: ((a * b) + 16384) >>u 15, even `i16` lanes [0,2,4,6,8,10,12,14]
-                //   (exact for all i16 pairs including -32768 * -32768 -> -32768, 7 ops, no mask).
+                // odd `i16` lanes [1,3,5,7,9,11,13,15] directly with one `shufflevector`.
                 let (ext, mflag) = if op == IOp::MulHiU {
                     ("zext", "nuw")
                 } else {
@@ -548,21 +562,15 @@ impl FunctionLifter<'_> {
                     ));
                     let wa = self.val(&format!("{ext} <4 x i16> {ah} to <4 x i32>"));
                     let wb = self.val(&format!("{ext} <4 x i16> {bh} to <4 x i32>"));
-                    let mut p = self.val(&format!("mul {mflag} <4 x i32> {wa}, {wb}"));
-                    if op == IOp::MulHrs {
-                        let c16384 = Ty::v(Elem::I32).splat("16384");
-                        let c15 = Ty::v(Elem::I32).splat("15");
-                        let s = self.val(&format!("add nsw <4 x i32> {p}, {c16384}"));
-                        p = self.val(&format!("lshr <4 x i32> {s}, {c15}"));
-                    }
+                    let p = self.val(&format!("mul {mflag} <4 x i32> {wa}, {wb}"));
                     halves.push(self.cast(&p, Ty::v(Elem::I32), Ty::v(Elem::I16)));
                 }
-                let pick = if op == IOp::MulHrs {
-                    [0, 2, 4, 6, 8, 10, 12, 14]
-                } else {
-                    [1, 3, 5, 7, 9, 11, 13, 15]
-                };
-                self.shuffle(&halves[0], &halves[1], Elem::I16, &pick)
+                self.shuffle(
+                    &halves[0],
+                    &halves[1],
+                    Elem::I16,
+                    &[1, 3, 5, 7, 9, 11, 13, 15],
+                )
             }
             IOp::MulEvenU | IOp::MulEvenS => unreachable!(),
             IOp::CmpEq | IOp::CmpGt => {
@@ -571,8 +579,24 @@ impl FunctionLifter<'_> {
                 self.val(&format!("sext {bt} {c} to {t}"))
             }
             IOp::MinS => self.intr(Intr::SMin, ty, &[&a, &b]),
+            IOp::MinU if e == Elem::I64 => {
+                // Wasm SIMD128 lacks unsigned `i64x2` compare, so `llvm.umin.v2i64` scalarizes to
+                // 21 ops. Flipping the sign bit reduces to `llvm.smin.v2i64` (5 pure SIMD128 ops).
+                let bias = "<i64 -9223372036854775808, i64 -9223372036854775808>";
+                let sa = self.val(&format!("xor <2 x i64> {a}, {bias}"));
+                let sb = self.val(&format!("xor <2 x i64> {b}, {bias}"));
+                let sm = self.intr(Intr::SMin, ty, &[&sa, &sb]);
+                self.val(&format!("xor <2 x i64> {sm}, {bias}"))
+            }
             IOp::MinU => self.intr(Intr::UMin, ty, &[&a, &b]),
             IOp::MaxS => self.intr(Intr::SMax, ty, &[&a, &b]),
+            IOp::MaxU if e == Elem::I64 => {
+                let bias = "<i64 -9223372036854775808, i64 -9223372036854775808>";
+                let sa = self.val(&format!("xor <2 x i64> {a}, {bias}"));
+                let sb = self.val(&format!("xor <2 x i64> {b}, {bias}"));
+                let sm = self.intr(Intr::SMax, ty, &[&sa, &sb]);
+                self.val(&format!("xor <2 x i64> {sm}, {bias}"))
+            }
             IOp::MaxU => self.intr(Intr::UMax, ty, &[&a, &b]),
             IOp::Avg => self.intr(Intr::AvgrUnsigned, ty, &[&a, &b]),
             IOp::Sign => {

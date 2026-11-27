@@ -65,7 +65,8 @@ fn ymm_upper_halves_get_slots_only_where_avx_touches_them() {
     let lifted = lift_function(&func).expect("lifts");
     let ir = &lifted.ir;
     assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
-    // Read upper halves (`ymm3`, `ymm4`) keep local allocas with entry load + exit store.
+    // Read-only upper halves (`ymm3`, `ymm4`) keep local allocas with entry load only (no
+    // redundant exit write-back to `%state.ymmh*`).
     for idx in [3, 4] {
         assert!(
             ir.contains(&format!("  %ymmh{idx} = alloca <2 x i64>\n")),
@@ -74,7 +75,7 @@ fn ymm_upper_halves_get_slots_only_where_avx_touches_them() {
         assert_eq!(
             ir.matches(&format!("ptr %state.ymmh{idx}, align 8"))
                 .count(),
-            2,
+            1,
             "{ir}"
         );
     }
@@ -877,8 +878,8 @@ fn r59_simd_vector_lowering_avoids_scalar_loops() {
                 );
             }
             "pmulhrsw" => {
-                assert!(ir.contains("16384"), "{ir}");
-                assert!(ir.contains("lshr <4 x i32>"), "{ir}");
+                assert!(ir.contains("@llvm.wasm.q15mulr.sat.signed("), "{ir}");
+                assert!(ir.contains("-32768"), "{ir}");
             }
             "pmulhw" => {
                 assert!(!ir.contains("lshr"), "pmulhw should shuffle odd lanes directly:\n{ir}");
@@ -1348,17 +1349,17 @@ fn r70_3d_fp_fma_f16c_and_shuffle_lowering_ir() {
             }
             "vinsert_and_vpermq" => {
                 assert!(!ir.contains("<4 x i64>"), "vpermq must not build <4 x i64>:\n{ir}");
-                // vinsertf128 ymm0, ymm1, xmm2, 1 must NOT load %ymmh1 inside body.
+                // vinsertf128 ymm0, ymm1, xmm2, 1 never reads or writes %ymmh1 (nor writes it back).
                 assert_eq!(
                     ir.matches("load <2 x i64>, ptr %ymmh1").count(),
-                    1,
-                    "only sync_out should load %ymmh1 (body only reads low half):\n{ir}"
+                    0,
+                    "read-only %ymmh1 must not be loaded in body or sync_out:\n{ir}"
                 );
-                // vpermq ymm3, ymm4, 0x00 only reads low half of ymm4, never %ymmh4 in body.
+                // vpermq ymm3, ymm4, 0x00 only reads low half of ymm4, never %ymmh4.
                 assert_eq!(
                     ir.matches("load <2 x i64>, ptr %ymmh4").count(),
-                    1,
-                    "only sync_out should load %ymmh4 (0x00 only reads low half):\n{ir}"
+                    0,
+                    "read-only %ymmh4 must not be loaded in body or sync_out:\n{ir}"
                 );
             }
             "f16c_256" => {
@@ -1630,6 +1631,163 @@ fn wasm64_simd128_bitmask_extadd_fp_fusion_and_idioms_ir() {
             }
             _ => {}
         }
+    }
+
+    let native_ir = LiftTarget::native_host().retarget(module.ir);
+    assert!(
+        !native_ir.contains("llvm.wasm."),
+        "wasm-only intrinsic leaked into native IR:\n{native_ir}"
+    );
+}
+
+#[test]
+fn wasm64_batch2_bitselect_q15mulr_strcmp_and_noinline_ir() {
+    use crate::lift::target::LiftTarget;
+
+    let cases: Vec<(&str, crate::cfg::Function)> = vec![
+        (
+            "blendv_bitselect",
+            asm_function(0x3000, |a| {
+                a.blendvps(xmm1, xmm2)?;
+                a.blendvpd(xmm3, xmm4)?;
+                a.pblendvb(xmm5, xmm6)?;
+                a.vblendvps(ymm7, ymm8, ymm9, ymm10)?;
+                a.ret()
+            }),
+        ),
+        (
+            "fma32_bitselect",
+            asm_function(0x3100, |a| {
+                a.vfmadd213ps(xmm0, xmm1, xmm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvtpd2dq_bitselect",
+            asm_function(0x3200, |a| {
+                a.cvtpd2dq(xmm0, xmm1)?;
+                a.vcvttpd2dq(xmm2, ymm3)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmulhrsw_q15",
+            asm_function(0x3300, |a| {
+                a.pmulhrsw(xmm0, xmm1)?;
+                a.pmulhrsw(xmm2, xmm2)?;
+                a.vpmulhrsw(ymm3, ymm4, ymm5)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pcmpstrm_vec_mask",
+            asm_function(0x3400, |a| {
+                a.pcmpistrm(xmm0, xmm1, 0x40)?; // 8-bit unit mask
+                a.pcmpestrm(xmm2, xmm3, 0x41)?; // 16-bit unit mask
+                a.ret()
+            }),
+        ),
+        (
+            "helpers_noinline",
+            asm_function(0x3500, |a| {
+                a.vfmadd213pd(xmm0, xmm1, xmm2)?;
+                a.pclmulqdq(xmm3, xmm4, 0)?;
+                a.pcmpistri(xmm5, xmm6, 0x08)?;
+                a.ret()
+            }),
+        ),
+        (
+            "dword_swizzle_and_ptest_same",
+            asm_function(0x3600, |a| {
+                a.vpermd(ymm0, ymm1, ymm2)?;
+                a.ptest(xmm3, xmm3)?;
+                a.ret()
+            }),
+        ),
+    ];
+
+    let module = lift_module(cases.iter().map(|(_, f)| f)).expect("lift module");
+    for ((name, _), f) in cases.iter().zip(&module.functions) {
+        assert!(f.unsupported.is_empty(), "{name}: {:?}", f.unsupported);
+        let ir = &f.ir;
+        match *name {
+            "blendv_bitselect" => {
+                assert!(ir.contains("@llvm.wasm.bitselect.v4i32("), "{ir}");
+                assert!(ir.contains("@llvm.wasm.bitselect.v2i64("), "{ir}");
+                assert!(ir.contains("@llvm.wasm.bitselect.v16i8("), "{ir}");
+                assert!(
+                    !ir.contains("icmp slt <"),
+                    "blendv* must use ashr + bitselect instead of icmp slt 0:\n{ir}"
+                );
+            }
+            "fma32_bitselect" => {
+                assert!(ir.contains("@llvm.wasm.bitselect.v2i64("), "{ir}");
+                assert!(
+                    !ir.contains("icmp eq <2 x i64>"),
+                    "fma32_core must use bitselect instead of icmp eq 0:\n{ir}"
+                );
+            }
+            "cvtpd2dq_bitselect" => {
+                assert_eq!(
+                    ir.matches("@llvm.wasm.bitselect.v4i32(").count(),
+                    3,
+                    "128-bit cvtpd2dq + 256-bit vcvttpd2dq must emit 3 bitselect.v4i32:\n{ir}"
+                );
+                assert!(
+                    !ir.contains("shufflevector <2 x i1>"),
+                    "cvt(t)pd2dq must avoid <2 x i1> -> <4 x i1> legalization:\n{ir}"
+                );
+            }
+            "pmulhrsw_q15" => {
+                assert_eq!(
+                    ir.matches("@llvm.wasm.q15mulr.sat.signed(").count(),
+                    4,
+                    "pmulhrsw + same-reg + 256-bit vpmulhrsw -> 4 q15mulr calls:\n{ir}"
+                );
+                // Same-reg `pmulhrsw xmm2, xmm2` needs only 1 `icmp eq -32768`, while the other
+                // three distinct-operand halves need 2 each: 2 + 1 + 2 + 2 = 7 total.
+                assert_eq!(
+                    ir.matches("icmp eq <8 x i16>").count(),
+                    7,
+                    "same-reg pmulhrsw must omit duplicate -32768 compare:\n{ir}"
+                );
+            }
+            "pcmpstrm_vec_mask" => {
+                assert!(
+                    !ir.contains("to <16 x i1>") && !ir.contains("to <8 x i1>"),
+                    "pcmp*strm unit mask must not scalarize via bitcast to <N x i1>:\n{ir}"
+                );
+                assert!(ir.contains("icmp ne <16 x i8>"), "{ir}");
+                assert!(ir.contains("icmp ne <8 x i16>"), "{ir}");
+            }
+            "dword_swizzle_and_ptest_same" => {
+                assert!(
+                    ir.contains("67372036"),
+                    "dword_swizzle_indices should multiply by 0x04040404:\n{ir}"
+                );
+                assert!(
+                    !ir.contains("shl <4 x i32>"),
+                    "dword_swizzle_indices should not emit shl 2:\n{ir}"
+                );
+                // `ptest xmm3, xmm3` sets CF=true directly without `xor -1` or `and`.
+                assert!(
+                    !ir.contains("xor <2 x i64>") && !ir.contains("and <2 x i64>"),
+                    "same-reg ptest must skip and / xor -1:\n{ir}"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Verify `noinline` on all three large SIMD internal helpers.
+    for helper in ["@__playgta6_fma_f64(", "@__playgta6_clmul(", "@__playgta6_pcmpstr("] {
+        assert!(
+            module
+                .ir
+                .lines()
+                .any(|l| l.contains(helper) && l.contains(" noinline ")),
+            "expected `noinline` on {helper} in module IR"
+        );
     }
 
     let native_ir = LiftTarget::native_host().retarget(module.ir);

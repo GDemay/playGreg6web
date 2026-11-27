@@ -324,10 +324,13 @@ pub(super) fn lift(
         }
     }
 
+    let (written_state, written_flags) = flag_liveness::own_written_state_and_flags(func);
     let mut lifter = FunctionLifter {
         func,
         regs,
         flags,
+        written_state,
+        written_flags,
         simd: vector_regs,
         faulting_calls,
         body: String::new(),
@@ -353,6 +356,7 @@ pub(super) fn lift(
         flag_summaries,
         block_live_out: flag_liveness::block_live_out(func, flag_summaries),
         dead_flags: 0,
+        carry_source: None,
         ymmh_zeroed: 0,
         known: Known::default(),
         block_entry_facts: [GprFact::Bottom; 16],
@@ -576,6 +580,12 @@ struct FunctionLifter<'a> {
     regs: [bool; 16],
     /// Arithmetic flags the function reads or writes; untouched flags stay in `%state`.
     flags: [bool; 6],
+    /// Registers (GPR/XMM/YMMH) this function's own instructions may write; read-only registers
+    /// skip redundant write-backs in `sync_out_parts`.
+    written_state: StateMask,
+    /// Arithmetic flags this function's own instructions may write; read-only flags skip
+    /// redundant write-backs in `sync_out_parts`.
+    written_flags: FlagMask,
     /// Vector registers the function touches (an `alloca <2 x i64>` per XMM register and per
     /// YMM upper half, synced like the GPRs) and the SIMD lifter's per-instruction state.
     simd: simd::Regs,
@@ -630,6 +640,9 @@ struct FunctionLifter<'a> {
     /// Per-instruction dead flags mask (0 outside modelled instructions):
     /// these flags are neither computed nor stored.
     dead_flags: FlagMask,
+    /// Pending `FlagSource` captured right before a carry-consuming instruction (`sbb`/`adc`/
+    /// `adcx`/`cmc`) invalidates `known.flag_source`, enabling direct carry-flag fusion.
+    carry_source: Option<FlagSource>,
     /// R63a: bitmask of unread upper YMM halves (`!self.simd.ymmh[i]`) whose `%state.ymmh{i}`
     /// slot is already known to hold `zeroinitializer` in the current straight-line region.
     /// Cleared on every `start_block`, call, and non-zero 256-bit write to an unread `ymmh`.
@@ -707,7 +720,14 @@ pub(super) enum FlagSource {
     /// Logical result (`test`, `and`, `or`, `xor`, `andn`): `CF = 0, OF = 0`, `ZF`/`SF` from
     /// `result`; all non-parity CCs lower directly to a constant or one `icmp <pred> result, 0`.
     LogicZero { result: String, bits: u32 },
-    /// Result (`add`, `blsi`, `blsr`, `bzhi`, non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`):
+    /// `add a, b` (`result = a + b`): `e`/`ne`/`s`/`ns` test `result` vs 0; `b`/`ae` test
+    /// `result <u a` / `result >=u a`.
+    Add {
+        a: String,
+        result: String,
+        bits: u32,
+    },
+    /// Result (`blsi`, `blsr`, `bzhi`, `adc`, `sbb`, non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`):
     /// `e`/`ne`/`s`/`ns` lower directly to `icmp eq/ne/slt/sge result, 0`.
     ResultZeroSign { result: String, bits: u32 },
     /// `dec a` (`result = a - 1`, preserving `CF`): `e`/`ne`/`s`/`ns` test `result` vs 0;
@@ -759,6 +779,9 @@ struct Known {
     gprs: [Option<String>; 16],
     flags: [Option<String>; 6],
     flag_source: Option<FlagSource>,
+    /// Tracks `(rdx64_ssa, rax64_ssa, bits)` immediately after `cdq` (32) or `cqo` (64) so a
+    /// subsequent `idiv` lowers to native `sdiv`/`srem i32`/`i64` instead of widening/`sdiv128`.
+    sign_ext_rdx: Option<(String, String, u32)>,
 }
 
 struct Checkpoint {
@@ -1522,10 +1545,22 @@ impl FunctionLifter<'_> {
         self.sync_out_parts(ALL_STATE, ALL_FLAGS);
     }
 
-    /// Flags a direct call or tail jump to `target` has to store (see `flag_liveness`).
+    /// Flags a tail jump to `target` has to store (see `flag_liveness`).
     fn flags_needed_by(&self, target: u64) -> FlagMask {
         self.flag_summaries
             .map_or(ALL_FLAGS, |summaries| summaries.needed_by(target))
+    }
+
+    /// Flags a direct call to `target` has to store before calling (`touched_flags & live_in`).
+    fn flags_sync_out_by(&self, target: u64) -> FlagMask {
+        self.flag_summaries
+            .map_or(ALL_FLAGS, |summaries| summaries.sync_out_flags_by(target))
+    }
+
+    /// Flags a direct call to `target` may overwrite (`written_flags`).
+    fn flags_written_by(&self, target: u64) -> FlagMask {
+        self.flag_summaries
+            .map_or(ALL_FLAGS, |summaries| summaries.written_flags_by(target))
     }
 
     /// Guest state a direct call to `target` must store before calling (`touched & live_in_state`).
@@ -1541,10 +1576,11 @@ impl FunctionLifter<'_> {
     }
 
     /// [`Self::sync_out`] storing only the tracked GPRs, `xmm` and `ymmh` registers in `state`
-    /// and the tracked flags in `flags`. The flags left out are dead because the callee
-    /// overwrites them before anything can observe them; the registers left out are never touched
-    /// by the callee, so the caller keeps them in its allocas across the call.
+    /// and the tracked flags in `flags` that this function may actually have modified. Registers
+    /// and flags the function only reads keep their exact values in `%state` throughout the call.
     fn sync_out_parts(&mut self, state: StateMask, flags: FlagMask) {
+        let state = state & self.written_state;
+        let flags = flags & self.written_flags;
         for idx in 0..16 {
             if self.regs[idx] && state & (1u64 << idx) != 0 {
                 let Ok(v) = self.load_gpr(idx) else {
@@ -1616,6 +1652,9 @@ impl FunctionLifter<'_> {
         self.emit(&format!("store i64 {value}, ptr {slot}"));
         self.known.gprs[idx] = Some(value.to_string());
         self.block_entry_facts[idx] = GprFact::Bottom;
+        if idx == integer::RAX || idx == integer::RDX {
+            self.known.sign_ext_rdx = None;
+        }
         Ok(())
     }
 
@@ -1666,6 +1705,24 @@ impl FunctionLifter<'_> {
     fn merge_gpr(&mut self, idx: usize, value: &str, bits: u32, shift: u32) -> R<()> {
         let old = self.load_gpr(idx)?;
         let keep = !(mask(bits) << shift);
+        if let Some(old_c) = memory_access::const_addr(&old) {
+            let kept_c = old_c & keep;
+            if let Ok(c) = value.parse::<i64>() {
+                let placed = ((c as u64) & mask(bits)) << shift;
+                return self.store_gpr(idx, &imm(kept_c | placed, 64));
+            }
+            let wide = self.val(&format!("zext i{bits} {value} to i64"));
+            let placed = if shift == 0 {
+                wide
+            } else {
+                self.val(&format!("shl i64 {wide}, {shift}"))
+            };
+            if kept_c == 0 {
+                return self.store_gpr(idx, &placed);
+            }
+            let merged = self.val(&format!("or i64 {placed}, {}", imm(kept_c, 64)));
+            return self.store_gpr(idx, &merged);
+        }
         let kept = self.val(&format!("and i64 {old}, {}", imm(keep, 64)));
         if let Ok(c) = value.parse::<i64>() {
             let placed = ((c as u64) & mask(bits)) << shift;
@@ -2467,6 +2524,18 @@ impl FunctionLifter<'_> {
                     _ => None,
                 }
             }
+            FlagSource::Add { a, result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    C::b => Some(self.val(&format!("icmp ult {t} {result}, {a}"))),
+                    C::ae => Some(self.val(&format!("icmp uge {t} {result}, {a}"))),
+                    _ => None,
+                }
+            }
             FlagSource::ResultZeroSign { result, bits } => {
                 let t = ty(bits);
                 match cc {
@@ -2648,18 +2717,40 @@ impl FunctionLifter<'_> {
         Ok(if negate { self.negate_i1(&v) } else { v })
     }
 
+    /// Reads the incoming carry flag (`CF`), preferring direct fusion from the immediately
+    /// preceding producer's `FlagSource` (captured in `self.carry_source`) over loading `%cf`.
+    pub(super) fn take_carry_flag(&mut self) -> String {
+        if let Some(src) = self.carry_source.take() {
+            let saved = self.known.flag_source.replace(src);
+            let fused = self.try_fused_condition(ConditionCode::b);
+            self.known.flag_source = saved;
+            if let Some(cf) = fused {
+                return cf;
+            }
+        }
+        self.get_flag(Flag::Cf)
+    }
+
     // ----- instructions --------------------------------------------------------------------------
 
     /// Lifts one non-terminating instruction (calls included).
     fn lift_instruction(&mut self, ins: &Instruction) -> R<()> {
         use Mnemonic as M;
+        self.carry_source = None;
         if ins.code() == Code::INVALID {
             return unsupported("invalid instruction encoding");
         }
         // Any instruction that can modify flags (or a call) invalidates the pending `FlagSource`
         // before it runs; fusable producers reinstall their own `FlagSource` after updating flags.
+        // Carry-consuming non-locked instructions (`adc`/`sbb`/`adcx`/`cmc`) preserve the prior
+        // `FlagSource` in `carry_source` so they can consume `CF` without touching `%cf`.
         if ins.rflags_modified() != 0 || ins.mnemonic() == M::Call {
-            self.known.flag_source = None;
+            let prev = self.known.flag_source.take();
+            if !ins.has_lock_prefix()
+                && matches!(ins.mnemonic(), M::Adc | M::Sbb | M::Adcx | M::Cmc)
+            {
+                self.carry_source = prev;
+            }
         }
         if simd::is_simd(ins) {
             return self.lift_simd(ins);
@@ -2796,6 +2887,14 @@ impl FunctionLifter<'_> {
                 let (v, bits) = self.read_reg(src)?;
                 let sign = self.val(&format!("ashr i{bits} {v}, {}", bits - 1));
                 self.write_reg(dst, &sign, bits)?;
+                if matches!(bits, 32 | 64)
+                    && let (Some(rdx64), Some(rax64)) = (
+                        self.known.gprs[integer::RDX].clone(),
+                        self.known.gprs[integer::RAX].clone(),
+                    )
+                {
+                    self.known.sign_ext_rdx = Some((rdx64, rax64, bits));
+                }
             }
             M::Seto
             | M::Setno
@@ -2977,7 +3076,31 @@ impl FunctionLifter<'_> {
                     self.known.flag_source = Some(FlagSource::LogicZero { result: a, bits });
                     return Ok(());
                 }
-                Alu::Add | Alu::Adc | Alu::Sbb => {}
+                Alu::Sbb => {
+                    // `sbb r, r` computes `-CF` (`0` or all-ones): CF=c, OF=0, AF=c, ZF=!c, SF=c,
+                    // PF=1 (both `0x00` and `0xFF` have even parity) without reading `r` (32/64b).
+                    let c = self.take_carry_flag();
+                    self.set_flag(Flag::Cf, &c);
+                    self.set_flag(Flag::Of, "false");
+                    self.set_flag(Flag::Af, &c);
+                    if self.flag_live(Flag::Zf) {
+                        let zf = self.negate_i1(&c);
+                        self.set_flag(Flag::Zf, &zf);
+                    }
+                    self.set_flag(Flag::Sf, &c);
+                    self.set_flag(Flag::Pf, "true");
+                    let r = match c.as_str() {
+                        "false" => "0".to_string(),
+                        "true" => "-1".to_string(),
+                        _ => self.val(&format!("sext i1 {c} to {}", ty(bits))),
+                    };
+                    self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                        result: r.clone(),
+                        bits,
+                    });
+                    return self.write_op(ins, 0, &r, bits);
+                }
+                Alu::Add | Alu::Adc => {}
             }
         }
         let a = self.read_op(ins, 0, bits)?;
@@ -3010,7 +3133,8 @@ impl FunctionLifter<'_> {
                     r
                 };
                 self.set_zsp(&r, bits);
-                self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                self.known.flag_source = Some(FlagSource::Add {
+                    a: a.to_string(),
                     result: r.clone(),
                     bits,
                 });
@@ -3018,19 +3142,49 @@ impl FunctionLifter<'_> {
             }
             Alu::Adc => {
                 // carry out of a + b + c: r < a, or r == a with a carry in.
-                let c = self.get_flag(Flag::Cf);
-                let cz = self.val(&format!("zext i1 {c} to {t}"));
-                let s = self.val(&format!("add {t} {a}, {b}"));
-                let r = self.val(&format!("add {t} {s}, {cz}"));
-                if self.flag_live(Flag::Cf) {
-                    let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
-                    let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
-                    let ceq = self.val(&format!("and i1 {c}, {eq}"));
-                    let cf = self.val(&format!("or i1 {lt}, {ceq}"));
-                    self.set_flag(Flag::Cf, &cf);
+                let c = self.take_carry_flag();
+                if c == "false" {
+                    return self.alu_value(Alu::Add, a, b, bits);
                 }
+                let r = if b == "0" {
+                    let r = if c == "true" {
+                        self.val(&format!("add {t} {a}, 1"))
+                    } else {
+                        let cz = self.val(&format!("zext i1 {c} to {t}"));
+                        self.val(&format!("add {t} {a}, {cz}"))
+                    };
+                    if self.flag_live(Flag::Cf) {
+                        let cf = self.val(&format!("icmp ult {t} {r}, {a}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    r
+                } else if c == "true" {
+                    let s = self.val(&format!("add {t} {a}, {b}"));
+                    let r = self.val(&format!("add {t} {s}, 1"));
+                    if self.flag_live(Flag::Cf) {
+                        let cf = self.val(&format!("icmp ule {t} {r}, {a}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    r
+                } else {
+                    let cz = self.val(&format!("zext i1 {c} to {t}"));
+                    let s = self.val(&format!("add {t} {a}, {b}"));
+                    let r = self.val(&format!("add {t} {s}, {cz}"));
+                    if self.flag_live(Flag::Cf) {
+                        let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
+                        let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
+                        let ceq = self.val(&format!("and i1 {c}, {eq}"));
+                        let cf = self.val(&format!("or i1 {lt}, {ceq}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    r
+                };
                 self.set_of_af(a, b, &r, bits, false);
                 self.set_zsp(&r, bits);
+                self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                    result: r.clone(),
+                    bits,
+                });
                 r
             }
             Alu::Cmp => {
@@ -3103,19 +3257,49 @@ impl FunctionLifter<'_> {
             }
             Alu::Sbb => {
                 // borrow out of a - b - c: a < b, or a == b with a borrow in.
-                let c = self.get_flag(Flag::Cf);
-                let cz = self.val(&format!("zext i1 {c} to {t}"));
-                let d = self.val(&format!("sub {t} {a}, {b}"));
-                let r = self.val(&format!("sub {t} {d}, {cz}"));
-                if self.flag_live(Flag::Cf) {
-                    let lt = self.val(&format!("icmp ult {t} {a}, {b}"));
-                    let eq = self.val(&format!("icmp eq {t} {a}, {b}"));
-                    let ceq = self.val(&format!("and i1 {c}, {eq}"));
-                    let cf = self.val(&format!("or i1 {lt}, {ceq}"));
-                    self.set_flag(Flag::Cf, &cf);
+                let c = self.take_carry_flag();
+                if c == "false" {
+                    return self.alu_value(Alu::Sub, a, b, bits);
                 }
+                let r = if b == "0" {
+                    let r = if c == "true" {
+                        self.val(&format!("sub {t} {a}, 1"))
+                    } else {
+                        let cz = self.val(&format!("zext i1 {c} to {t}"));
+                        self.val(&format!("sub {t} {a}, {cz}"))
+                    };
+                    if self.flag_live(Flag::Cf) {
+                        let cf = self.val(&format!("icmp ugt {t} {r}, {a}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    r
+                } else if c == "true" {
+                    let d = self.val(&format!("sub {t} {a}, {b}"));
+                    let r = self.val(&format!("sub {t} {d}, 1"));
+                    if self.flag_live(Flag::Cf) {
+                        let cf = self.val(&format!("icmp ule {t} {a}, {b}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    r
+                } else {
+                    let cz = self.val(&format!("zext i1 {c} to {t}"));
+                    let d = self.val(&format!("sub {t} {a}, {b}"));
+                    let r = self.val(&format!("sub {t} {d}, {cz}"));
+                    if self.flag_live(Flag::Cf) {
+                        let lt = self.val(&format!("icmp ult {t} {a}, {b}"));
+                        let eq = self.val(&format!("icmp eq {t} {a}, {b}"));
+                        let ceq = self.val(&format!("and i1 {c}, {eq}"));
+                        let cf = self.val(&format!("or i1 {lt}, {ceq}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    r
+                };
                 self.set_of_af(a, b, &r, bits, true);
                 self.set_zsp(&r, bits);
+                self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                    result: r.clone(),
+                    bits,
+                });
                 r
             }
             Alu::And | Alu::Or | Alu::Xor | Alu::Test => {
@@ -3237,14 +3421,21 @@ impl FunctionLifter<'_> {
         };
         let (count, imm_count) = match ins.op_kind(1) {
             OpKind::Register if ins.op_register(1) == Register::CL => {
-                let (cl, _) = self.read_reg(Register::CL)?;
-                let masked = self.val(&format!("and i8 {cl}, {count_mask}"));
-                let widened = if cnt_bits == 8 {
-                    masked
+                let rcx = self.load_gpr(integer::RCX)?;
+                if let Some(v) = memory_access::const_addr(&rcx) {
+                    let c = v & count_mask;
+                    (c.to_string(), Some(c))
                 } else {
-                    self.val(&format!("zext i8 {masked} to i{cnt_bits}"))
-                };
-                (widened, None)
+                    let raw = if cnt_bits == 64 {
+                        rcx
+                    } else {
+                        self.val(&format!("trunc i64 {rcx} to i{cnt_bits}"))
+                    };
+                    (
+                        self.val(&format!("and i{cnt_bits} {raw}, {count_mask}")),
+                        None,
+                    )
+                }
             }
             kind if is_immediate(kind) => match ins.try_immediate(1) {
                 Ok(v) => {
@@ -3445,6 +3636,19 @@ impl FunctionLifter<'_> {
 
     /// Full 64x64 -> 128-bit product as `(lo, hi)`; `signed` adjusts the high half.
     fn mul128(&mut self, a: &str, b: &str, signed: bool) -> (String, String) {
+        if memory_access::const_addr(a) == Some(0) || memory_access::const_addr(b) == Some(0) {
+            return ("0".to_string(), "0".to_string());
+        }
+        // `UMUL128_IR` places its inline-asm barrier on `%a1` (`a >> 32`); keeping a lift-time
+        // constant in `%b` (e.g. MSVC's `mov rax, MAGIC; mul rcx`) lets LLVM constant-fold `%b0`
+        // and `%b1`, cutting Wasm ops and `i64.mul` count in half.
+        let (a, b) = if memory_access::const_addr(a).is_some()
+            && memory_access::const_addr(b).is_none()
+        {
+            (b, a)
+        } else {
+            (a, b)
+        };
         self.support.insert(Support::Umul128);
         let p = self.val(&format!(
             "call {{ i64, i64 }} @__playgta6_umul128(i64 {a}, i64 {b})"
@@ -3576,6 +3780,53 @@ impl FunctionLifter<'_> {
         let divisor = self.read_op(ins, 0, bits)?;
         let ext = if signed { "sext" } else { "zext" };
 
+        // Fast paths for compiler-standard `xor edx, edx; div` and `cdq`/`cqo; idiv` (32/64-bit):
+        // emit native `udiv`/`urem`/`sdiv`/`srem i{bits}` directly, avoiding 32->64 widening and
+        // 64-bit `@__playgta6_{u,s}div128` calls (`sret` shadow-stack spills + 64-iter loops).
+        if matches!(bits, 32 | 64) {
+            let (qreg, rreg) = if bits == 32 {
+                (Register::EAX, Register::EDX)
+            } else {
+                (Register::RAX, Register::RDX)
+            };
+            if !signed
+                && self.known.gprs[integer::RDX]
+                    .as_deref()
+                    .and_then(memory_access::const_addr)
+                    .is_some_and(|v| (v & mask(bits)) == 0)
+            {
+                let (lo, _) = self.read_reg(qreg)?;
+                let fault = self.val(&format!("icmp eq {t} {divisor}, 0"));
+                self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+                let q = self.val(&format!("udiv {t} {lo}, {divisor}"));
+                let r = self.val(&format!("urem {t} {lo}, {divisor}"));
+                self.write_reg(qreg, &q, bits)?;
+                return self.write_reg(rreg, &r, bits);
+            }
+            if signed
+                && matches!(
+                    &self.known.sign_ext_rdx,
+                    Some((rdx64, rax64, b))
+                        if *b == bits
+                            && self.known.gprs[integer::RDX].as_deref() == Some(rdx64.as_str())
+                            && self.known.gprs[integer::RAX].as_deref() == Some(rax64.as_str())
+                )
+            {
+                let (lo, _) = self.read_reg(qreg)?;
+                let d_zero = self.val(&format!("icmp eq {t} {divisor}, 0"));
+                let min_val = imm(1u64 << (bits - 1), bits);
+                let is_min = self.val(&format!("icmp eq {t} {lo}, {min_val}"));
+                let is_neg1 = self.val(&format!("icmp eq {t} {divisor}, -1"));
+                let ov = self.val(&format!("and i1 {is_min}, {is_neg1}"));
+                let fault = self.val(&format!("or i1 {d_zero}, {ov}"));
+                self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+                let q = self.val(&format!("sdiv {t} {lo}, {divisor}"));
+                let r = self.val(&format!("srem {t} {lo}, {divisor}"));
+                self.write_reg(qreg, &q, bits)?;
+                return self.write_reg(rreg, &r, bits);
+            }
+        }
+
         // 8/16/32-bit `div`/`idiv`: the 2N-bit dividend fits natively in `i64`, so lower straight
         // to Wasm64/native `udiv`/`sdiv`/`urem`/`srem i64` without calling the 128-bit helpers.
         if bits < 64 {
@@ -3694,24 +3945,32 @@ impl FunctionLifter<'_> {
                 self.start_block(&dead);
                 return Ok(());
             }
-            let flags = self.flags_needed_by(target);
+            let flags = self.flags_sync_out_by(target);
+            let written_flags = self.flags_written_by(target);
             let out_state = self.state_sync_out_by(target);
             let in_state = self.state_written_by(target);
             self.sync_out_parts(out_state, flags);
             let pre_known_gprs = self.known.gprs.clone();
+            let pre_known_flags = self.known.flags.clone();
             let pre_entry_facts = self.block_entry_facts;
             self.guest_call(&format!(
                 "call void @{}(ptr %state)",
                 function_symbol(target)
             ));
             self.callees.push(target);
-            self.sync_in_parts(in_state, live_flags_after);
-            // `after_call` is dominated solely by the pre-call block: GPRs the callee never writes
-            // (other than `rsp`) still hold their pre-call SSA values and stack/constant facts.
+            self.sync_in_parts(in_state, written_flags & live_flags_after);
+            // `after_call` is dominated solely by the pre-call block: GPRs and flags the callee
+            // never writes (other than `rsp`) still hold their pre-call SSA values and facts.
             for idx in 0..16 {
                 if idx != RSP && self.regs[idx] && in_state & (1u64 << idx) == 0 {
                     self.known.gprs[idx] = pre_known_gprs[idx].clone();
                     self.block_entry_facts[idx] = pre_entry_facts[idx];
+                }
+            }
+            for flag in FLAGS {
+                let f = flag as usize;
+                if self.flags[f] && written_flags & (1 << f) == 0 {
+                    self.known.flags[f] = pre_known_flags[f].clone();
                 }
             }
         } else {
@@ -4476,10 +4735,10 @@ fn transfer_gpr_instruction(
 pub(super) fn gpr_rw_masks(ins: &Instruction, info: &iced_x86::InstructionInfo) -> (u16, u16) {
     use Mnemonic as M;
     let rsp_bit = 1u16 << RSP;
-    // Register zeroing idioms (`xor r32/r64, r32/r64` and `sub r32/r64, r32/r64`) write 0
-    // directly in `alu()` without loading the register. 8/16-bit forms go through `merge_gpr`
-    // and therefore read the full 64-bit register.
-    if matches!(ins.mnemonic(), M::Xor | M::Sub)
+    // Register zeroing/borrow-mask idioms (`xor`/`sub`/`sbb r32/r64, r32/r64`) write directly
+    // in `alu()` without loading the register. 8/16-bit forms go through `merge_gpr` and
+    // therefore read the full 64-bit register.
+    if matches!(ins.mnemonic(), M::Xor | M::Sub | M::Sbb)
         && ins.op_count() == 2
         && ins.op_kind(0) == OpKind::Register
         && ins.op_kind(1) == OpKind::Register

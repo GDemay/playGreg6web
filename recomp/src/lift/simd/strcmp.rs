@@ -124,14 +124,33 @@ impl FunctionLifter<'_> {
                 let lo = self.val(&format!("zext i32 {res} to i64"));
                 self.insert("zeroinitializer", Elem::I64, &lo, 0)
             } else if n == 16 {
+                // Vectorized bit-to-byte mask expansion (5 Wasm SIMD128 ops vs ~125 scalarized
+                // ops from `bitcast i16 to <16 x i1>; sext`, zero `__stack_pointer` touch).
                 let bits = self.val(&format!("trunc i32 {res} to i16"));
-                let v = self.val(&format!("bitcast i16 {bits} to <16 x i1>"));
-                let e = self.val(&format!("sext <16 x i1> {v} to {}", Ty::v(Elem::I8).ir()));
+                let sp = self.splat_value(&bits, Elem::I16);
+                let b16 = self.cast(&sp, Ty::v(Elem::I16), Ty::v(Elem::I8));
+                let bytes = self.shuffle(
+                    &b16,
+                    "poison",
+                    Elem::I8,
+                    &[0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1],
+                );
+                let m = self.val(&format!(
+                    "and <16 x i8> {bytes}, <i8 1, i8 2, i8 4, i8 8, i8 16, i8 32, i8 64, i8 -128, \
+                     i8 1, i8 2, i8 4, i8 8, i8 16, i8 32, i8 64, i8 -128>"
+                ));
+                let c = self.val(&format!("icmp ne <16 x i8> {m}, zeroinitializer"));
+                let e = self.val(&format!("sext <16 x i1> {c} to <16 x i8>"));
                 self.cast(&e, Ty::v(Elem::I8), Ty::v(Elem::I64))
             } else {
-                let bits = self.val(&format!("trunc i32 {res} to i8"));
-                let v = self.val(&format!("bitcast i8 {bits} to <8 x i1>"));
-                let e = self.val(&format!("sext <8 x i1> {v} to {}", Ty::v(Elem::I16).ir()));
+                // Vectorized bit-to-word mask expansion (3 Wasm SIMD128 ops).
+                let bits = self.val(&format!("trunc i32 {res} to i16"));
+                let sp = self.splat_value(&bits, Elem::I16);
+                let m = self.val(&format!(
+                    "and <8 x i16> {sp}, <i16 1, i16 2, i16 4, i16 8, i16 16, i16 32, i16 64, i16 128>"
+                ));
+                let c = self.val(&format!("icmp ne <8 x i16> {m}, zeroinitializer"));
+                let e = self.val(&format!("sext <8 x i1> {c} to <8 x i16>"));
                 self.cast(&e, Ty::v(Elem::I16), Ty::v(Elem::I64))
             };
             self.xset_half(iced_x86::Register::XMM0, 0, &mask, Elem::I64)?;
