@@ -4468,6 +4468,10 @@ void test_xbox_device_queue_and_list_slots() {
     scene.execute({list});
     CHECK(count_op(packets_since(fx, mark), GpuOpcode::Draw) == 1);  // the indirect draw has no packet
     CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 131) == 0);
+    // Slot 101 (unidentified) stays a counted E_NOTIMPL stub, not a silent no-op.
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 101) == 0);
+    CHECK(static_cast<int32_t>(fx.vcall(list, 101, {I(0), I(0), I(0)})) == static_cast<int32_t>(0x80004001));
+    CHECK(com::stub_hits(dg::kID3D12GraphicsCommandList, 101) == 1);
 
     CHECK(t_balanced);
     scene.release_all({list, buf, heap, aliased});
