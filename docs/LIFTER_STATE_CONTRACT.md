@@ -132,8 +132,8 @@ Before #2033, rules 1-4 already held. Nothing found here shows #2033 broke one o
 - **The main thread has no `GuestStateScope`.** Synchronous callbacks from generated imports on
   the boot thread run on a separate lazy state; on worker threads they run on the caller's
   state. Behaviour differs by thread.
-- **The shard lift cache key** (`recomp/src/pipeline/shard_lift.rs` `function_key`) hashes
-  callee `live_in`, `touched`, `written` and `live_in_state`, but not `touched_flags` or
-  `written_flags`. With `--lift-cache`, a discovery change that only widens a callee's written
-  flags reuses stale caller IR.
+- **The shard lift cache key** (`recomp/src/pipeline/shard_lift.rs` `function_key`) once left out
+  callee `touched_flags` / `written_flags`, so a discovery change that only widened a callee's
+  written flags reused stale caller IR with `--lift-cache`. Fixed: all six summary fields are
+  hashed (`SHARD_CACHE_VERSION` 2) and `function_key_covers_every_callee_summary_field` pins it.
 - **`probe_hit` logs can show stale arguments** for callees that do not read them (see Readers).
