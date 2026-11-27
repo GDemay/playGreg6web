@@ -60,6 +60,17 @@ int main() {
     CHECK(has(d, "\"quarantined\":3"));
     CHECK(!has(d, "no_shader_module\":1"));
 
+    // Auto-quarantine file: new failed hashes are appended once, existing notes kept, 0 ignored.
+    CHECK(ShaderQuarantine::merge_auto_file("", {}).empty());
+    const std::string a1 = ShaderQuarantine::merge_auto_file("", {0x10, 0x10, 0});
+    CHECK(has(a1, "0x0000000000000010 pipeline_failed auto\n") && a1[0] == '#');
+    CHECK(ShaderQuarantine::merge_auto_file(a1, {0x10}).empty());
+    const std::string a2 = ShaderQuarantine::merge_auto_file(a1, {0x10, 0x20});
+    CHECK(has(a2, a1.c_str()) && has(a2, "0x0000000000000020 pipeline_failed auto\n"));
+    ShaderQuarantine rt;
+    CHECK(rt.add_text(a2, false, "auto", &err) && rt.size() == 2 && rt.contains(0x20));
+    CHECK(ShaderQuarantine::merge_auto_file("zz\n", {0x30}).empty());  // unparsable file is never rewritten
+
     if (g_failures) return 1;
     std::printf("test_native_exec_quarantine: ok\n");
     return 0;
