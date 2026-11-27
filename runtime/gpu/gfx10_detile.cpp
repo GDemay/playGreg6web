@@ -1362,6 +1362,17 @@ const char* walk_surface_mip(const PreparedSurfaceMip& p, uint32_t mip, size_t s
     // once per column and the y / z part once per row; the XOR swizzle is applied to their union
     // per element as chain_address applies it. Same addresses, without the per-element equation.
     const TileShape& s = c.shape;
+    // Consecutive low X bits name a contiguous byte run. Stop below the pipe XOR bits
+    // [8..15], so XOR changes only the run's base, never its byte order. Tail X offsets
+    // and partial rows below split runs at their natural alignment boundaries.
+    uint32_t run_log2 = 0;
+    for (uint32_t bit = c.bpp_log2; bit < std::min(s.blk_size_log2, 8u); ++bit) {
+        const bool x_bit = s.eq != nullptr ? s.eq[bit] == X(run_log2)
+                                           : (s.x_mask & (1u << bit)) != 0;
+        if (!x_bit) break;
+        ++run_log2;
+    }
+    const uint32_t run_elements = 1u << run_log2;
     std::vector<uint32_t> col_intra(p.bx);
     std::vector<uint64_t> col_block(p.bx);
     for (uint32_t x = 0; x < p.bx; ++x) {
@@ -1382,16 +1393,25 @@ const char* walk_surface_mip(const PreparedSurfaceMip& p, uint32_t mip, size_t s
             const uint64_t row_block =
                 c.in_tail[mip] ? 0u : (uint64_t{y / c.bh} * (c.pitch[mip] / c.bw)) << s.blk_size_log2;
             const uint64_t row = c.slice_stride * slice + c.macro_offset[mip] + row_block;
-            for (uint32_t x = 0; x < p.bx; ++x) {
+            auto copy_run = [&](uint32_t x, size_t copy_bytes) {
                 uint32_t intra = col_intra[x] | row_intra;
-                if (s.xor_mode) {
-                    intra = apply_gfx10_xor_64k(intra, c.pipe_bank_xor);
-                }
+                if (s.xor_mode) intra = apply_gfx10_xor_64k(intra, c.pipe_bank_xor);
                 const uint64_t addr = row + col_block[x] + intra;
-                if (addr > surface_size || p.bpe > surface_size - addr) {
-                    return "tiled source offset out of bounds";
+                if (addr > surface_size || copy_bytes > surface_size - addr) return false;
+                fn(lin_row + size_t{x} * p.bpe, static_cast<size_t>(addr), copy_bytes);
+                return true;
+            };
+            if (run_elements == 1u) {
+                // Keep the scalar walk for equations with no contiguous X bits (e.g. 16B _S).
+                for (uint32_t x = 0; x < p.bx; ++x) {
+                    if (!copy_run(x, p.bpe)) return "tiled source offset out of bounds";
                 }
-                fn(lin_row + size_t{x} * p.bpe, static_cast<size_t>(addr), size_t{p.bpe});
+            } else {
+                for (uint32_t x = 0; x < p.bx;) {
+                    const uint32_t n = std::min(run_elements - ((x + c.tail_x[mip]) & (run_elements - 1u)), p.bx - x);
+                    if (!copy_run(x, size_t{n} * p.bpe)) return "tiled source offset out of bounds";
+                    x += n;
+                }
             }
         }
     }
@@ -1407,6 +1427,7 @@ inline void copy_element(uint8_t* dst, const uint8_t* src, size_t n) noexcept {
         case 4: std::memcpy(dst, src, 4); break;
         case 8: std::memcpy(dst, src, 8); break;
         case 16: std::memcpy(dst, src, 16); break;
+        case 32: std::memcpy(dst, src, 32); break;
         default: std::memcpy(dst, src, n); break;
     }
 }
