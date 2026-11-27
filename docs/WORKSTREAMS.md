@@ -98,6 +98,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement synchronous worker-to-worker `Atomics.wait` range reads over a `SharedArrayBuffer` so `host_httpfs_open`/`read`/`close` work from pthreads.
 - [x] **O3 — Virtual Memory & Threading/TLS Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Implement Win32/Xbox `VirtualAlloc`/`VirtualProtect` arena mapping, `TlsAlloc`, SRW locks, and `XTaskQueue` on top of Emscripten pthreads.
+- [x] **OS-PERF2052 — Preserve first-fit while skipping occupied VA prefixes** — `DONE` (#2052, @GDemay). Scope: `runtime/os/vmem.{h,cpp}`, focused differential tests and synthetic reserve-only benchmark. Native allocation-search measurements only; game/browser boot impact unmeasured.
+
 - [x] **O4 — `GameInput` & `/userdata` Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Read `playgta6::InputState` from the input `SharedArrayBuffer` and map save paths to IndexedDB `/userdata`.
 - [x] **O5 — Xbox GDK `xgameruntime` & Win32 Kernel/File/Sync C-ABI Shims** — `DONE` (PR #36, closes #16) *(no game files required)*
@@ -438,7 +440,3 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Handles Emscripten 7.0.1 `em-pthread` worker bootstrap and forwards `env.host_*` host-import bindings across worker threads inside `web/loader.js`.
 - [x] **W63 — Fix Inline `detectWasm64` (`address: 'i64'` + `index: 'i64'`) in `web/index.html`** — `DONE` (PR #385, closes #384) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
   - Updates the inline HUD `detectWasm64` probe in `web/index.html` to check `address: 'i64'` with `index: 'i64'` fallback consistently across all browser entrypoints.
-
-## Focused reservation-search performance follow-up
-
-- [x] **OS-PERF2052 — Preserve first-fit while skipping occupied VA prefixes** — `DONE` (#2052, @GDemay). Scope: `runtime/os/vmem.{h,cpp}`, focused differential tests and synthetic reserve-only benchmark. Native allocation-search measurements only; game/browser boot impact unmeasured.
