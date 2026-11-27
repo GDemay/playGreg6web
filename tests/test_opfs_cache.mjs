@@ -1464,3 +1464,169 @@ test('W313: QuotaExceededError recovery on SyncAccessHandle write and concurrent
   assert.equal(syncState.activeOpenHandles.size, 0);
   assert.equal(syncState.totalClosedHandles, syncState.totalOpenedHandles);
 });
+
+test('Concurrent evictToBudget() serializes cleanly without corrupting LRU pointers, and putBackground() enforces maxPendingWriteBytes with single copy', async () => {
+  const baseDir = createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR);
+  const removedNames = [];
+  const origRemove = baseDir.removeEntry.bind(baseDir);
+  baseDir.removeEntry = async (name, opts) => {
+    // Yield to interleave concurrent evictions.
+    await new Promise((r) => setTimeout(r, 2));
+    removedNames.push(name);
+    return origRemove(name, opts);
+  };
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: baseDir });
+
+  const cache = new OpfsChunkCache({
+    opfsRoot,
+    maxBytes: 1000,
+    indexFlushDelayMs: 50,
+  });
+
+  for (let i = 0; i < 8; i += 1) {
+    await cache.put(`evict-${i}.bin`, makePatternBytes(100, i + 1));
+  }
+  assert.equal(cache.getStats().totalBytes, 800);
+
+  // Fire 4 concurrent evictToBudget() calls racing down to 300 bytes!
+  await Promise.all([
+    cache.evictToBudget(300),
+    cache.evictToBudget(300),
+    cache.evictToBudget(300),
+    cache.evictToBudget(300),
+  ]);
+
+  assert.equal(cache.getStats().totalBytes, 300);
+  assert.equal(cache.getStats().entryCount, 3);
+  // Zero duplicate removeEntry calls for the same victim!
+  assert.equal(new Set(removedNames).size, removedNames.length);
+  // Verify doubly-linked LRU list forward and backward traversal match entryCount.
+  let fwd = 0;
+  for (let n = cache._head; n; n = n.next) fwd += 1;
+  let bwd = 0;
+  for (let n = cache._tail; n; n = n.prev) bwd += 1;
+  assert.equal(fwd, 3);
+  assert.equal(bwd, 3);
+
+  // putBackground() enforces maxPendingWriteBytes and avoids redundant double-slice copies.
+  let blockWrites = true;
+  const blockedWriteResolvers = [];
+  const slowDir = createMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR, null, {
+    async onBeforeWrite(name) {
+      if (blockWrites && name !== DEFAULT_INDEX_FILENAME) {
+        await new Promise((r) => {
+          blockedWriteResolvers.push(r);
+        });
+      }
+    },
+  });
+  const slowRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: slowDir });
+  const bgCache = new OpfsChunkCache({
+    opfsRoot: slowRoot,
+    maxBytes: 10000,
+    maxBackgroundWriteConcurrency: 1,
+    maxPendingWriteBytes: 256,
+    indexFlushDelayMs: 50,
+  });
+  await bgCache.init();
+
+  let sliceCalls = 0;
+  const origSlice = Uint8Array.prototype.slice;
+  Uint8Array.prototype.slice = function trackedSlice(...args) {
+    sliceCalls += 1;
+    return origSlice.apply(this, args);
+  };
+  try {
+    const payload = makePatternBytes(100, 9);
+    assert.equal(bgCache.putBackground('bg-0.bin', payload).queued, true); // active (100B)
+    assert.equal(bgCache.putBackground('bg-1.bin', payload).queued, true); // queued (100B)
+    assert.equal(bgCache.putBackground('bg-2.bin', payload).queued, true); // queued (200B <= 256B)
+    assert.equal(bgCache.putBackground('bg-3.bin', payload).queued, true); // drops oldest queued to stay <= 256B
+    assert.ok(bgCache._bgWriteQueuedBytes <= 256);
+    assert.ok(bgCache._bgWriteQueue.size <= 2);
+    // Rejects single payload larger than maxPendingWriteBytes immediately.
+    assert.equal(bgCache.putBackground('too-big.bin', makePatternBytes(300, 7)).queued, false);
+  } finally {
+    Uint8Array.prototype.slice = origSlice;
+  }
+  assert.ok(sliceCalls <= 4, `Expected <= 4 slice copies for 4 putBackground calls (single copy each), got ${sliceCalls}`);
+  blockWrites = false;
+  while (blockedWriteResolvers.length > 0) {
+    blockedWriteResolvers.shift()();
+  }
+  await bgCache.flushBackgroundWrites();
+  await bgCache.close();
+  await cache.close();
+});
+
+test('Reload reconciliation skips getFile() for indexed keys, places untracked files at LRU head, and MRU-tail hits skip redundant index flush', async () => {
+  const cacheDir = createSyncMockOpfsDirHandle(DEFAULT_OPFS_CACHE_DIR);
+  const opfsRoot = createMockOpfsDirHandle('', { [DEFAULT_OPFS_CACHE_DIR]: cacheDir });
+  const syncState = cacheDir._syncState;
+
+  const first = new OpfsChunkCache({
+    opfsRoot,
+    maxBytes: 400,
+    indexFlushDelayMs: 0,
+  });
+  await first.put('k1.bin', makePatternBytes(100, 1));
+  await first.put('k2.bin', makePatternBytes(100, 2));
+  await first.close();
+
+  // Inject an untracked file directly on disk (not listed in index JSON).
+  cacheDir._entries.set('untracked.bin', makePatternBytes(100, 99));
+
+  // Count getFile() calls on cacheDir entries during warm reload reconciliation.
+  let entryGetFileCalls = 0;
+  const origEntries = cacheDir.entries.bind(cacheDir);
+  cacheDir.entries = async function* wrappedEntries() {
+    for await (const [name, handle] of origEntries()) {
+      if (handle && handle.kind === 'file' && typeof handle.getFile === 'function') {
+        const origGetFile = handle.getFile.bind(handle);
+        yield [
+          name,
+          {
+            kind: handle.kind,
+            name: handle.name,
+            async getFile() {
+              entryGetFileCalls += 1;
+              return origGetFile();
+            },
+          },
+        ];
+      } else {
+        yield [name, handle];
+      }
+    }
+  };
+
+  const second = new OpfsChunkCache({
+    opfsRoot,
+    maxBytes: 400,
+    indexFlushDelayMs: 0,
+  });
+  await second.init();
+
+  // Only the 1 untracked file should have called handle.getFile(); indexed k1.bin and k2.bin skipped it!
+  assert.equal(entryGetFileCalls, 1, 'Already-indexed OPFS chunks must not trigger handle.getFile() during init reconciliation');
+  assert.equal(second._head.key, 'untracked.bin', 'Discovered untracked disk files must be placed at LRU head (lowest eviction priority)');
+
+  // MRU-tail getEntry() hit must NOT trigger redundant index writes!
+  const indexWritesBefore = cacheDir._writeCounts.get(DEFAULT_INDEX_FILENAME) || 0;
+  const tailKey = second._tail.key;
+  const hit = await second.getEntry(tailKey);
+  assert.equal(hit.hit, true);
+  assert.equal(
+    cacheDir._writeCounts.get(DEFAULT_INDEX_FILENAME) || 0,
+    indexWritesBefore,
+    'Reading an entry already at MRU tail must skip redundant index rewrite',
+  );
+
+  // Adding 200 bytes overflows maxBytes=400 and must evict untracked.bin first, keeping k2.bin alive.
+  await second.put('k3.bin', makePatternBytes(200, 3));
+  assert.equal(await second.has('untracked.bin'), false);
+  assert.equal(await second.has('k2.bin'), true);
+
+  await second.close();
+  assert.equal(syncState.activeOpenHandles.size, 0);
+});

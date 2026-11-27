@@ -12,8 +12,10 @@ export const DEFAULT_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB
 export const DEFAULT_INDEX_FLUSH_DELAY_MS = 0;
 export const DEFAULT_PREFETCH_CONCURRENCY = 4;
 export const DEFAULT_MAX_PENDING_WRITES = 64;
+export const DEFAULT_MAX_PENDING_WRITE_BYTES = 32 * 1024 * 1024; // 32 MiB byte cap on queued background writes
 export const DEFAULT_MAX_WRITE_CONCURRENCY = 4;
 export const DEFAULT_MAX_OPEN_SYNC_HANDLES = 8;
+export const DEFAULT_RECONCILE_CONCURRENCY = 8;
 
 export const CHUNK_KINDS = Object.freeze({
   SHADER_PACK: 'shader-pack',
@@ -495,6 +497,10 @@ export class OpfsChunkCache {
       opts.maxPendingWrites,
       DEFAULT_MAX_PENDING_WRITES
     );
+    this.maxPendingWriteBytes = sanitizePositiveInt(
+      opts.maxPendingWriteBytes,
+      DEFAULT_MAX_PENDING_WRITE_BYTES
+    );
     this.maxWriteConcurrency = sanitizePositiveInt(
       opts.maxWriteConcurrency,
       DEFAULT_MAX_WRITE_CONCURRENCY
@@ -543,8 +549,10 @@ export class OpfsChunkCache {
 
     // Bounded non-blocking background write-through queue.
     this._bgWriteQueue = new Map();
+    this._bgWriteQueuedBytes = 0;
     this._activeBgWrites = new Set();
     this._bgWriteWaiters = [];
+    this._evictChain = Promise.resolve();
 
     // Bounded LRU pool of Web Worker OPFS FileSystemSyncAccessHandles (W313).
     this._syncHandles = new Map();
@@ -597,6 +605,45 @@ export class OpfsChunkCache {
       this._head = node;
     }
     this._tail = node;
+  }
+
+  _linkHead(node) {
+    node.prev = null;
+    node.next = this._head;
+    if (this._head !== null) {
+      this._head.prev = node;
+    } else {
+      this._tail = node;
+    }
+    this._head = node;
+  }
+
+  _insertAtHead(meta) {
+    if (this._entries.has(meta.key)) {
+      return this._upsertNode(meta);
+    }
+    const node = {
+      key: meta.key,
+      sizeBytes: meta.sizeBytes,
+      lastAccessedMs: meta.lastAccessedMs,
+      createdAtMs: meta.createdAtMs,
+      etag: meta.etag,
+      versionKey: meta.versionKey,
+      fileFingerprint: meta.fileFingerprint || null,
+      pinned: meta.pinned,
+      kind: meta.kind,
+      accessOrder: meta.accessOrder,
+      prev: null,
+      next: null,
+    };
+    this._entries.set(node.key, node);
+    this._linkHead(node);
+    this._totalBytes += node.sizeBytes;
+    if (node.pinned) {
+      this._pinnedCount += 1;
+      this._pinnedBytes += node.sizeBytes;
+    }
+    return node;
   }
 
   _unlinkNode(node) {
@@ -1099,7 +1146,8 @@ export class OpfsChunkCache {
     return removed;
   }
 
-  async _collectDiskEntries(dirHandle, prefix = '', out = []) {
+  async _collectDiskEntries(dirHandle, prefix = '', out = [], knownKeys = null) {
+    const untrackedFileHandles = [];
     for await (const [name, handle] of iterateDirEntries(dirHandle)) {
       if (!handle || typeof name !== 'string') continue;
       if (prefix === '' && name === this.indexFileName && handle.kind !== 'directory') {
@@ -1107,12 +1155,43 @@ export class OpfsChunkCache {
       }
       const rel = prefix ? `${prefix}/${name}` : name;
       if (handle.kind === 'directory') {
-        await this._collectDiskEntries(handle, rel, out);
+        await this._collectDiskEntries(handle, rel, out, knownKeys);
       } else if (handle.kind === 'file' || typeof handle.getFile === 'function') {
-        const meta = await readFileHandleMeta(handle);
-        out.push({ name: rel, size: meta.size, lastModified: meta.lastModified });
+        if (knownKeys && knownKeys.has(rel)) {
+          // Skip redundant getFile() IPC on warm reload for already-indexed files.
+          out.push({ name: rel, size: null, lastModified: 0, fromKnownIndex: true });
+        } else {
+          untrackedFileHandles.push({ rel, handle });
+        }
       }
     }
+
+    if (untrackedFileHandles.length > 0) {
+      let nextIdx = 0;
+      const workerCount = Math.min(DEFAULT_RECONCILE_CONCURRENCY, untrackedFileHandles.length);
+      const workers = [];
+      for (let w = 0; w < workerCount; w += 1) {
+        workers.push(
+          (async () => {
+            while (true) {
+              const i = nextIdx;
+              if (i >= untrackedFileHandles.length) return;
+              nextIdx += 1;
+              const item = untrackedFileHandles[i];
+              const meta = await readFileHandleMeta(item.handle);
+              out.push({
+                name: item.rel,
+                size: meta.size,
+                lastModified: meta.lastModified,
+                fromKnownIndex: false,
+              });
+            }
+          })()
+        );
+      }
+      await Promise.all(workers);
+    }
+
     return out;
   }
 
@@ -1420,10 +1499,12 @@ export class OpfsChunkCache {
       let prunedCount = 0;
 
       if (reconcile) {
-        const diskEntries = await this._collectDiskEntries(cacheDir);
+        const knownKeys = loadedFromIndex && this._entries.size > 0 ? new Set(this._entries.keys()) : null;
+        const diskEntries = await this._collectDiskEntries(cacheDir, '', [], knownKeys);
         diskEntries.sort((a, b) => compareAscii(a.name, b.name));
 
         const presentKeys = new Set();
+        const discovered = [];
         for (let i = 0; i < diskEntries.length; i += 1) {
           const file = diskEntries[i];
           let validKey;
@@ -1435,7 +1516,7 @@ export class OpfsChunkCache {
           presentKeys.add(validKey);
           const existing = this._entries.get(validKey);
           if (existing) {
-            if (existing.sizeBytes !== file.size) {
+            if (file.size !== null && existing.sizeBytes !== file.size) {
               this._totalBytes = Math.max(0, this._totalBytes - existing.sizeBytes) + file.size;
               if (existing.pinned) {
                 this._pinnedBytes = Math.max(0, this._pinnedBytes - existing.sizeBytes) + file.size;
@@ -1443,21 +1524,29 @@ export class OpfsChunkCache {
               existing.sizeBytes = file.size;
             }
           } else {
-            const ts = sanitizeNonNegativeInt(file.lastModified, 0);
-            this._upsertNode({
-              key: validKey,
-              sizeBytes: file.size,
-              lastAccessedMs: ts,
-              createdAtMs: ts,
-              etag: null,
-              versionKey: null,
-              fileFingerprint: extractFingerprintFromKey(validKey),
-              pinned: false,
-              kind: inferChunkKind(validKey),
-              accessOrder: this._nextAccessOrder(),
-            });
-            discoveredCount += 1;
+            discovered.push({ validKey, file });
           }
+        }
+
+        // Insert unindexed files discovered on disk at LRU head (accessOrder = 0) so
+        // warm indexed entries are never evicted ahead of untracked/orphan files.
+        for (let i = discovered.length - 1; i >= 0; i -= 1) {
+          const { validKey, file } = discovered[i];
+          const ts = sanitizeNonNegativeInt(file.lastModified, 0);
+          const sizeBytes = sanitizeNonNegativeInt(file.size, 0);
+          this._insertAtHead({
+            key: validKey,
+            sizeBytes,
+            lastAccessedMs: ts,
+            createdAtMs: ts,
+            etag: null,
+            versionKey: null,
+            fileFingerprint: extractFingerprintFromKey(validKey),
+            pinned: false,
+            kind: inferChunkKind(validKey),
+            accessOrder: 0,
+          });
+          discoveredCount += 1;
         }
 
         for (const [key, node] of Array.from(this._entries.entries())) {
@@ -1561,8 +1650,9 @@ export class OpfsChunkCache {
    */
   async put(keyOrDescriptor, data, options = {}) {
     const key = makeChunkKey(keyOrDescriptor, this.indexFileName);
-    const bytes = toUint8Array(data);
     const opts = options && typeof options === 'object' ? options : {};
+    const bytes =
+      opts._ownedBytes === true && data instanceof Uint8Array ? data : toUint8Array(data);
 
     if (!this._initialized) {
       await this.init();
@@ -1729,6 +1819,14 @@ export class OpfsChunkCache {
     let bytes;
     try {
       key = makeChunkKey(keyOrDescriptor, this.indexFileName);
+      if (
+        this.maxPendingWriteBytes > 0 &&
+        data &&
+        typeof data.byteLength === 'number' &&
+        data.byteLength > this.maxPendingWriteBytes
+      ) {
+        return { queued: false, droppedOldest: false, key };
+      }
       bytes = toUint8Array(data);
     } catch {
       this._writeErrors += 1;
@@ -1753,19 +1851,40 @@ export class OpfsChunkCache {
       opts.fileSize = keyOrDescriptor.fileSize;
     }
 
-    let droppedOldest = false;
-    if (this._bgWriteQueue.has(key)) {
-      this._bgWriteQueue.delete(key);
-    } else {
-      while (this._bgWriteQueue.size >= this.maxPendingWrites) {
-        const oldestKey = this._bgWriteQueue.keys().next().value;
-        if (oldestKey === undefined) break;
-        this._bgWriteQueue.delete(oldestKey);
-        droppedOldest = true;
-      }
+    if (this.maxPendingWriteBytes > 0 && bytes.byteLength > this.maxPendingWriteBytes) {
+      // Single payload exceeds queue byte budget; drop cleanly rather than pinning unbounded RAM.
+      return { queued: false, droppedOldest: false, key };
     }
 
+    let droppedOldest = false;
+    if (this._bgWriteQueue.has(key)) {
+      const prev = this._bgWriteQueue.get(key);
+      if (prev && prev.bytes) {
+        this._bgWriteQueuedBytes = Math.max(0, this._bgWriteQueuedBytes - prev.bytes.byteLength);
+      }
+      this._bgWriteQueue.delete(key);
+    }
+    while (
+      this._bgWriteQueue.size > 0 &&
+      (this._bgWriteQueue.size >= this.maxPendingWrites ||
+        this._bgWriteQueuedBytes + bytes.byteLength > this.maxPendingWriteBytes)
+    ) {
+      const oldestKey = this._bgWriteQueue.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldestTask = this._bgWriteQueue.get(oldestKey);
+      this._bgWriteQueue.delete(oldestKey);
+      if (oldestTask && oldestTask.bytes) {
+        this._bgWriteQueuedBytes = Math.max(
+          0,
+          this._bgWriteQueuedBytes - oldestTask.bytes.byteLength
+        );
+      }
+      droppedOldest = true;
+    }
+
+    opts._ownedBytes = true;
     this._bgWriteQueue.set(key, { key, bytes, options: opts });
+    this._bgWriteQueuedBytes += bytes.byteLength;
     this._pumpBgWriteQueue();
     return { queued: true, droppedOldest, key };
   }
@@ -1779,6 +1898,9 @@ export class OpfsChunkCache {
       if (!next) break;
       const [key, task] = next;
       this._bgWriteQueue.delete(key);
+      if (task && task.bytes) {
+        this._bgWriteQueuedBytes = Math.max(0, this._bgWriteQueuedBytes - task.bytes.byteLength);
+      }
 
       const writePromise = (async () => {
         try {
@@ -2020,6 +2142,7 @@ export class OpfsChunkCache {
 
     const nowMs = this._readNowMs();
     let node = existing;
+    let indexChanged = false;
     if (!node) {
       node = this._upsertNode({
         key,
@@ -2033,6 +2156,7 @@ export class OpfsChunkCache {
         kind: inferChunkKind(key),
         accessOrder: this._nextAccessOrder(),
       });
+      indexChanged = true;
     } else {
       if (node.sizeBytes !== bytes.byteLength) {
         this._totalBytes = Math.max(0, this._totalBytes - node.sizeBytes) + bytes.byteLength;
@@ -2040,14 +2164,19 @@ export class OpfsChunkCache {
           this._pinnedBytes = Math.max(0, this._pinnedBytes - node.sizeBytes) + bytes.byteLength;
         }
         node.sizeBytes = bytes.byteLength;
+        indexChanged = true;
       }
       if (opts.touch !== false) {
+        const wasAlreadyMru = node === this._tail;
         this._touchNode(node, nowMs);
+        if (!wasAlreadyMru) {
+          indexChanged = true;
+        }
       }
     }
 
     this._hits += 1;
-    if (opts.touch !== false || !existing) {
+    if (indexChanged) {
       await this._markIndexDirty();
     }
 
@@ -2113,6 +2242,16 @@ export class OpfsChunkCache {
    * @param {boolean} [options.deferFlush=false]
    */
   async evictToBudget(targetBytes, options = {}) {
+    const run = () => this._evictToBudgetInternal(targetBytes, options);
+    const next = this._evictChain.then(run, run);
+    this._evictChain = next.then(
+      () => {},
+      () => {}
+    );
+    return next;
+  }
+
+  async _evictToBudgetInternal(targetBytes, options = {}) {
     const budget = sanitizeNonNegativeInt(targetBytes, 0);
     const opts = options && typeof options === 'object' ? options : {};
     const excludeSet = new Set(opts.excludeKeys || []);
@@ -2133,23 +2272,25 @@ export class OpfsChunkCache {
 
     let evictedEntries = 0;
     let evictedBytes = 0;
-    let node = this._head;
 
-    while (node !== null && this._totalBytes > budget) {
-      const next = node.next;
-      if (node.pinned || excludeSet.has(node.key)) {
-        node = next;
-        continue;
+    while (this._totalBytes > budget) {
+      let victim = this._head;
+      while (victim !== null && (victim.pinned || excludeSet.has(victim.key))) {
+        victim = victim.next;
       }
-      const key = node.key;
-      const sizeBytes = node.sizeBytes;
+      if (victim === null) {
+        break;
+      }
+      const key = victim.key;
+      const sizeBytes = victim.sizeBytes;
+      // Unlink victim synchronously BEFORE awaiting OPFS removal so concurrent
+      // operations cannot corrupt doubly-linked list pointers or double-evict.
+      this._deleteNode(victim);
       await this._removeFile(cacheDir, key);
-      this._deleteNode(node);
       evictedEntries += 1;
       evictedBytes += sizeBytes;
       this._evictions += 1;
       this._evictedBytes += sizeBytes;
-      node = next;
     }
 
     if (evictedEntries > 0 && !opts.deferFlush) {
