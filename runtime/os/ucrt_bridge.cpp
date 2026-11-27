@@ -2590,6 +2590,9 @@ size_t pg6_crt_fwrite(const void* buffer, size_t size, size_t count, FILE* strea
         }
         return done / size;
     }
+    // #1077: a host FILE may hand a large block straight to WriteFile, a kernel read of the guest
+    // buffer, which fails on pages the guest never touched (still lazily committed).
+    playgta6::os::materialize_host_range(buffer, static_cast<uint64_t>(size * count));
     return std::fwrite(buffer, size, count, stream);
 }
 

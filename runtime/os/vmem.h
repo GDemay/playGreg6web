@@ -575,6 +575,11 @@ public:
 bool take_written_view_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 // R40: writes to shared page views caught so far (one per page and take interval).
 uint64_t shared_view_write_faults();
+// #1077: commits the lazily committed (commit-on-first-touch) pages of [p, p + len) now, for a
+// kernel call that only reads them (WriteFile / fwrite straight from a guest buffer): a kernel read
+// of a page not yet committed fails (ERROR_NOACCESS) instead of faulting into the commit handler.
+// Unlike HostWriteScope it does not mark anything written. False when a commit failed.
+bool materialize_host_range(const void* p, uint64_t len);
 // R40: a host or kernel call about to write [p, p + len) itself (ReadFile/fread into a guest
 // buffer, DirectStorage destinations). A kernel write to an armed (read-only) view fails instead
 // of faulting into the tracker, so while the scope lives the views it covers stay writable and are

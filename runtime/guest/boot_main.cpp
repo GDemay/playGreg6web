@@ -134,6 +134,7 @@
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/host_input.h"
+#include "guest/host_probe.h"
 #include "guest/input_record.h"
 #include "gpu/native_exec/pipe_budget_model.h"
 #include "gpu/native_exec/present_model.h"
@@ -817,13 +818,16 @@ uint64_t profile_caller(const CONTEXT& ctx, uint64_t top) {
     CONTEXT unwound = ctx;
     void* handler_data = nullptr;
     DWORD64 establisher = 0;
+    bool faulted = false;
+    guest::host_probe_enter();  // a stale stack faults into the __except, not the crash handler
     __try {
         RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &unwound, &handler_data, &establisher,
                          nullptr);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        return 0;
+        faulted = true;
     }
-    return unwound.Rip;
+    guest::host_probe_leave();
+    return faulted ? 0 : unwound.Rip;
 }
 
 std::string profile_module(uint64_t pc) {
@@ -914,6 +918,7 @@ std::string gp_frame_label(uint64_t pc, int* kind) {
 size_t gp_unwind(const CONTEXT& start, uint64_t top, uint64_t* pcs) {
     CONTEXT ctx = start;
     size_t n = 0;
+    guest::host_probe_enter();  // a stale stack faults into the __except, not the crash handler
     __try {
         while (n < kGpMaxFrames && ctx.Rip != 0) {
             pcs[n++] = ctx.Rip;
@@ -934,6 +939,7 @@ size_t gp_unwind(const CONTEXT& start, uint64_t top, uint64_t* pcs) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
     }
+    guest::host_probe_leave();
     return n;
 }
 
@@ -1623,6 +1629,7 @@ size_t capture_host_stack(void** frames, size_t max_frames) {
 void print_host_stack_hint(uint64_t rsp) {
     std::fprintf(stderr, "[host-stack] fault thread %lu, rsp 0x%" PRIx64 ":", GetCurrentThreadId(), rsp);
     int printed = 0;
+    guest::host_probe_enter();  // an unreadable stack word ends the hint (see vectored_handler)
     for (int i = 0; i < 256 && printed < 12; ++i) {
         uint64_t word = 0;
         __try {
@@ -1643,12 +1650,16 @@ void print_host_stack_hint(uint64_t rsp) {
                      word - reinterpret_cast<uint64_t>(module));
         ++printed;
     }
+    guest::host_probe_leave();
     std::fprintf(stderr, "\n");
     std::fflush(stderr);
 }
 
 LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
     const DWORD code = info->ExceptionRecord->ExceptionCode;
+    if ((code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) && guest::host_probe_active()) {
+        return EXCEPTION_CONTINUE_SEARCH;  // a probe's own __except handles it (host_probe.h)
+    }
     const char* kind = nullptr;
     switch (code) {
         case EXCEPTION_ACCESS_VIOLATION:
@@ -1697,7 +1708,11 @@ LONG CALLBACK vectored_handler(EXCEPTION_POINTERS* info) {
 void install_host_fault_handlers() {
     guest::minidump::Writer::init();  // dbghelp + dumper thread before any fault
     guest::set_fault_hook(&guest_fault_hook);
-    AddVectoredExceptionHandler(1, &vectored_handler);
+    // Last in the vectored chain: the os layer's handlers (lazy commit-on-first-touch, #1077, and
+    // shared-view write tracking) resolve their faults and resume; they are registered on first
+    // use, which can come before this point, and a handler added first would take those faults
+    // for host crashes.
+    AddVectoredExceptionHandler(0, &vectored_handler);
 }
 #else
 constexpr guest::HostFunctionStartFn host_function_start = nullptr;  // heuristic mapping
