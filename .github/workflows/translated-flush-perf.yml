@@ -42,9 +42,10 @@ jobs:
           cmake -S baseline/runtime -B baseline-build -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON
           cmake --build baseline-build -j4 --target bench_fragmented_buffer_flush test_d3d12_xs_exports
           cmake -S patch/runtime -B patch-build -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_OPUS=OFF -DPLAYGTA6_PERFORMANCE_BENCHMARKS=ON
-          cmake --build patch-build -j4 --target bench_fragmented_buffer_flush test_d3d12_xs_exports
+          cmake --build patch-build -j4 --target bench_fragmented_buffer_flush test_d3d12_xs_exports test_fragmented_buffer_flush
           baseline-build/test_d3d12_xs_exports
           patch-build/test_d3d12_xs_exports
+          ctest --test-dir patch-build -R fragmented_buffer --output-on-failure
       - name: Alternating pairs without builds
         run: |
           python3 runner/tools/perf_run_fragmented_flush.py --baseline baseline-build/bench_fragmented_buffer_flush --candidate patch-build/bench_fragmented_buffer_flush --output results/fragmented-flush.json
