@@ -98,6 +98,8 @@ Runtime pieces are merged (residency of BVH/address sources, fault readback, WGS
 
 ## Diagnostic tools
 
+A run stopped or crashed? Start with [WHEN_IT_CRASHES.md](WHEN_IT_CRASHES.md).
+
 | Tool | Use it for |
 |---|---|
 | `tools/fault_report.py <boot-report.json>` | Compact fault record: rip, lifted function, call stack, last dispatched entries |
