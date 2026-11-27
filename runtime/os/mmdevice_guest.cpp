@@ -208,12 +208,28 @@ bool is_mix_format(uint64_t va) {
 
 struct StreamClock {
     std::atomic<bool> started{false};
+    std::mutex event_mutex;
     std::atomic<uint64_t> event{0};
     std::atomic<uint64_t> frames_played{0};
     std::atomic<uint64_t> periods{0};
     // Bounded pending period credits so catch-up ticks never collapse on an auto-reset event.
     std::atomic<uint32_t> pending_passes{0};
 };
+
+void signal_clock_event(StreamClock& c) {
+    std::lock_guard<std::mutex> lock(c.event_mutex);
+    if (c.started.load(std::memory_order_acquire)) {
+        if (const uint64_t ev = c.event.load(std::memory_order_acquire); ev != 0) {
+            win32::SetEvent(static_cast<win32::Handle>(ev));
+        }
+    }
+}
+
+void clear_clock_event(StreamClock& c) {
+    std::lock_guard<std::mutex> lock(c.event_mutex);
+    c.started.store(false, std::memory_order_release);
+    c.event.store(0, std::memory_order_release);
+}
 
 void add_pending_passes(StreamClock& c, uint32_t count) {
     uint32_t cur = c.pending_passes.load(std::memory_order_relaxed);
@@ -315,9 +331,7 @@ public:
             c->frames_played.fetch_add(advance_frames, std::memory_order_relaxed);
             c->periods.fetch_add(periods, std::memory_order_relaxed);
             add_pending_passes(*c, periods);
-            if (const uint64_t ev = c->event.load(std::memory_order_acquire); ev != 0) {
-                win32::SetEvent(static_cast<win32::Handle>(ev));
-            }
+            signal_clock_event(*c);
         }
         tick_live_.clear();
     }
@@ -832,6 +846,7 @@ public:
     }
 
     ~AudioClientObj() override {
+        clear_clock_event(*clock_);
         if (buffer_ != 0) {
             com::guest_free(buffer_);
         }
@@ -895,18 +910,36 @@ private:
 
 class SpatialStreamObj;
 
+// Shared lifetime guard between SpatialStreamObj and its SpatialObjectObj instances so
+// SpatialObjectObj::GetBuffer() can never dereference a destroyed stream.
+// Lock order: guard->mutex -> SpatialStreamObj::mutex_.
+struct SpatialStreamGuard {
+    std::mutex mutex;
+    SpatialStreamObj* stream = nullptr;
+};
+
 class SpatialObjectObj : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "MMDevAPI.ISpatialAudioObject";
-    SpatialObjectObj(SpatialStreamObj* stream, uint32_t type) : stream_(stream), type_(type) {}
+    SpatialObjectObj(std::shared_ptr<SpatialStreamGuard> guard, uint32_t type)
+        : guard_(std::move(guard)), type_(type) {}
 
     HResult GetBuffer(OutPtr buffer, GuestPtr<uint32_t> length);  // 3
-    HResult SetEndOfStream(uint32_t /*frames*/) {                 // 4
-        active_ = false;
+    // 4: keep the object active for the remainder of the current pass (mixing `frames` samples
+    // zero-padded to kPeriodFrames) unless `frames == 0` (immediate end with no final samples).
+    HResult SetEndOfStream(uint32_t frames) {
+        if (frames == 0u) {
+            eos_frames_.store(0u, std::memory_order_release);
+            eos_pending_.store(false, std::memory_order_release);
+            active_.store(false, std::memory_order_release);
+        } else {
+            eos_frames_.store(std::min(frames, kPeriodFrames), std::memory_order_release);
+            eos_pending_.store(true, std::memory_order_release);
+        }
         return kOk;
     }
     HResult IsActive(GuestPtr<uint32_t> active) {  // 5 (BOOL)
-        return active.write(active_ ? 1u : 0u) ? kOk : com::E_POINTER_HR;
+        return active.write(active_.load(std::memory_order_acquire) ? 1u : 0u) ? kOk : com::E_POINTER_HR;
     }
     HResult GetAudioObjectType(GuestPtr<uint32_t> type) {  // 6
         return type.write(type_) ? kOk : com::E_POINTER_HR;
@@ -917,35 +950,61 @@ public:
         if (!(volume >= 0.0f && volume <= 1.0f)) {
             return com::E_INVALIDARG_HR;
         }
-        volume_ = volume;
+        volume_.store(volume, std::memory_order_release);
         return kOk;
     }
 
     uint32_t type() const { return type_; }
-    bool active() const { return active_; }
-    float volume() const { return volume_; }
-    void detach() { stream_ = nullptr; }
+    bool active() const { return active_.load(std::memory_order_acquire); }
+    float volume() const { return volume_.load(std::memory_order_acquire); }
+    // Consumes any pending SetEndOfStream for the pass that is ending; returns the valid frame count.
+    uint32_t consume_pass_frames() {
+        if (eos_pending_.exchange(false, std::memory_order_acq_rel)) {
+            const uint32_t n = eos_frames_.load(std::memory_order_acquire);
+            active_.store(false, std::memory_order_release);
+            return std::min(n, kPeriodFrames);
+        }
+        return kPeriodFrames;
+    }
+    void detach() {
+        std::lock_guard<std::mutex> lock(detached_mutex_);
+        detached_ = true;
+    }
 
 private:
-    SpatialStreamObj* stream_;  // the stream owns its objects (cleared before it goes away)
+    std::shared_ptr<SpatialStreamGuard> guard_;
+    std::mutex detached_mutex_;
+    bool detached_ = false;
     uint32_t type_;
     std::atomic<bool> active_{true};
+    std::atomic<bool> eos_pending_{false};
+    std::atomic<uint32_t> eos_frames_{kPeriodFrames};
     std::atomic<float> volume_{1.0f};
 };
 
 class SpatialStreamObj : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "MMDevAPI.ISpatialAudioObjectRenderStream";
-    SpatialStreamObj(uint32_t static_mask, uint64_t event) : clock_(std::make_shared<StreamClock>()), mask_(static_mask) {
-        clock_->event = event;
+    SpatialStreamObj(uint32_t static_mask, uint64_t event)
+        : guard_(std::make_shared<SpatialStreamGuard>()), clock_(std::make_shared<StreamClock>()), mask_(static_mask) {
+        guard_->stream = this;
+        clock_->event.store(event, std::memory_order_release);
         engine().add(clock_);
     }
     ~SpatialStreamObj() override {
+        clear_clock_event(*clock_);
+        {
+            std::lock_guard<std::mutex> glock(guard_->mutex);
+            guard_->stream = nullptr;
+        }
         for (auto& o : objects_) {
             o.object->detach();
             if (o.buffer != 0) {
                 com::guest_free(o.buffer);
             }
+        }
+        for (uint64_t buf : deferred_frees_) {
+            com::guest_free(buf);
         }
     }
 
@@ -960,18 +1019,43 @@ public:
         return kENoInterface;
     }
     HResult Start() {  // 5
-        clock_->started = true;
+        clock_->started.store(true, std::memory_order_release);
         return kOk;
     }
     HResult Stop() {  // 6
-        clock_->started = false;
+        clock_->started.store(false, std::memory_order_release);
         clock_->pending_passes.store(0, std::memory_order_release);
         return kOk;
     }
     HResult Reset() {  // 7
-        std::lock_guard<std::mutex> lock(mutex_);
-        clock_->frames_played = 0;
-        clock_->pending_passes.store(0, std::memory_order_release);
+        if (clock_->started.load(std::memory_order_acquire)) {
+            return kNotStopped;
+        }
+        std::vector<com::Ref<SpatialObjectObj>> to_detach;
+        std::vector<uint64_t> to_free;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            clock_->frames_played.store(0, std::memory_order_release);
+            clock_->pending_passes.store(0, std::memory_order_release);
+            updating_ = false;
+            for (auto& o : objects_) {
+                to_detach.push_back(std::move(o.object));
+                if (o.buffer != 0) {
+                    if (active_reads_ > 0) {
+                        deferred_frees_.push_back(o.buffer);
+                    } else {
+                        to_free.push_back(o.buffer);
+                    }
+                }
+            }
+            objects_.clear();
+        }
+        for (auto& obj : to_detach) {
+            obj->detach();
+        }
+        for (uint64_t buf : to_free) {
+            com::guest_free(buf);
+        }
         return kOk;
     }
     HResult BeginUpdatingAudioObjects(GuestPtr<uint32_t> available_dynamic, GuestPtr<uint32_t> frames) {  // 8
@@ -989,6 +1073,7 @@ public:
             uint32_t type;
             uint64_t buffer;
             float volume;
+            uint32_t valid_frames;
         };
         constexpr size_t kMaxInlineObjects = 20;  // kAnyStaticObject has 17 static bits
         std::array<Written, kMaxInlineObjects> written_inline{};
@@ -1002,20 +1087,41 @@ public:
             updating_ = false;
             for (auto& o : objects_) {
                 if (o.handed_out && o.object->active()) {
-                    const Written entry{o.object->type(), o.buffer, o.object->volume()};
-                    if (written_count < kMaxInlineObjects) {
-                        written_inline[written_count] = entry;
-                    } else {
-                        if (written_overflow.empty()) {
-                            written_overflow.assign(written_inline.begin(), written_inline.end());
+                    const uint32_t valid_frames = o.object->consume_pass_frames();
+                    if (valid_frames > 0u) {
+                        const Written entry{o.object->type(), o.buffer, o.object->volume(), valid_frames};
+                        if (written_count < kMaxInlineObjects) {
+                            written_inline[written_count] = entry;
+                        } else {
+                            if (written_overflow.empty()) {
+                                written_overflow.assign(written_inline.begin(), written_inline.end());
+                            }
+                            written_overflow.push_back(entry);
                         }
-                        written_overflow.push_back(entry);
+                        ++written_count;
                     }
-                    ++written_count;
+                } else if (o.object->active()) {
+                    (void)o.object->consume_pass_frames();
                 }
                 o.handed_out = false;
             }
+            ++active_reads_;  // prevent guest_free() of any snapshotted buffer while we read it
         }
+        struct ReadGuard {
+            SpatialStreamObj* self;
+            ~ReadGuard() {
+                std::vector<uint64_t> to_free;
+                {
+                    std::lock_guard<std::mutex> lock(self->mutex_);
+                    if (--self->active_reads_ == 0 && !self->deferred_frees_.empty()) {
+                        to_free.swap(self->deferred_frees_);
+                    }
+                }
+                for (uint64_t buf : to_free) {
+                    com::guest_free(buf);
+                }
+            }
+        } read_guard{this};
         const Written* written_data = written_overflow.empty() ? written_inline.data() : written_overflow.data();
         g_spatial_passes.fetch_add(1);
 
@@ -1043,11 +1149,14 @@ public:
                 mono_scratch_.resize(needed_samples);
             }
             for (size_t i = 0; i < written_count; ++i) {
-                const auto& [type, buffer, volume] = written_data[i];
+                const auto& [type, buffer, volume, valid_frames] = written_data[i];
                 float* mono = mono_scratch_.data() + static_cast<size_t>(valid_count) * kPeriodFrames;
-                if (buffer != 0 && com::read_guest(buffer, mono, kPeriodFrames * sizeof(float))) {
+                if (buffer != 0 && com::read_guest(buffer, mono, valid_frames * sizeof(float))) {
+                    if (valid_frames < kPeriodFrames) {
+                        std::memset(mono + valid_frames, 0, (kPeriodFrames - valid_frames) * sizeof(float));
+                    }
                     if (volume != 1.0f) {
-                        for (uint32_t j = 0; j < kPeriodFrames; ++j) {
+                        for (uint32_t j = 0; j < valid_frames; ++j) {
                             mono[j] *= volume;
                         }
                     }
@@ -1076,10 +1185,8 @@ public:
         // Consume one pending period credit; if catch-up periods are still owed on this started
         // stream, immediately re-signal the auto-reset event so the guest renders them back-to-back
         // instead of losing catch-up periods to auto-reset event coalescing.
-        if (consume_pending_pass(*clock_) && clock_->started.load(std::memory_order_acquire)) {
-            if (const uint64_t ev = clock_->event.load(std::memory_order_acquire); ev != 0) {
-                win32::SetEvent(static_cast<win32::Handle>(ev));
-            }
+        if (consume_pending_pass(*clock_)) {
+            signal_clock_event(*clock_);
         }
         if (trace_on) {
             trace_window(valid_count, pass_peak);
@@ -1124,20 +1231,30 @@ private:
         uint64_t buffer = 0;
         bool handed_out = false;
     };
+    std::shared_ptr<SpatialStreamGuard> guard_;
     std::mutex mutex_;
     std::mutex scratch_mutex_;
     std::vector<float> mono_scratch_;
     std::shared_ptr<StreamClock> clock_;
     uint32_t mask_;
     bool updating_ = false;
+    uint32_t active_reads_ = 0;
+    std::vector<uint64_t> deferred_frees_;
     std::vector<Object> objects_;
 };
 
 HResult SpatialObjectObj::GetBuffer(OutPtr buffer, GuestPtr<uint32_t> length) {
-    if (stream_ == nullptr) {
+    {
+        std::lock_guard<std::mutex> lock(detached_mutex_);
+        if (detached_) {
+            return kOutOfOrder;
+        }
+    }
+    std::lock_guard<std::mutex> glock(guard_->mutex);
+    if (guard_->stream == nullptr) {
         return kOutOfOrder;
     }
-    return stream_->object_buffer(this, buffer, length);
+    return guard_->stream->object_buffer(this, buffer, length);
 }
 
 using PSM = com::Methods<PropertyStoreObj>;
@@ -1258,30 +1375,45 @@ HResult SpatialStreamObj::ActivateSpatialAudioObject(uint32_t type, OutPtr out) 
     if (type == 0 || (type & (type - 1)) != 0 || (type & mask_) == 0) {
         return com::E_INVALIDARG_HR;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& o : objects_) {
-        if (o.object->type() == type && o.object->active()) {
-            return com::E_INVALIDARG_HR;  // already active
+    std::vector<com::Ref<SpatialObjectObj>> to_detach;
+    std::vector<uint64_t> to_free;
+    com::Ref<SpatialObjectObj> obj;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& o : objects_) {
+            if (o.object->type() == type && o.object->active()) {
+                return com::E_INVALIDARG_HR;  // already active
+            }
         }
+        // Objects that reached their end of stream are done: forget them and defer/free their buffers.
+        objects_.erase(std::remove_if(objects_.begin(), objects_.end(),
+                                      [&](Object& o) {
+                                          if (o.object->active()) {
+                                              return false;
+                                          }
+                                          to_detach.push_back(std::move(o.object));
+                                          if (o.buffer != 0) {
+                                              if (active_reads_ > 0) {
+                                                  deferred_frees_.push_back(o.buffer);
+                                              } else {
+                                                  to_free.push_back(o.buffer);
+                                              }
+                                          }
+                                          return true;
+                                      }),
+                       objects_.end());
+        obj = com::create_object<SpatialObjectObj>(com::implements(kISpatialAudioObject), guard_, type);
+        if (!obj) {
+            return com::E_OUTOFMEMORY_HR;
+        }
+        objects_.push_back({obj, 0, false});
     }
-    // Objects that reached their end of stream are done: forget them and their buffers.
-    objects_.erase(std::remove_if(objects_.begin(), objects_.end(),
-                                  [](Object& o) {
-                                      if (o.object->active()) {
-                                          return false;
-                                      }
-                                      o.object->detach();
-                                      if (o.buffer != 0) {
-                                          com::guest_free(o.buffer);
-                                      }
-                                      return true;
-                                  }),
-                   objects_.end());
-    com::Ref<SpatialObjectObj> obj = com::create_object<SpatialObjectObj>(com::implements(kISpatialAudioObject), this, type);
-    if (!obj) {
-        return com::E_OUTOFMEMORY_HR;
+    for (auto& d : to_detach) {
+        d->detach();
     }
-    objects_.push_back({obj, 0, false});
+    for (uint64_t buf : to_free) {
+        com::guest_free(buf);
+    }
     out.write(obj.detach(kISpatialAudioObject));
     return kOk;
 }
@@ -1374,8 +1506,9 @@ public:
         if (!is_float_mono_48k(p.object_format)) {
             return kUnsupportedFormat;
         }
-        if ((p.static_object_type_mask & ~kAnyStaticObject) != 0 || p.max_dynamic_object_count != 0 ||
-            p.min_dynamic_object_count != 0) {
+        // Optional dynamic objects (min == 0, max >= 0) are accepted with 0 available dynamic objects
+        // per the Windows Spatial Audio fallback contract; requiring > 0 dynamic objects is rejected.
+        if ((p.static_object_type_mask & ~kAnyStaticObject) != 0 || p.min_dynamic_object_count != 0) {
             return com::E_INVALIDARG_HR;
         }
         if (p.event_handle == 0) {

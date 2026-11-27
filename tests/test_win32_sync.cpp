@@ -1905,6 +1905,94 @@ void test_cv_fast_path_and_stress() {
     }
 }
 
+void test_cs_owning_thread_lock_count_and_recursive_cv() {
+    CriticalSection cs{};
+    InitializeCriticalSection(&cs);
+    CHECK(cs.lock_count == -1);
+    CHECK(cs.recursion_count == 0);
+    CHECK(cs.owning_thread == 0);
+
+    const uint32_t self_tid = GetCurrentThreadId();
+    EnterCriticalSection(&cs);
+    CHECK(cs.owning_thread == self_tid);
+    CHECK(cs.recursion_count == 1);
+    CHECK(cs.lock_count == 0);
+
+    CHECK(TryEnterCriticalSection(&cs));
+    CHECK(cs.owning_thread == self_tid);
+    CHECK(cs.recursion_count == 2);
+    CHECK(cs.lock_count == 1);
+
+    // Recursive SleepConditionVariableCS must release ALL recursion levels while sleeping so a
+    // producer thread can enter the CS and wake the waiter without deadlocking.
+    ConditionVariable cv{};
+    InitializeConditionVariable(&cv);
+    bool ready = false;
+    std::thread producer([&]() {
+        EnterCriticalSection(&cs);
+        CHECK(cs.owning_thread == GetCurrentThreadId());
+        CHECK(cs.recursion_count == 1);
+        CHECK(cs.lock_count == 0);
+        ready = true;
+        LeaveCriticalSection(&cs);
+        WakeConditionVariable(&cv);
+    });
+
+    while (!ready) {
+        CHECK(SleepConditionVariableCS(&cv, &cs, 5000));
+    }
+    CHECK(cs.owning_thread == self_tid);
+    CHECK(cs.recursion_count == 2);
+    CHECK(cs.lock_count == 1);
+    producer.join();
+
+    LeaveCriticalSection(&cs);
+    CHECK(cs.recursion_count == 1);
+    CHECK(cs.lock_count == 0);
+    CHECK(cs.owning_thread == self_tid);
+
+    LeaveCriticalSection(&cs);
+    CHECK(cs.recursion_count == 0);
+    CHECK(cs.lock_count == -1);
+    CHECK(cs.owning_thread == 0);
+    DeleteCriticalSection(&cs);
+}
+
+void test_open_thread_by_id_and_affinity_query() {
+    Handle gate = CreateEventW(nullptr, true, false, nullptr);
+    CHECK(gate != kNullHandle);
+    struct WorkerCtx {
+        Handle gate;
+    } ctx{gate};
+    uint32_t worker_tid = 0;
+    Handle created = CreateThread(
+        nullptr, 0,
+        [](void* p) -> uint32_t {
+            auto* c = static_cast<WorkerCtx*>(p);
+            WaitForSingleObject(c->gate, 5000);
+            return 77u;
+        },
+        &ctx, 0, &worker_tid);
+    CHECK(created != kNullHandle && worker_tid != 0);
+
+    Handle opened = OpenThreadById(worker_tid);
+    CHECK(opened != kNullHandle && opened != created && opened != kCurrentThreadPseudoHandle);
+
+    const uint64_t prev_mask = SetThreadAffinityMask(opened, 0x1ULL);
+    CHECK(prev_mask != 0);
+    uint64_t queried_mask = 0;
+    CHECK(GetThreadAffinityMask(opened, &queried_mask));
+    CHECK(queried_mask == 0x1ULL);
+
+    CHECK(SetEvent(gate));
+    CHECK(WaitForSingleObject(opened, 5000) == WAIT_OBJECT_0);
+    uint32_t exit_code = 0;
+    CHECK(GetExitCodeThread(opened, &exit_code) && exit_code == 77u);
+    CHECK(CloseHandle(opened));
+    CHECK(CloseHandle(created));
+    CHECK(CloseHandle(gate));
+}
+
 int main() {
 #if defined(_WIN32)
     _putenv_s("PG6_EVENT_TRACE", "1");
@@ -1915,6 +2003,8 @@ int main() {
 #endif
     test_event_trace_selection();
     test_critical_section_guest_storage();
+    test_cs_owning_thread_lock_count_and_recursive_cv();
+    test_open_thread_by_id_and_affinity_query();
     test_sync_microbench();
     test_sync_contention_microbench();
     test_wait_all_any_stress();

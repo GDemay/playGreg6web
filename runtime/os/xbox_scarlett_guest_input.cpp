@@ -305,6 +305,33 @@ public:
     uint64_t GetDeviceInfo() { return payload_address(); }
     // slot 4
     uint32_t GetDeviceStatus() { return kDeviceStatus; }
+    // slot 5: void GetBatteryState(GameInputBatteryState* state)
+    void GetBatteryState(uint64_t state_va) {
+        if (state_va == 0) {
+            return;
+        }
+        struct GameInputBatteryState {
+            float charge_rate = 0.0f;
+            float max_charge_rate = 0.0f;
+            float remaining_capacity = 1.0f;
+            float full_charge_capacity = 1.0f;
+            uint32_t status = 0u;  // GameInputBatteryNotPresent (wired controller)
+        };
+        static_assert(sizeof(GameInputBatteryState) == 20);
+        GameInputBatteryState st{};
+        com::write_guest(state_va, st);
+    }
+    // slot 6: HRESULT CreateForceFeedbackEffect(uint32_t motorIndex, const params*, IGameInputForceFeedbackEffect**)
+    HResult CreateForceFeedbackEffect(uint32_t /*motor_index*/, uint64_t /*params*/, OutPtr out) {
+        if (out.is_null() || !out.write(0)) {
+            return com::E_POINTER_HR;
+        }
+        return com::E_NOTIMPL_HR;
+    }
+    // slot 7: bool IsForceFeedbackMotorPoweredOn(uint32_t motorIndex)
+    bool IsForceFeedbackMotorPoweredOn(uint32_t /*motor_index*/) { return false; }
+    // slot 8: void SetForceFeedbackMotorGain(uint32_t motorIndex, float masterGain)
+    void SetForceFeedbackMotorGain(uint32_t /*motor_index*/, float /*gain*/) {}
     // slot 9: GDK v0 HRESULT SetHapticMotorState(uint32_t motorIndex, const GameInputHapticFeedbackParams* params)
     HResult SetHapticMotorState(uint32_t /*motor_index*/, uint64_t /*params*/) {
         std::lock_guard<std::mutex> lock(rumble_mutex());
@@ -562,6 +589,17 @@ public:
         return kOk;
     }
 
+    // 10: RegisterGuideButtonCallback(device, context, callbackFunc, callbackToken*)
+    HResult RegisterGuideButtonCallback(const com::InterfaceArg<GameInputDeviceObj>& device, uint64_t /*context*/,
+                                        uint64_t callback, GuestPtr<uint64_t> out_token) {
+        return register_silent_callback(device, callback, out_token);
+    }
+    // 11: RegisterKeyboardLayoutCallback(device, context, callbackFunc, callbackToken*)
+    HResult RegisterKeyboardLayoutCallback(const com::InterfaceArg<GameInputDeviceObj>& device, uint64_t /*context*/,
+                                           uint64_t callback, GuestPtr<uint64_t> out_token) {
+        return register_silent_callback(device, callback, out_token);
+    }
+
     // 12
     void StopCallback(uint64_t token) { (void)remove(token); }
     // 13
@@ -747,6 +785,24 @@ private:
     }
 
     HResult emit(const Snapshot& s, OutPtr out);
+
+    HResult register_silent_callback(const com::InterfaceArg<GameInputDeviceObj>& device, uint64_t callback,
+                                     GuestPtr<uint64_t> out_token) {
+        if (device.invalid() || callback == 0) {
+            return com::E_INVALIDARG_HR;
+        }
+        uint64_t token = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            token = next_token_++;
+            callbacks_.push_back(token);
+        }
+        if (!out_token.is_null() && !out_token.write(token)) {
+            (void)remove(token);
+            return com::E_POINTER_HR;
+        }
+        return kOk;
+    }
 
     bool remove(uint64_t token) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -1249,10 +1305,10 @@ constexpr com::MethodDesc kGameInputMethods[] = {
     GM::method<&GameInputApi::GetPreviousReading>("GetPreviousReading"),          // 6
     GM::stub("GetTemporalReading"),                                               // 7
     GM::stub("RegisterReadingCallback"),                                          // 8
-    GM::method<&GameInputApi::RegisterDeviceCallback>("RegisterDeviceCallback"),  // 9
-    GM::stub("RegisterGuideButtonCallback"),                                      // 10
-    GM::stub("RegisterKeyboardLayoutCallback"),                                   // 11
-    GM::method<&GameInputApi::StopCallback>("StopCallback"),                      // 12
+    GM::method<&GameInputApi::RegisterDeviceCallback>("RegisterDeviceCallback"),                  // 9
+    GM::method<&GameInputApi::RegisterGuideButtonCallback>("RegisterGuideButtonCallback"),        // 10
+    GM::method<&GameInputApi::RegisterKeyboardLayoutCallback>("RegisterKeyboardLayoutCallback"),  // 11
+    GM::method<&GameInputApi::StopCallback>("StopCallback"),                                      // 12
     GM::method<&GameInputApi::UnregisterCallback>("UnregisterCallback"),          // 13
     GM::stub("CreateDispatcher"),                                                 // 14
     GM::stub("CreateAggregateDevice"),                                            // 15
@@ -1296,13 +1352,13 @@ constexpr auto kIReading = com::declare_interface<GameInputReadingObj>(
 
 using DM = com::Methods<GameInputDeviceObj>;
 constexpr com::MethodDesc kDeviceMethods[] = {
-    DM::method<&GameInputDeviceObj::GetDeviceInfo>("GetDeviceInfo"),            // 3
-    DM::method<&GameInputDeviceObj::GetDeviceStatus>("GetDeviceStatus"),        // 4
-    DM::stub("GetBatteryState"),                                                // 5
-    DM::stub("CreateForceFeedbackEffect"),                                      // 6
-    DM::stub("IsForceFeedbackMotorPoweredOn"),                                  // 7
-    DM::stub("SetForceFeedbackMotorGain"),                                      // 8
-    DM::method<&GameInputDeviceObj::SetHapticMotorState>("SetHapticMotorState"), // 9
+    DM::method<&GameInputDeviceObj::GetDeviceInfo>("GetDeviceInfo"),                                // 3
+    DM::method<&GameInputDeviceObj::GetDeviceStatus>("GetDeviceStatus"),                            // 4
+    DM::method<&GameInputDeviceObj::GetBatteryState>("GetBatteryState"),                            // 5
+    DM::method<&GameInputDeviceObj::CreateForceFeedbackEffect>("CreateForceFeedbackEffect"),        // 6
+    DM::method<&GameInputDeviceObj::IsForceFeedbackMotorPoweredOn>("IsForceFeedbackMotorPoweredOn"), // 7
+    DM::method<&GameInputDeviceObj::SetForceFeedbackMotorGain>("SetForceFeedbackMotorGain"),        // 8
+    DM::method<&GameInputDeviceObj::SetHapticMotorState>("SetHapticMotorState"),                    // 9
     DM::method<&GameInputDeviceObj::SetRumbleState>("SetRumbleState"),          // 10
 };
 constexpr auto kIDevice = com::declare_interface<GameInputDeviceObj>("GameInput.IGameInputDevice", kIidIGameInputDevice,

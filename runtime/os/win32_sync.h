@@ -160,7 +160,9 @@ uint32_t ResumeThread(Handle thread);
 bool GetExitCodeThread(Handle thread, uint32_t* exit_code);
 Handle GetCurrentThread();
 uint32_t GetCurrentThreadId();
+Handle OpenThreadById(uint32_t thread_id);
 uint64_t SetThreadAffinityMask(Handle thread, uint64_t affinity_mask);
+bool GetThreadAffinityMask(Handle thread, uint64_t* out_mask);
 
 // ---------------------------------------------------------------------------
 // Vista thread pool (work objects + simple callbacks). Callback environments are accepted and

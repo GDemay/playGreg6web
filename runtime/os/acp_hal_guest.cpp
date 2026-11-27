@@ -86,9 +86,12 @@ struct XmaSlot {
 struct XmaState {
     std::mutex mutex;
     std::condition_variable wake;
+    std::condition_variable pump_done;
     bool woken = false;
     bool worker_started = false;
     bool worker_allowed = true;  // tests pump by hand
+    uint32_t active_pumps = 0;
+    uint64_t contexts_generation = 0;
     std::vector<bool> enabled;
     std::vector<std::shared_ptr<XmaSlot>> slots;
     uint64_t contexts = 0;  // guest address of the live context array
@@ -96,14 +99,29 @@ struct XmaState {
     uint64_t test_contexts = 0;  // set_xma_contexts_for_tests
     uint32_t test_count = 0;
     xd::ApuMap test_map;  // set_xma_apu_map_for_tests
-    uint32_t dumped = 0;
-    uint32_t trace_lines = 0;
+    std::atomic<uint32_t> dumped{0};
+    std::atomic<uint32_t> trace_lines{0};
     // Filled by the worker (atomics: read by xma_command_stats without the voice locks).
     std::atomic<uint64_t> frames{0}, blocks_written{0}, loops{0}, exhausted{0}, bad_frames{0};
 };
+void quiesce_xma_contexts();
 XmaState& xma() {
-    static XmaState s;
+    static XmaState s = [] {
+        pg6_mw_set_xma_contexts_released_callback(&quiesce_xma_contexts);
+        return XmaState{};
+    }();
     return s;
+}
+
+void quiesce_xma_contexts() {
+    auto& x = xma();
+    std::unique_lock<std::mutex> lock(x.mutex);
+    x.enabled.clear();
+    x.slots.clear();
+    x.contexts = 0;
+    ++x.contexts_generation;
+    x.stats.enabled_now = 0;
+    x.pump_done.wait(lock, [&x] { return x.active_pumps == 0; });
 }
 
 constexpr uint32_t kAcpEnableXma = 5, kAcpEnableXmaMask = 6, kAcpDisableXma = 7, kAcpDisableXmaMask = 8,
@@ -114,14 +132,9 @@ uint32_t* xma_context_words(uint64_t contexts, uint32_t index) {
                                                      xd::kContextBytes));
 }
 
-// APU address range -> host memory, through the APU heap (xbox_middleware.cpp).
+// APU address range -> host memory, through the single-lock APU range mapper (xbox_middleware.cpp).
 uint8_t* map_apu_range(uint32_t apu, size_t bytes) {
-    if (apu == 0 || bytes == 0 || uint64_t{apu} + bytes > 0x100000000ull) {
-        return nullptr;
-    }
-    auto* first = static_cast<uint8_t*>(pg6_mw_apu_map_apu_address(apu));
-    auto* last = static_cast<uint8_t*>(pg6_mw_apu_map_apu_address(static_cast<uint32_t>(apu + bytes - 1)));
-    return first != nullptr && last == first + (bytes - 1) ? first : nullptr;
+    return static_cast<uint8_t*>(pg6_mw_apu_map_apu_range(apu, bytes));
 }
 
 xd::ApuMap apu_map_locked() {
@@ -132,7 +145,7 @@ xd::ApuMap apu_map_locked() {
 }
 
 void xma_trace(const std::string& line) {
-    if (audio_trace_enabled() && xma().trace_lines++ < 400) {
+    if (audio_trace_enabled() && xma().trace_lines.fetch_add(1, std::memory_order_relaxed) < 400) {
         diag("audio-trace: " + line);
     }
 }
@@ -141,10 +154,13 @@ void xma_trace(const std::string& line) {
 // of the first 32 contexts enabled, to test the decoder on the title's streams offline.
 void dump_enabled_context(uint32_t index, xd::Context ctx, const xd::ApuMap& map) {
     static const char* dir = std::getenv("PG6_XMA_DUMP");
-    if (dir == nullptr || dir[0] == '\0' || xma().dumped >= 32) {
+    if (dir == nullptr || dir[0] == '\0') {
         return;
     }
-    const uint32_t n = xma().dumped++;
+    const uint32_t n = xma().dumped.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 32) {
+        return;
+    }
     char path[1024];
     std::snprintf(path, sizeof(path), "%s/%02u-%u.ctx", dir, n, index);
     if (FILE* f = std::fopen(path, "wb")) {
@@ -187,13 +203,29 @@ void pump_enabled_voices() {
         auto& x = xma();
         std::lock_guard<std::mutex> lock(x.mutex);
         contexts = x.contexts;
+        if (contexts == 0 || x.slots.empty()) {
+            return;
+        }
         map = apu_map_locked();
         for (uint32_t i = 0; i < x.slots.size(); ++i) {
             if (x.enabled[i]) {
                 active.emplace_back(i, x.slots[i]);
             }
         }
+        if (active.empty()) {
+            return;
+        }
+        ++x.active_pumps;
     }
+    struct PumpGuard {
+        ~PumpGuard() {
+            auto& x = xma();
+            std::lock_guard<std::mutex> lock(x.mutex);
+            if (--x.active_pumps == 0) {
+                x.pump_done.notify_all();
+            }
+        }
+    } pump_guard;
     for (auto& [index, slot] : active) {
         std::lock_guard<std::mutex> lock(slot->mutex);
         uint32_t* words = xma_context_words(contexts, index);
@@ -238,45 +270,43 @@ void wake_worker_locked() {
     x.wake.notify_one();
 }
 
-// The caller holds xma().mutex.
-void set_voice_enabled_locked(uint32_t index, bool on) {
-    auto& x = xma();
-    if (x.enabled[index] != on) {
-        x.enabled[index] = on;
+// Applies enable/disable to one slot WITHOUT holding xma().mutex (only slot->mutex).
+void apply_voice_enabled_unlocked(uint32_t index, const std::shared_ptr<XmaSlot>& slot, uint64_t contexts,
+                                  const xd::ApuMap& map, bool on) {
+    uint32_t* words = xma_context_words(contexts, index);
+    bool should_dump = false;
+    {
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        auto& voice = slot->voice;
         if (on) {
-            ++x.stats.enabled_now;
-        } else {
-            --x.stats.enabled_now;
+            voice.emplace();
+            if (words != nullptr) {
+                xd::Context ctx(words);
+                // nullptr defaults to the built-in WMA Pro / XMA2 subframe decoder (os/xma_decoder.cpp).
+                xd::enable(ctx, *voice, nullptr);
+                if (audio_trace_enabled() && xma().trace_lines.load(std::memory_order_relaxed) < 400) {
+                    char line[300];
+                    std::snprintf(line, sizeof(line),
+                                  "XMA context %u enabled: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", index,
+                                  ctx.word(0), ctx.word(1), ctx.word(2), ctx.word(3), ctx.word(4), ctx.word(5),
+                                  ctx.word(6), ctx.word(7), ctx.word(8), ctx.word(9));
+                    xma_trace(line);
+                }
+                should_dump = true;
+            }
+        } else if (voice) {
+            const xd::VoiceStats& s = voice->stats;
+            char line[300];
+            std::snprintf(line, sizeof(line),
+                          "XMA context %u disabled: %" PRIu64 " frames, %" PRIu64 " blocks, %" PRIu64
+                          " loops, %" PRIu64 " input switches, ran dry %" PRIu64 "x",
+                          index, s.frames, s.blocks_written, s.loops, s.input_switches, s.exhausted);
+            xma_trace(line);
+            voice.reset();
         }
     }
-    uint32_t* words = xma_context_words(x.contexts, index);
-    std::lock_guard<std::mutex> lock(x.slots[index]->mutex);
-    auto& voice = x.slots[index]->voice;
-    if (on) {
-        voice.emplace();
-        if (words != nullptr) {
-            xd::Context ctx(words);
-            xd::enable(ctx, *voice, xd::make_silence_decoder());
-            if (x.trace_lines < 400 && audio_trace_enabled()) {
-                char line[300];
-                std::snprintf(line, sizeof(line),
-                              "XMA context %u enabled: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x", index,
-                              ctx.word(0), ctx.word(1), ctx.word(2), ctx.word(3), ctx.word(4), ctx.word(5),
-                              ctx.word(6), ctx.word(7), ctx.word(8), ctx.word(9));
-                xma_trace(line);
-            }
-            dump_enabled_context(index, ctx, apu_map_locked());
-        }
-        wake_worker_locked();
-    } else if (voice) {
-        const xd::VoiceStats& s = voice->stats;
-        char line[300];
-        std::snprintf(line, sizeof(line),
-                      "XMA context %u disabled: %" PRIu64 " frames, %" PRIu64 " blocks, %" PRIu64
-                      " loops, %" PRIu64 " input switches, ran dry %" PRIu64 "x",
-                      index, s.frames, s.blocks_written, s.loops, s.input_switches, s.exhausted);
-        xma_trace(line);
-        voice.reset();
+    if (should_dump && words != nullptr) {
+        dump_enabled_context(index, xd::Context(words), map);
     }
 }
 
@@ -288,68 +318,122 @@ void handle_xma_command(uint32_t command, uint64_t payload) {
     uint32_t count = 0;
     uint64_t contexts = pg6_mw_xma_contexts(&count);
     auto& x = xma();
-    std::lock_guard<std::mutex> lock(x.mutex);
-    if (x.test_contexts != 0) {
-        contexts = x.test_contexts;
-        count = x.test_count;
-    }
-    if (x.enabled.size() != count || x.contexts != contexts) {
-        x.enabled.assign(count, false);
-        x.slots.clear();
-        for (uint32_t i = 0; i < count; ++i) {
-            x.slots.push_back(std::make_shared<XmaSlot>());
+
+    struct VoiceOp {
+        uint32_t index = 0;
+        std::shared_ptr<XmaSlot> slot;
+        bool on = false;
+    };
+    std::vector<VoiceOp> ops;
+    std::shared_ptr<XmaSlot> advance_slot;
+    uint32_t advance_index = 0;
+    uint32_t advance_blocks = 0;
+    bool wake_worker = false;
+    xd::ApuMap map;
+
+    {
+        std::lock_guard<std::mutex> lock(x.mutex);
+        if (x.test_contexts != 0) {
+            contexts = x.test_contexts;
+            count = x.test_count;
         }
-        x.contexts = contexts;
-        x.stats.enabled_now = 0;
-    }
-    uint32_t word[2] = {};
-    if (payload == 0 || count == 0 || !com::read_guest(payload, word, sizeof(uint32_t))) {
-        ++x.stats.rejected;
-        return;
-    }
-    switch (command) {
-        case kAcpEnableXma:
-        case kAcpDisableXma:
-            if (word[0] >= count) {
-                ++x.stats.rejected;
-                return;
-            }
-            set_voice_enabled_locked(word[0], command == kAcpEnableXma);
-            ++(command == kAcpEnableXma ? x.stats.enables : x.stats.disables);
-            return;
-        case kAcpEnableXmaMask:
-        case kAcpDisableXmaMask: {
-            std::vector<uint32_t> mask((count + 31) / 32);
-            if (!com::read_guest(payload, mask.data(), mask.size() * sizeof(uint32_t))) {
-                ++x.stats.rejected;
-                return;
-            }
+        if (x.enabled.size() != count || x.contexts != contexts) {
+            x.enabled.assign(count, false);
+            x.slots.clear();
             for (uint32_t i = 0; i < count; ++i) {
-                if (((mask[i / 32] >> (i % 32)) & 1u) != 0) {
-                    set_voice_enabled_locked(i, command == kAcpEnableXmaMask);
+                x.slots.push_back(std::make_shared<XmaSlot>());
+            }
+            x.contexts = contexts;
+            ++x.contexts_generation;
+            x.stats.enabled_now = 0;
+        }
+        uint32_t word[2] = {};
+        if (payload == 0 || count == 0 || !com::read_guest(payload, word, sizeof(uint32_t))) {
+            ++x.stats.rejected;
+            return;
+        }
+        map = apu_map_locked();
+        auto queue_toggle_locked = [&](uint32_t idx, bool on) {
+            if (x.enabled[idx] != on) {
+                x.enabled[idx] = on;
+                if (on) {
+                    ++x.stats.enabled_now;
+                } else {
+                    --x.stats.enabled_now;
                 }
             }
-            ++(command == kAcpEnableXmaMask ? x.stats.mask_enables : x.stats.mask_disables);
-            return;
+            if (on) {
+                wake_worker = true;
+            }
+            ops.push_back({idx, x.slots[idx], on});
+        };
+        switch (command) {
+            case kAcpEnableXma:
+            case kAcpDisableXma:
+                if (word[0] >= count) {
+                    ++x.stats.rejected;
+                    return;
+                }
+                queue_toggle_locked(word[0], command == kAcpEnableXma);
+                ++(command == kAcpEnableXma ? x.stats.enables : x.stats.disables);
+                break;
+            case kAcpEnableXmaMask:
+            case kAcpDisableXmaMask: {
+                const size_t mask_words = static_cast<size_t>((uint64_t{count} + 31u) / 32u);
+                std::vector<uint32_t> mask(mask_words);
+                if (!com::read_guest(payload, mask.data(), mask.size() * sizeof(uint32_t))) {
+                    ++x.stats.rejected;
+                    return;
+                }
+                const bool on = command == kAcpEnableXmaMask;
+                for (uint32_t i = 0; i < count; ++i) {
+                    if (((mask[i / 32] >> (i % 32)) & 1u) != 0) {
+                        queue_toggle_locked(i, on);
+                    }
+                }
+                ++(on ? x.stats.mask_enables : x.stats.mask_disables);
+                break;
+            }
+            default: {  // 18: the title consumed output blocks; advance the read offset
+                if (!com::read_guest(payload, word, sizeof(word)) || word[0] >= count ||
+                    xma_context_words(contexts, word[0]) == nullptr) {
+                    ++x.stats.rejected;
+                    return;
+                }
+                advance_index = word[0];
+                advance_blocks = word[1];
+                advance_slot = x.slots[word[0]];
+                ++x.stats.read_advances;
+                wake_worker = x.enabled[word[0]];
+                break;
+            }
         }
-        default: {  // 18: the title consumed output blocks; advance the read offset
-            uint32_t* words = nullptr;
-            if (!com::read_guest(payload, word, sizeof(word)) || word[0] >= count ||
-                (words = xma_context_words(contexts, word[0])) == nullptr) {
-                ++x.stats.rejected;
-                return;
+        ++x.active_pumps;  // pin contexts memory until per-slot updates finish
+    }
+
+    struct CmdGuard {
+        ~CmdGuard() {
+            auto& x = xma();
+            std::lock_guard<std::mutex> lock(x.mutex);
+            if (--x.active_pumps == 0) {
+                x.pump_done.notify_all();
             }
-            {
-                // The decoder writes the same words.
-                std::lock_guard<std::mutex> voice_lock(x.slots[word[0]]->mutex);
-                xd::advance_read(xd::Context(words), word[1]);
-            }
-            ++x.stats.read_advances;
-            if (x.enabled[word[0]]) {
-                wake_worker_locked();
-            }
-            return;
         }
+    } cmd_guard;
+
+    for (const VoiceOp& op : ops) {
+        apply_voice_enabled_unlocked(op.index, op.slot, contexts, map, op.on);
+    }
+    if (advance_slot) {
+        uint32_t* words = xma_context_words(contexts, advance_index);
+        if (words != nullptr) {
+            std::lock_guard<std::mutex> voice_lock(advance_slot->mutex);
+            xd::advance_read(xd::Context(words), advance_blocks);
+        }
+    }
+    if (wake_worker) {
+        std::lock_guard<std::mutex> lock(x.mutex);
+        wake_worker_locked();
     }
 }
 
@@ -379,20 +463,24 @@ public:
 
     // 2
     HResult SubmitCommand(uint32_t command, uint32_t tag, uint32_t arg, uint64_t payload, uint32_t flags) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!connected_) {
-            diag("AcpHal: command " + std::to_string(command) + " submitted while not connected");
-            return kEUnexpected;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!connected_) {
+                diag("AcpHal: command " + std::to_string(command) + " submitted while not connected");
+                return kEUnexpected;
+            }
+            first = (++commands_[command] == 1);
         }
         handle_xma_command(command, payload);
         if (command == kAcpEnableXma || command == kAcpEnableXmaMask) {
             audio_stream_log::log().record("xma_enable", command, payload, arg);
         }
-        if (++commands_[command] == 1) {
+        if (first) {
             char line[200];
             std::snprintf(line, sizeof(line),
                           "AcpHal: first command %u (tag 0x%08x, arg 0x%08x, payload 0x%" PRIx64
-                          ", flags %u): accepted and discarded (no audio hardware)",
+                          ", flags %u): accepted",
                           command, tag, arg, payload, flags);
             diag(line);
         }
@@ -628,15 +716,25 @@ void push_bounded(std::deque<XApuResult>& queue, const XApuResult& result) {
 constexpr size_t kXApuMaxOutputFloats = kXApuMaxOutputBytes / sizeof(float);
 static_assert(kXApuMaxOutputBytes % sizeof(float) == 0);
 
+struct XApuVoiceSlot {
+    std::mutex mutex;
+    xapu_opus::VoiceDecoder decoder;
+    std::array<float, kXApuMaxOutputFloats> pcm{};
+};
+
+struct XApuConn {
+    std::mutex event_mutex;
+    uint64_t event = 0;  // auto-reset result event (0 if none or disconnected)
+};
+
 struct XApuState {
     std::mutex mutex;
     std::map<uint64_t, std::deque<XApuResult>> queues;  // handle -> pending results
     std::map<uint32_t, uint64_t> commands;              // command type -> count
     std::map<uint64_t, uint64_t> memory;                // handle -> shared memory
-    std::map<uint64_t, uint64_t> events;                // handle -> auto-reset result event (when asked for)
+    std::map<uint64_t, std::shared_ptr<XApuConn>> conns;
     std::map<uint64_t, size_t> limits;                  // handle -> max outstanding results (0 = unlimited)
-    std::map<std::pair<uint64_t, uint32_t>, std::unique_ptr<xapu_opus::VoiceDecoder>> decoders;  // (handle, voice)
-    std::array<float, kXApuMaxOutputFloats> decode_pcm{};  // reusable decode scratch (guarded by mutex)
+    std::map<std::pair<uint64_t, uint32_t>, std::shared_ptr<XApuVoiceSlot>> voice_slots;  // (handle, voice)
     uint64_t decoded_packets = 0;
     uint64_t failed_packets = 0;
     uint64_t decoded_bytes = 0;
@@ -722,20 +820,27 @@ HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
         }
         return com::E_OUTOFMEMORY_HR;
     }
+    auto conn = std::make_shared<XApuConn>();
     uint64_t event = 0;
+    if (cp.result_event) {
+        event = static_cast<uint64_t>(win32::CreateEventA(nullptr, false, false, nullptr));
+        conn->event = event;
+    }
+    if (!shared.write(memory) ||
+        (cp.result_event && !com::write_guest(shared.va() + 8, &event, sizeof(event)))) {
+        if (event != 0) {
+            win32::CloseHandle(static_cast<win32::Handle>(event));
+        }
+        com::guest_free(handle);
+        com::guest_free(memory);
+        return com::E_POINTER_HR;
+    }
     {
         std::lock_guard<std::mutex> lock(xapu().mutex);
         xapu().queues[handle];
         xapu().memory[handle] = memory;
         xapu().limits[handle] = cp.outstanding_limit;
-        if (cp.result_event) {
-            xapu().events[handle] = static_cast<uint64_t>(win32::CreateEventA(nullptr, false, false, nullptr));
-        }
-        event = cp.result_event ? xapu().events[handle] : 0;
-    }
-    shared.write(memory);
-    if (cp.result_event) {
-        com::write_guest(shared.va() + 8, &event, sizeof(event));
+        xapu().conns[handle] = std::move(conn);
     }
     out.write(handle);
     return kOk;
@@ -743,7 +848,7 @@ HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
 
 HResult xapu_disconnect(uint64_t handle) {
     uint64_t memory = 0;
-    uint64_t event = 0;
+    std::shared_ptr<XApuConn> conn;
     {
         std::lock_guard<std::mutex> lock(xapu().mutex);
         if (xapu().queues.erase(handle) == 0) {
@@ -752,15 +857,22 @@ HResult xapu_disconnect(uint64_t handle) {
         memory = xapu().memory[handle];
         xapu().memory.erase(handle);
         xapu().limits.erase(handle);
-        if (const auto e = xapu().events.find(handle); e != xapu().events.end()) {
-            event = e->second;
-            xapu().events.erase(e);
+        if (const auto c = xapu().conns.find(handle); c != xapu().conns.end()) {
+            conn = std::move(c->second);
+            xapu().conns.erase(c);
         }
-        auto& decoders = xapu().decoders;
-        decoders.erase(decoders.lower_bound({handle, 0u}), decoders.upper_bound({handle, ~0u}));
+        auto& slots = xapu().voice_slots;
+        slots.erase(slots.lower_bound({handle, 0u}), slots.upper_bound({handle, ~0u}));
+        auto& traces = xapu().trace_voices;
+        traces.erase(traces.lower_bound({handle, 0u}), traces.upper_bound({handle, ~0u}));
     }
-    if (event != 0) {
-        win32::CloseHandle(static_cast<win32::Handle>(event));
+    if (conn) {
+        // Close the event under conn->event_mutex so an in-flight SetEvent can never touch a recycled handle.
+        std::lock_guard<std::mutex> elock(conn->event_mutex);
+        if (conn->event != 0) {
+            win32::CloseHandle(static_cast<win32::Handle>(conn->event));
+            conn->event = 0;
+        }
     }
     com::guest_free(handle);
     if (memory != 0) {
@@ -784,63 +896,68 @@ T field(const uint8_t* bytes, size_t offset) {
     return v;
 }
 
-// Command 3 (the caller holds the lock): decodes the packet into the output area and returns the
-// result to queue.
-XApuResult decode_command(uint64_t handle, const uint8_t* cmd) {
-    const uint32_t voice = field<uint32_t>(cmd, 0x04);
+struct DecodeOutcome {
+    XApuResult result{};
+    bool ok = false;
+    uint32_t bytes = 0;
+    uint32_t voice = 0;
+    uint32_t packet_bytes = 0;
+    uint8_t toc = 0;
+    uint32_t sample_rate = 48000u;
+    uint32_t channels = 0;
+    uint32_t frames_per_packet = 0;
+    uint32_t skip = 0;
+    uint32_t capacity = 0;
+    uint64_t packet_va = 0;
+    uint64_t output_va = 0;
+};
+
+// Command 3 (runs WITHOUT holding xapu().mutex — only the per-voice slot mutex): decodes the Opus
+// packet into the guest output area so concurrent voices never serialize on a global decode lock.
+DecodeOutcome decode_command_unlocked(const std::shared_ptr<XApuVoiceSlot>& slot, const uint8_t* cmd) {
+    DecodeOutcome out{};
+    out.voice = field<uint32_t>(cmd, 0x04);
     const float rate = field<float>(cmd, 0x1C);
-    const uint32_t skip = field<uint32_t>(cmd, 0x20);
-    const uint32_t frames_per_packet = field<uint32_t>(cmd, 0x24);
-    const uint32_t packet_bytes = field<uint32_t>(cmd, 0x28);
-    const uint64_t packet_va = field<uint64_t>(cmd, 0x2C);
-    const uint32_t capacity = std::min(field<uint32_t>(cmd, 0x34), kXApuMaxOutputBytes);
-    const uint64_t output_va = field<uint64_t>(cmd, 0x38);
-    const uint32_t channels = capacity / kXApuChannelBytes;
-    auto& s = xapu();
+    out.skip = field<uint32_t>(cmd, 0x20);
+    out.frames_per_packet = field<uint32_t>(cmd, 0x24);
+    out.packet_bytes = field<uint32_t>(cmd, 0x28);
+    out.packet_va = field<uint64_t>(cmd, 0x2C);
+    out.capacity = std::min(field<uint32_t>(cmd, 0x34), kXApuMaxOutputBytes);
+    out.output_va = field<uint64_t>(cmd, 0x38);
+    // Derive channel count from frames_per_packet when valid so 10 ms (480-frame) or 24 kHz packets
+    // do not collapse to 0 or 1 channels; fall back to kXApuChannelBytes (960 frames) otherwise.
+    const uint32_t channel_bytes =
+        (out.frames_per_packet > 0u && out.frames_per_packet <= xapu_opus::kMaxOpusFrames)
+            ? (out.frames_per_packet * static_cast<uint32_t>(sizeof(float)))
+            : kXApuChannelBytes;
+    const uint32_t raw_channels = channel_bytes != 0u ? (out.capacity / channel_bytes) : 0u;
+    out.channels = std::min<uint32_t>(raw_channels, 2u);
+    out.sample_rate = rate >= 1.0f && rate < 1.0e6f ? static_cast<uint32_t>(rate) : 48000u;
 
     uint8_t packet[kXApuMaxPacketBytes];
-    const bool readable = packet_bytes != 0 && packet_bytes <= sizeof(packet) && packet_va != 0 &&
-                          com::read_guest(packet_va, packet, packet_bytes);
-    if (readable && channels != 0 && output_va != 0) {
-        auto& decoder = s.decoders[{handle, voice}];
-        if (!decoder) {
-            decoder = std::make_unique<xapu_opus::VoiceDecoder>();
-        }
-        const size_t max_frames = capacity / (channels * sizeof(float));
-        float* pcm = s.decode_pcm.data();
-        const uint32_t sample_rate = rate >= 1.0f && rate < 1.0e6f ? static_cast<uint32_t>(rate) : 48000u;
-        const int frames = decoder->decode(packet, packet_bytes, sample_rate, channels, pcm, max_frames);
+    const bool readable = out.packet_bytes != 0 && out.packet_bytes <= sizeof(packet) && out.packet_va != 0 &&
+                          com::read_guest(out.packet_va, packet, out.packet_bytes);
+    if (readable) {
+        out.toc = packet[0];
+    }
+    if (readable && out.channels != 0 && out.output_va != 0 && slot) {
+        std::lock_guard<std::mutex> vlock(slot->mutex);
+        const size_t max_frames = out.capacity / (out.channels * sizeof(float));
+        float* pcm = slot->pcm.data();
+        const int frames = slot->decoder.decode(packet, out.packet_bytes, out.sample_rate, out.channels, pcm, max_frames);
         if (frames >= 0) {
-            const uint32_t dropped = std::min<uint32_t>(skip, static_cast<uint32_t>(frames));
-            const uint32_t bytes = (static_cast<uint32_t>(frames) - dropped) * channels * sizeof(float);
-            if (bytes == 0 || com::write_guest(output_va, pcm + size_t{dropped} * channels, bytes)) {
-                ++s.decoded_packets;
-                s.decoded_bytes += bytes;
-                if (!s.decode_logged) {
-                    s.decode_logged = true;
-                    char line[256];
-                    std::snprintf(line, sizeof(line),
-                                  "XApu: first decode: voice %u, %u bytes (TOC 0x%02x), %u Hz, %u channel(s), "
-                                  "%u frames/packet, skip %u -> %u bytes of float32%s",
-                                  voice, packet_bytes, packet[0], sample_rate, channels, frames_per_packet, skip,
-                                  bytes, xapu_opus::available() ? "" : " (silence: built without libopus)");
-                    diag(line);
-                }
-                return make_result(3, voice, bytes);
+            const uint32_t dropped = std::min<uint32_t>(out.skip, static_cast<uint32_t>(frames));
+            const uint32_t bytes = (static_cast<uint32_t>(frames) - dropped) * out.channels * sizeof(float);
+            if (bytes == 0 || com::write_guest(out.output_va, pcm + size_t{dropped} * out.channels, bytes)) {
+                out.ok = true;
+                out.bytes = bytes;
+                out.result = make_result(3, out.voice, bytes);
+                return out;
             }
         }
     }
-    ++s.failed_packets;
-    if (!s.failure_logged) {
-        s.failure_logged = true;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "XApu: decode failed: voice %u, packet 0x%" PRIx64 " (%u bytes), capacity %u, output 0x%" PRIx64
-                      "; result posted with 0 bytes",
-                      voice, packet_va, packet_bytes, capacity, output_va);
-        diag(line);
-    }
-    return make_result(3, voice, 0);
+    out.result = make_result(3, out.voice, 0);
+    return out;
 }
 
 // PG6_AUDIO_TRACE=1 (the caller holds the lock): one line per voice start (type 1), free (type 2,
@@ -858,13 +975,18 @@ void trace_command(uint64_t handle, uint32_t type, uint32_t voice) {
     if (type == 1) {
         v = {0, now};
     }
+    const uint64_t pkts = v.first;
+    const int64_t start_ms = v.second;
+    if (type == 2) {
+        s.trace_voices.erase({handle, voice});
+    }
     if (s.trace_lines++ >= 400) {
         return;
     }
     char line[200];
     std::snprintf(line, sizeof(line), "audio-trace: XApu command %u voice %u (t=%" PRId64 "): %" PRIu64
                   " packets over %" PRId64 " ms since its start",
-                  type, voice, now, v.first, v.second != 0 ? now - v.second : -1);
+                  type, voice, now, pkts, start_ms != 0 ? now - start_ms : -1);
     diag(line);
 }
 
@@ -874,11 +996,15 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
         return com::E_INVALIDARG_HR;
     }
     const uint32_t type = head[0];
+    const uint32_t voice = head[1];
     uint8_t decode[kXApuDecodeCommandBytes] = {};
     if (type == 3 && !com::read_guest(command, decode, sizeof(decode))) {
         return com::E_INVALIDARG_HR;
     }
-    uint64_t result_event = 0;
+
+    std::shared_ptr<XApuVoiceSlot> slot;
+    std::shared_ptr<XApuConn> conn;
+    const bool needs_reset = (type == 1 || type == 2 || type == 5);
     {
         std::lock_guard<std::mutex> lock(xapu().mutex);
         auto it = xapu().queues.find(handle);
@@ -888,8 +1014,38 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
         if (const size_t limit = xapu().limits[handle]; limit != 0 && it->second.size() >= limit) {
             return kXApuQueueFull;
         }
-        // Every command type is acknowledged with a result, in command order. The title sends only types
-        // 1, 2, 3 and 5 and its drain loop ignores other result types (see the model notes above).
+        if (type == 3) {
+            auto& entry = xapu().voice_slots[{handle, voice}];
+            if (!entry) {
+                entry = std::make_shared<XApuVoiceSlot>();
+            }
+            slot = entry;
+        } else if (needs_reset) {
+            if (auto d = xapu().voice_slots.find({handle, voice}); d != xapu().voice_slots.end()) {
+                slot = d->second;
+            }
+        }
+    }
+
+    // Run Opus decode or decoder reset OUTSIDE xapu().mutex so concurrent voices and result drains
+    // never block each other.
+    DecodeOutcome decoded{};
+    if (type == 3) {
+        decoded = decode_command_unlocked(slot, decode);
+    } else if (needs_reset && slot) {
+        std::lock_guard<std::mutex> vlock(slot->mutex);
+        slot->decoder.reset();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(xapu().mutex);
+        auto it = xapu().queues.find(handle);
+        if (it == xapu().queues.end()) {
+            return com::E_INVALIDARG_HR;
+        }
+        if (const size_t limit = xapu().limits[handle]; limit != 0 && it->second.size() >= limit) {
+            return kXApuQueueFull;
+        }
         const bool acknowledged = true;
         const uint64_t seen = ++xapu().commands[type];
         if (type != 3 || seen <= 8) {
@@ -905,33 +1061,57 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
                  (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
         }
         if (audio_trace_enabled()) {
-            trace_command(handle, type, head[1]);
-        }
-        if (type == 1 || type == 2) {
-            // The voice starts or is freed: its next packet begins a new stream.
-            auto d = xapu().decoders.find({handle, head[1]});
-            if (d != xapu().decoders.end()) {
-                d->second->reset();
-            }
+            trace_command(handle, type, voice);
         }
         if (type == 3) {
-            push_bounded(it->second, decode_command(handle, decode));
+            auto& s = xapu();
+            if (decoded.ok) {
+                ++s.decoded_packets;
+                s.decoded_bytes += decoded.bytes;
+                if (!s.decode_logged) {
+                    s.decode_logged = true;
+                    char line[256];
+                    std::snprintf(line, sizeof(line),
+                                  "XApu: first decode: voice %u, %u bytes (TOC 0x%02x), %u Hz, %u channel(s), "
+                                  "%u frames/packet, skip %u -> %u bytes of float32%s",
+                                  decoded.voice, decoded.packet_bytes, decoded.toc, decoded.sample_rate,
+                                  decoded.channels, decoded.frames_per_packet, decoded.skip, decoded.bytes,
+                                  xapu_opus::available() ? "" : " (silence: built without libopus)");
+                    diag(line);
+                }
+            } else {
+                ++s.failed_packets;
+                if (!s.failure_logged) {
+                    s.failure_logged = true;
+                    char line[256];
+                    std::snprintf(line, sizeof(line),
+                                  "XApu: decode failed: voice %u, packet 0x%" PRIx64 " (%u bytes), capacity %u, "
+                                  "output 0x%" PRIx64 "; result posted with 0 bytes",
+                                  decoded.voice, decoded.packet_va, decoded.packet_bytes, decoded.capacity,
+                                  decoded.output_va);
+                    diag(line);
+                }
+            }
+            push_bounded(it->second, decoded.result);
             ++xapu().type3_results;
         } else {
-            push_bounded(it->second, make_result(type, head[1]));
+            push_bounded(it->second, make_result(type, voice));
         }
         if (type != 1 && type != 2 && type != 3 && type != 5) {
             ++xapu().unhandled;  // no behaviour modelled for this type (still acknowledged)
         }
         ++xapu().results_posted;
-        if (const auto e = xapu().events.find(handle); e != xapu().events.end()) {
-            result_event = e->second;
+        if (const auto c = xapu().conns.find(handle); c != xapu().conns.end()) {
+            conn = c->second;
         }
     }
-    // The result is ready now: wake the title's audio thread after releasing xapu().mutex so the
-    // woken consumer does not immediately stall trying to acquire the lock.
-    if (result_event != 0) {
-        win32::SetEvent(static_cast<win32::Handle>(result_event));
+    // Wake the title's audio thread after releasing xapu().mutex, guarded by conn->event_mutex
+    // against concurrent xapu_disconnect() closing the Win32 event handle.
+    if (conn) {
+        std::lock_guard<std::mutex> elock(conn->event_mutex);
+        if (conn->event != 0) {
+            win32::SetEvent(static_cast<win32::Handle>(conn->event));
+        }
     }
     return kOk;
 }
@@ -946,20 +1126,20 @@ HResult xapu_dequeue_result(uint64_t handle, uint64_t result) {
     if (result == 0) {
         return com::E_POINTER_HR;
     }
-    XApuResult bytes{};
-    {
-        std::lock_guard<std::mutex> lock(xapu().mutex);
-        auto it = xapu().queues.find(handle);
-        if (it == xapu().queues.end()) {
-            return com::E_INVALIDARG_HR;
-        }
-        if (it->second.empty()) {
-            return com::E_FAIL_HR;
-        }
-        bytes = it->second.front();
-        it->second.pop_front();
+    std::lock_guard<std::mutex> lock(xapu().mutex);
+    auto it = xapu().queues.find(handle);
+    if (it == xapu().queues.end()) {
+        return com::E_INVALIDARG_HR;
     }
-    return com::write_guest(result, bytes.data(), bytes.size()) ? kOk : com::E_POINTER_HR;
+    if (it->second.empty()) {
+        return com::E_FAIL_HR;
+    }
+    const XApuResult& bytes = it->second.front();
+    if (!com::write_guest(result, bytes.data(), bytes.size())) {
+        return com::E_POINTER_HR;
+    }
+    it->second.pop_front();
+    return kOk;
 }
 
 }  // namespace
@@ -1018,11 +1198,13 @@ bool xma_context_enabled(uint32_t index) {
 
 void reset_xma_commands() {
     auto& x = xma();
-    std::lock_guard<std::mutex> lock(x.mutex);
+    std::unique_lock<std::mutex> lock(x.mutex);
     x.enabled.clear();
     x.slots.clear();
     x.contexts = 0;
+    ++x.contexts_generation;
     x.stats = {};
+    x.pump_done.wait(lock, [&x] { return x.active_pumps == 0; });
     x.frames = 0;
     x.blocks_written = 0;
     x.loops = 0;

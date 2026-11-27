@@ -569,6 +569,36 @@ void test_audio_apu_xapu_xdsp() {
     CHECK(pg6_mw_apu_free(virt) == E_INVALIDARG_HR);
     CHECK(!guest_heap.owns(reinterpret_cast<uintptr_t>(virt_va)));  // released to the guest heap
 
+    // Single-lock APU range mapping must reject cross-block spans and 32-bit wraparound.
+    void* va1 = nullptr;
+    void* va2 = nullptr;
+    Pg6ApuAddress pa1 = 0u, pa2 = 0u;
+    CHECK(pg6_mw_apu_alloc(&va1, &pa1, 4096u, 256u, 0u) == S_OK_HR);
+    CHECK(pg6_mw_apu_alloc(&va2, &pa2, 4096u, 256u, 0u) == S_OK_HR);
+    CHECK(pg6_mw_apu_map_apu_range(pa1, 4096u) != nullptr);
+    CHECK(pg6_mw_apu_map_apu_range(pa1, 4097u) == nullptr);  // past end of block 1
+    CHECK(pg6_mw_apu_map_apu_range(0xFFFFF800u, 0x1000u) == nullptr);  // 32-bit wrap
+    CHECK(pg6_mw_apu_map_apu_range(pa1, 0u) == nullptr);
+    CHECK(pg6_mw_apu_free(guest_heap.to_host(reinterpret_cast<uintptr_t>(va1))) == S_OK_HR);
+    CHECK(pg6_mw_apu_free(guest_heap.to_host(reinterpret_cast<uintptr_t>(va2))) == S_OK_HR);
+
+    // Shape-context release callback must run before the arrays are freed.
+    {
+        static int s_release_cb_hits = 0;
+        s_release_cb_hits = 0;
+        pg6_mw_set_xma_contexts_released_callback([]() { ++s_release_cb_hits; });
+        struct ShapeReq {
+            uint32_t counts[6]{};
+            uint64_t arrays[6]{};
+        } req{};
+        req.counts[4] = 4;
+        CHECK(pg6_mw_acp_hal_allocate_shape_contexts(&req) == S_OK_HR);
+        CHECK(req.arrays[4] != 0);
+        CHECK(pg6_mw_acp_hal_release_shape_contexts() == S_OK_HR);
+        CHECK(s_release_cb_hits == 1);
+        pg6_mw_set_xma_contexts_released_callback(nullptr);
+    }
+
     // XApu connect / enqueue / result count / dequeue / disconnect.
     Pg6XApuHandle xapu = nullptr;
     CHECK(pg6_mw_xapu_connect(nullptr, &xapu) == S_OK_HR);
