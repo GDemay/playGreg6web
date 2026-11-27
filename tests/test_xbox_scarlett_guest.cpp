@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <ctime>
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -33,6 +35,7 @@
 #include "os/audio_downmix.h"
 #include "os/bcpack.h"
 #include "os/httpfs_mailbox.h"
+#include "os/guest_window.h"
 #include "os/vmem.h"
 #include "os/xapu_opus.h"
 #include "os/win32_compat.h"
@@ -1985,7 +1988,7 @@ void test_xg() {
         uint32_t dim, w, h, d, mips, format, bpe, mip, slice, swizzle;
     };
     for (const TiledCase& c : {TiledCase{3, 256, 256, 1, 9, 28, 4, 1, 0, 0x105}, TiledCase{3, 64, 64, 1, 1, 28, 4, 0, 0, 0x105},
-                               TiledCase{4, 16, 16, 16, 1, 10, 8, 0, 0, 0x105}, TiledCase{3, 256, 256, 3, 2, 61, 1, 1, 2, 0x10A},
+                               TiledCase{4, 16, 16, 16, 1, 10, 8, 0, 0, 0x105}, TiledCase{4, 32, 16, 8, 6, 28, 4, 2, 0, 0x105}, TiledCase{3, 256, 256, 3, 2, 61, 1, 1, 2, 0x10A},
                                TiledCase{3, 512, 256, 1, 3, 71, 8, 0, 0, 0x10A}, TiledCase{3, 128, 72, 1, 7, 41, 4, 3, 0, 0x100},
                                TiledCase{3, 128, 72, 1, 7, 41, 4, 0, 0, 0x100}, TiledCase{3, 20, 6, 3, 3, 28, 4, 1, 2, 0x100},
                                TiledCase{4, 32, 32, 36, 1, 42, 4, 0, 0, 0x100}, TiledCase{3, 100, 60, 1, 5, 71, 8, 2, 0, 0x100},
@@ -2041,6 +2044,9 @@ void test_xg() {
         std::vector<uint8_t> back;
         CHECK(gfx10::detile_from_surface(gd, c.mip, written.data(), written.size(), back).ok);
         CHECK(back == lin);
+        const uint64_t tight_back = com::guest_alloc(lin.size());
+        CHECK(as_hr(fx.vcall(tcomp, 9, {I(tight_back), I(0), I(sub), I(0), I(tdst), I(row), I(row * rows)})) == 0);
+        CHECK(guest_bytes(tight_back, lin.size()) == lin);
         // CopyFromSubresource (slot 9) reads the same subresource back into linear rows with a
         // padded pitch (CopyInto then CopyFrom is the identity); padding bytes stay untouched.
         {
@@ -2122,6 +2128,166 @@ void test_xg() {
         CHECK(as_hr(fx.vcall(rcomp, 9, {I(rback), I(0), I(0), I(0), I(rres), I(1024), I(lin.size())})) == 0);
         CHECK(guest_bytes(rback, lin.size()) == lin);
         CHECK(fx.vcall(rcomp, 1) == 0);
+    }
+}
+
+void test_xg_selected_mip_spans() {
+    Fixture fx;
+    namespace gx = playgta6::gpu::gfx10;
+    const uint64_t create = fx.export_address("xg_xs.dll", "XGCreateTextureComputer");
+    uint32_t small_non_tail = 0;
+    bool window_tested = false;
+    for (const uint32_t format : {28u, 61u, 10u, 71u, 98u}) {
+        for (const uint32_t mode : {0x100u, 0x101u, 0x102u, 0x105u, 0x106u, 0x109u, 0x10Au}) {
+            for (const uint32_t width : {512u, 1003u}) {
+                const uint32_t height = width == 512 ? 256 : 603;
+                const uint32_t mips = 10;
+                const uint32_t slices = format == 28 && mode == 0x105 ? 3 : 1;
+                const uint32_t slice = slices - 1;
+                const gx::TextureLayoutDesc td{format, width, height, 1, mips, mode, 0};
+                const size_t chain = gx::surface_bytes(td);
+                CHECK(chain != 0);
+                const auto bytes = pattern_data(chain * slices);
+                const uint64_t src = fx.arena.virtual_alloc(0, bytes.size(), os::kMemReserve | os::kMemCommit,
+                                                            os::PageProtect::ReadWrite);
+                CHECK(src != 0 && com::write_guest(src, bytes.data(), bytes.size()));
+                const uint64_t desc = xg_desc(3, width, height, slices, mips, format);
+                CHECK(com::write_guest(desc + 0x2C, mode));
+                const uint64_t out = fx.out_slot();
+                CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
+                const uint64_t comp = load64(out);
+                const auto geometry = gx::format_geometry(format);
+                for (uint32_t mip = 0; mip < mips; ++mip) {
+                    const auto placement = gx::mip_placement(td, mip);
+                    std::vector<uint8_t> expected;
+                    CHECK(gx::detile_from_surface(td, mip, bytes.data() + slice * chain, chain, expected).ok);
+                    const uint32_t row = (std::max(1u, width >> mip) + geometry.block_width - 1) /
+                                         geometry.block_width * geometry.bytes_per_block;
+                    const uint32_t rows = (std::max(1u, height >> mip) + geometry.block_height - 1) /
+                                          geometry.block_height;
+                    const uint32_t pitch = row + 13;
+                    std::vector<uint8_t> pitched(size_t{pitch} * rows + 17, 0xCD);
+                    for (uint32_t y = 0; y < rows; ++y) {
+                        std::memcpy(pitched.data() + size_t{y} * pitch, expected.data() + size_t{y} * row, row);
+                    }
+                    const uint64_t dst = com::guest_alloc(pitched.size());
+                    CHECK(com::write_guest(dst, std::vector<uint8_t>(pitched.size(), 0xCD).data(), pitched.size()));
+                    CHECK(as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(slice * mips + mip), I(0), I(src), I(pitch),
+                                                     I(pitched.size())})) == 0);
+                    CHECK(guest_bytes(dst, pitched.size()) == pitched);
+                    if (mip > 0 && !placement.in_tail && placement.size_bytes <= 256 * 1024 &&
+                        placement.size_bytes <= chain / 16) {
+                        ++small_non_tail;
+                        // Independent address implementations: explicit original pitch, then a
+                        // standalone non-tail detile, must equal the complete-chain oracle.
+                        auto standalone = td;
+                        standalone.width = std::max(1u, width >> mip);
+                        standalone.height = std::max(1u, height >> mip);
+                        standalone.mip_levels = 1;
+                        standalone.pitch_bytes = placement.pitch_elements * geometry.bytes_per_block;
+                        std::vector<uint8_t> direct;
+                        CHECK(gx::detile_subresource(standalone, 0,
+                                  bytes.data() + slice * chain + placement.macro_block_offset,
+                                  placement.size_bytes, direct).ok);
+                        CHECK(direct == expected);
+                        if (format == 28 && mode == 0x105 && width == 1003) {
+                            if (!window_tested) {
+                                namespace gw = playgta6::os::guest_window;
+                                const uint64_t slots = (chain + gw::kSlotBytes - 1) / gw::kSlotBytes;
+                                const uint64_t window_pages = fx.arena.virtual_alloc(0, (slots + 1) * gw::kSlotBytes,
+                                    os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+                                CHECK(window_pages != 0);
+                                gw::reset_for_testing();
+                                gw::set_enabled(true);
+                                for (uint64_t i = 0; i < slots; ++i) {
+                                    CHECK(gw::map_slot(gw::kWindowBase + i * gw::kSlotBytes,
+                                        fx.arena.translate(window_pages + (i == 0 ? 0 : i + 1) * gw::kSlotBytes)));
+                                }
+                                CHECK(com::write_guest(gw::kWindowBase, bytes.data() + slice * chain, chain));
+                                CHECK(as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(mip), I(0), I(gw::kWindowBase),
+                                                                 I(pitch), I(pitched.size())})) == 0);
+                                CHECK(guest_bytes(dst, pitched.size()) == pitched);
+                                CHECK(gw::unmap_slot(gw::kWindowBase + (slots - 1) * gw::kSlotBytes));
+                                CHECK(com::write_guest(dst, std::vector<uint8_t>(pitched.size(), 0xCD).data(), pitched.size()));
+                                CHECK(as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(mip), I(0), I(gw::kWindowBase),
+                                                                 I(pitch), I(pitched.size())})) == com::E_INVALIDARG_HR);
+                                CHECK(guest_bytes(dst, pitched.size()) == std::vector<uint8_t>(pitched.size(), 0xCD));
+                                gw::reset_for_testing();
+                                CHECK(fx.arena.release(window_pages));
+                                {
+                                    os::VirtualMemoryArena::DiagnosticReads diagnostic;
+                                    CHECK(as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(slice * mips + mip), I(0), I(src),
+                                                                     I(pitch), I(pitched.size())})) == 0);
+                                }
+                                CHECK(guest_bytes(dst, pitched.size()) == pitched);
+                                CHECK(fx.arena.protect(src, bytes.size(), os::PageProtect::ReadOnly));
+                                CHECK(as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(slice * mips + mip), I(0), I(src),
+                                                                 I(pitch), I(pitched.size())})) == 0);
+                                CHECK(guest_bytes(dst, pitched.size()) == pitched);
+                                CHECK(fx.arena.protect(src, bytes.size(), os::PageProtect::ReadWrite));
+                                window_tested = true;
+                            }
+                            // Source/destination overlap: the selected span is fully snapshotted
+                            // before any guest writes, even when the output overwrites the chain.
+                            const uint64_t selected_src = src + slice * chain;
+                            CHECK(as_hr(fx.vcall(comp, 9, {I(selected_src), I(0), I(slice * mips + mip), I(0), I(src),
+                                                             I(row), I(expected.size())})) == 0);
+                            CHECK(guest_bytes(selected_src, expected.size()) == expected);
+                            CHECK(com::write_guest(src, bytes.data(), bytes.size()));
+                            // An unreadable page outside the selected span still rejects the call,
+                            // preserving the original full-chain access-validation contract.
+                            if (placement.macro_block_offset >= 4096) {
+                                CHECK(fx.arena.decommit(selected_src, 4096));
+                                CHECK(com::write_guest(dst, std::vector<uint8_t>(pitched.size(), 0xCD).data(), pitched.size()));
+                                CHECK(as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(slice * mips + mip), I(0), I(src), I(pitch),
+                                                                 I(pitched.size())})) == com::E_INVALIDARG_HR);
+                                CHECK(guest_bytes(dst, pitched.size()) == std::vector<uint8_t>(pitched.size(), 0xCD));
+                                CHECK(fx.arena.commit(selected_src, 4096));
+                                CHECK(com::write_guest(selected_src, bytes.data() + slice * chain, 4096));
+                            }
+                        }
+                    }
+                    com::guest_free(dst);
+                }
+                CHECK(fx.vcall(comp, 1) == 0);
+                CHECK(fx.arena.release(src));
+            }
+        }
+    }
+    CHECK(small_non_tail > 50 && window_tested);
+}
+
+void test_xg_mip_span_thresholds() {
+    Fixture fx;
+    namespace gx = playgta6::gpu::gfx10;
+    const uint64_t create = fx.export_address("xg_xs.dll", "XGCreateTextureComputer");
+    struct Case { uint32_t w, h, mips, mip; uint64_t span; bool cap_ok, ratio_ok; };
+    for (const Case c : {Case{4096, 4096, 13, 4, 256 * 1024, true, true},
+                         Case{4096, 4096, 13, 3, 1024 * 1024, false, true},
+                         Case{80, 196, 4, 2, 8192, true, true},
+                         Case{80, 192, 4, 2, 8192, true, false}}) {
+        const gx::TextureLayoutDesc td{28, c.w, c.h, 1, c.mips, 0x105, 0};
+        const size_t chain = gx::surface_bytes(td);
+        const auto p = gx::mip_placement(td, c.mip);
+        CHECK(p.ok && !p.in_tail && p.size_bytes == c.span);
+        CHECK((p.size_bytes <= 256 * 1024) == c.cap_ok);
+        CHECK((p.size_bytes <= chain / 16) == c.ratio_ok);
+        if (c.w == 80 && c.h == 196) CHECK(p.size_bytes * 16 == chain);
+        const auto bytes = pattern_data(chain);
+        std::vector<uint8_t> expected;
+        CHECK(gx::detile_from_surface(td, c.mip, bytes.data(), bytes.size(), expected).ok);
+        const uint64_t src = com::guest_alloc(chain), dst = com::guest_alloc(expected.size());
+        CHECK(com::write_guest(src, bytes.data(), bytes.size()));
+        const uint64_t desc = xg_desc(3, c.w, c.h, 1, c.mips, 28);
+        CHECK(com::write_guest(desc + 0x2C, uint32_t{0x105}));
+        const uint64_t out = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
+        const uint64_t comp = load64(out);
+        CHECK(as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(c.mip), I(0), I(src), I((c.w >> c.mip) * 4), I(expected.size())})) == 0);
+        CHECK(guest_bytes(dst, expected.size()) == expected);
+        CHECK(fx.vcall(comp, 1) == 0);
+        com::guest_free(src);
+        com::guest_free(dst);
     }
 }
 
@@ -3696,7 +3862,81 @@ void test_mmdevice_end_of_stream_and_reset() {
     win32::CloseHandle(event);
 }
 
-int main() {
+// Synthetic public COM slot 9 benchmark. Setup, oracle and full output checks are not timed.
+int benchmark_texture_mip(int argc, char** argv) {
+    if (argc != 11) {
+        std::fprintf(stderr, "usage: --benchmark-texture-mip width height format layout mips mip padding iterations translated\n");
+        return 2;
+    }
+    const auto number = [&](int i) { return static_cast<uint32_t>(std::strtoul(argv[i], nullptr, 0)); };
+    const uint32_t width = number(2), height = number(3), format = number(4), layout = number(5);
+    const uint32_t mips = number(6), mip = number(7), padding = number(8), iterations = number(9), translated = number(10);
+    if (!width || !height || width > 4096 || height > 4096 || !mips || mips > 13 || mip >= mips || padding > 256 ||
+        !iterations || iterations > 1000 || translated > 1 || (format != 28 && format != 71)) return 2;
+    Fixture fx;
+    namespace gx = playgta6::gpu::gfx10;
+    namespace gw = playgta6::os::guest_window;
+    const gx::TextureLayoutDesc td{format, width, height, 1, mips, layout, 0};
+    const size_t chain = gx::surface_bytes(td);
+    if (!chain) return 2;
+    const auto bytes = pattern_data(chain);
+    const auto fg = gx::format_geometry(format);
+    const uint32_t row = (std::max(1u, width >> mip) + fg.block_width - 1) / fg.block_width * fg.bytes_per_block;
+    const uint32_t rows = (std::max(1u, height >> mip) + fg.block_height - 1) / fg.block_height;
+    const uint32_t pitch = row + padding;
+    const size_t out_bytes = size_t{pitch} * rows + 17;
+    std::vector<uint8_t> tight;
+    CHECK(gx::detile_from_surface(td, mip, bytes.data(), bytes.size(), tight).ok);
+    std::vector<uint8_t> expected(out_bytes, 0xCD);
+    for (uint32_t y = 0; y < rows; ++y) std::memcpy(expected.data() + size_t{y} * pitch, tight.data() + size_t{y} * row, row);
+    const uint64_t create = fx.export_address("xg_xs.dll", "XGCreateTextureComputer");
+    const uint64_t desc = xg_desc(3, width, height, 1, mips, format);
+    CHECK(com::write_guest(desc + 0x2C, layout));
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(desc), I(out)})) == 0);
+    const uint64_t comp = load64(out);
+    uint64_t src = com::guest_alloc(chain);
+    if (translated) {
+        const uint64_t slots = (chain + gw::kSlotBytes - 1) / gw::kSlotBytes;
+        const uint64_t pages = fx.arena.virtual_alloc(0, (slots + 1) * gw::kSlotBytes,
+            os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        CHECK(pages != 0);
+        gw::reset_for_testing();
+        gw::set_enabled(true);
+        for (uint64_t i = 0; i < slots; ++i) CHECK(gw::map_slot(gw::kWindowBase + i * gw::kSlotBytes,
+            fx.arena.translate(pages + (i == 0 ? 0 : i + 1) * gw::kSlotBytes)));
+        src = gw::kWindowBase;
+    }
+    CHECK(com::write_guest(src, bytes.data(), bytes.size()));
+    const uint64_t dst = com::guest_alloc(out_bytes);
+    CHECK(com::write_guest(dst, std::vector<uint8_t>(out_bytes, 0xCD).data(), out_bytes));
+    const auto run = [&]() { return as_hr(fx.vcall(comp, 9, {I(dst), I(0), I(mip), I(0), I(src), I(pitch), I(out_bytes)})); };
+    CHECK(run() == 0);
+    const auto cpu_start = std::clock();
+    const auto wall_start = std::chrono::steady_clock::now();
+    bool calls_ok = true;
+    for (uint32_t i = 0; i < iterations; ++i) calls_ok = run() == 0 && calls_ok;
+    const double wall_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wall_start).count();
+    const double cpu_ms = 1000.0 * (std::clock() - cpu_start) / CLOCKS_PER_SEC;
+    const auto actual = guest_bytes(dst, out_bytes);
+    CHECK(calls_ok && actual == expected);
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (uint8_t byte : actual) hash = (hash ^ byte) * 0x100000001b3ull;
+    const auto placement = gx::mip_placement(td, mip);
+    gw::reset_for_testing();
+    CHECK(fx.vcall(comp, 1) == 0);
+    std::printf("{\"width\":%u,\"height\":%u,\"format\":%u,\"mips\":%u,\"mip\":%u,\"translated\":%s,"
+                "\"chain_bytes\":%zu,\"mip_span_bytes\":%llu,\"in_tail\":%s,\"output_bytes\":%zu,\"iterations\":%u,"
+                "\"wall_ms\":%.6f,\"cpu_ms\":%.6f,\"output_hash\":\"%016llx\",\"correct\":%s}\n",
+                width, height, format, mips, mip, translated ? "true" : "false", chain,
+                static_cast<unsigned long long>(placement.size_bytes), placement.in_tail ? "true" : "false",
+                out_bytes, iterations, wall_ms, cpu_ms, static_cast<unsigned long long>(hash), g_failures == 0 ? "true" : "false");
+    return g_failures == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--benchmark-texture-mip") return benchmark_texture_mip(argc, argv);
+
     test_inflate();
     test_inflate_lz77_fast_paths();
     test_factory_identity_and_stubs();
@@ -3719,6 +3959,8 @@ int main() {
     test_game_input_stable_pad();
     test_game_input_battery_ffb_and_callbacks();
     test_xg();
+    test_xg_selected_mip_spans();
+    test_xg_mip_span_thresholds();
     test_acp_hal();
     test_acp_hal_xma_commands();
     test_acp_hal_xma_decode_worker();
