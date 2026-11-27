@@ -114,6 +114,8 @@ target_include_directories(playgta6_core PUBLIC
 
 option(PLAYGTA6_PERFORMANCE_BENCHMARKS "Build synthetic production-path performance benchmarks" OFF)
 if(PLAYGTA6_PERFORMANCE_BENCHMARKS)
+    add_executable(bench_fragmented_buffer_flush ../tests/bench_fragmented_buffer_flush.cpp)
+    target_link_libraries(bench_fragmented_buffer_flush PRIVATE playgta6_core)
     add_executable(bench_buffer_shadows ../tests/bench_buffer_shadows.cpp)
     target_link_libraries(bench_buffer_shadows PRIVATE playgta6_core)
 endif()
@@ -612,6 +614,12 @@ else()
     add_executable(test_guest_window_e2e ../tests/test_guest_window_e2e.cpp)
     target_link_libraries(test_guest_window_e2e PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_window_e2e_tests COMMAND test_guest_window_e2e)
+
+    add_executable(test_fragmented_buffer_flush ../tests/bench_fragmented_buffer_flush.cpp)
+    target_link_libraries(test_fragmented_buffer_flush PRIVATE playgta6_core)
+    add_test(NAME fragmented_buffer_sparse COMMAND test_fragmented_buffer_flush 2 2 fragmented)
+    add_test(NAME fragmented_buffer_unaligned_tail COMMAND test_fragmented_buffer_flush 2 2 fragmented-unaligned)
+    add_test(NAME fragmented_buffer_dense COMMAND test_fragmented_buffer_flush 2 1 fragmented-dense)
 
     add_executable(test_d3d12_xs_exports ../tests/test_d3d12_xs_exports.cpp)
     target_link_libraries(test_d3d12_xs_exports PRIVATE playgta6_core)
