@@ -1683,21 +1683,28 @@ class CaptureFramesDumpPipelinesAndPresetsTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("tracked repository directory", err_text)
 
-            # Live real-game run stages dump_pipelines_dir into boot-options.json and records dumpPipelines
-            code, _, err, _, sessions = fx.run_cli(
+            # Live real-game run stages dump_pipelines_dir into boot-options.json during the session,
+            # records dumpPipelines, and restores/removes boot-options.json on exit.
+            observed_staged_during_session: list[dict[str, Any]] = []
+            staged_path = fx.boot_dir / "boot-options.json"
+
+            def observing_session(**kwargs):
+                if staged_path.is_file():
+                    observed_staged_during_session.append(json.loads(staged_path.read_text(encoding="utf-8")))
+                return make_fake_session_result(
+                    probe=make_sample_probe(boot_mode="real-wasm64", session_state="running_wasm")
+                )
+
+            code, _, err, _, _ = fx.run_cli(
                 "--trust-build",
                 "--name",
                 "dump-live",
                 "--dump-pipelines",
+                session_runner=observing_session,
             )
             self.assertEqual(code, 0, err)
-            staged_path = fx.boot_dir / "boot-options.json"
-            self.assertTrue(staged_path.is_file())
-            self.assertEqual(
-                json.loads(staged_path.read_text(encoding="utf-8")),
-                {"dump_pipelines_dir": "/pg6_dump"},
-            )
-            self.assertEqual(sessions[0]["boot_options"], {"dump_pipelines_dir": "/pg6_dump"})
+            self.assertEqual(observed_staged_during_session, [{"dump_pipelines_dir": "/pg6_dump"}])
+            self.assertFalse(staged_path.exists())
 
             run_dir = fx.build / "runs" / "dump-live"
             cmd_meta = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
@@ -5225,6 +5232,426 @@ class Orch14DumpPipelinesStagingAndTelemetryTests(unittest.TestCase):
         self.assertEqual(mem["jsHeapUsedBytes"], main_used_bytes)
         self.assertEqual(mem["cdpTotalJsHeapUsedBytes"], cdp_used_bytes)
         self.assertEqual(mem["cdpTotalJsHeapUsedMb"], 384.0)
+
+
+class Wave5RunnerCleanupViewportTelemetryTests(unittest.TestCase):
+    def test_dump_pipelines_restores_or_removes_boot_options_on_exit_and_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            opts_path = fx.boot_dir / rbb.BOOT_OPTIONS_NAME
+
+            # 1. No pre-existing boot-options.json + exception during session -> removed via finally
+            seen_in_crash: list[dict[str, Any]] = []
+
+            def crashing_session(**kwargs):
+                seen_in_crash.append(json.loads(opts_path.read_text(encoding="utf-8")))
+                raise RuntimeError("simulated browser crash")
+
+            with self.assertRaises(RuntimeError):
+                fx.run_cli(
+                    "--trust-build",
+                    "--name",
+                    "dump-crash-new",
+                    "--dump-pipelines",
+                    session_runner=crashing_session,
+                )
+            self.assertEqual(seen_in_crash, [{"dump_pipelines_dir": "/pg6_dump"}])
+            self.assertFalse(opts_path.exists())
+
+            # 2. Pre-existing boot-options.json -> restored verbatim after normal exit AND after crash
+            original_bytes = b'{\n  "report_to_log": true\n}\n'
+            opts_path.write_bytes(original_bytes)
+            seen_override: list[dict[str, Any]] = []
+
+            def ok_session(**kwargs):
+                seen_override.append(json.loads(opts_path.read_text(encoding="utf-8")))
+                return make_fake_session_result(
+                    probe=make_sample_probe(boot_mode="real-wasm64", session_state="running_wasm")
+                )
+
+            code, _, err, _, _ = fx.run_cli(
+                "--trust-build",
+                "--name",
+                "dump-restore-ok",
+                "--dump-pipelines",
+                session_runner=ok_session,
+            )
+            self.assertEqual(code, 0, err)
+            self.assertEqual(seen_override, [{"dump_pipelines_dir": "/pg6_dump"}])
+            self.assertTrue(opts_path.is_file())
+            self.assertEqual(opts_path.read_bytes(), original_bytes)
+
+            with self.assertRaises(KeyboardInterrupt):
+                fx.run_cli(
+                    "--trust-build",
+                    "--name",
+                    "dump-restore-kb",
+                    "--boot-options",
+                    '{"dump_pipelines_dir": "/pg6_dump"}',
+                    session_runner=lambda **kw: (_ for _ in ()).throw(KeyboardInterrupt()),
+                )
+            self.assertTrue(opts_path.is_file())
+            self.assertEqual(opts_path.read_bytes(), original_bytes)
+
+            # 3. Direct run_browser_session with dump_pipelines=True also cleans up in finally
+            opts_path.unlink()
+            run_dir = fx.build / "runs" / "direct-dump-kb"
+            run_dir.mkdir(parents=True)
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            class KbCdp:
+                def __init__(self, ws_url: str):
+                    pass
+
+                def connect(self):
+                    pass
+
+                def close(self):
+                    pass
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Page.navigate":
+                        raise KeyboardInterrupt()
+                    return {}
+
+                def drain_events(self, timeout=0.0):
+                    return []
+
+            with self.assertRaises(KeyboardInterrupt):
+                rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=fx.boot_dir,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=1.0,
+                    headless=True,
+                    smoke=False,
+                    send_input=False,
+                    capture_frames=False,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    boot_options={"dump_pipelines_dir": "/pg6_dump"},
+                    dump_pipelines=True,
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=KbCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+            self.assertFalse(opts_path.exists())
+
+    def test_stale_dump_pipelines_boot_options_logs_sanitized_warning(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            opts_path = fx.boot_dir / rbb.BOOT_OPTIONS_NAME
+            opts_path.write_text(json.dumps({"dump_pipelines_dir": "/pg6_dump"}) + "\n", encoding="utf-8")
+
+            # Normal CLI run without --dump-pipelines logs a clear sanitized warning and records it in telemetry.json
+            code, _, err, _, _ = fx.run_cli(
+                "--trust-build",
+                "--name",
+                "stale-warn",
+            )
+            self.assertEqual(code, 0, err)
+            self.assertIn("[warn]", err)
+            self.assertIn("boot-options.json", err)
+            self.assertIn("dump_pipelines_dir", err)
+            self.assertNotIn(str(Path(d)), err)
+
+            telemetry = json.loads((fx.build / "runs" / "stale-warn" / "telemetry.json").read_text(encoding="utf-8"))
+            self.assertTrue(
+                any("dump_pipelines_dir" in w and "boot-options.json" in w for w in telemetry["warnings"]),
+                telemetry["warnings"],
+            )
+
+            # Smoke mode does not mount boot_dir, so no stale warning is emitted
+            code_smoke, _, err_smoke, _, _ = fx.run_cli("--smoke", "--name", "stale-smoke-ok")
+            self.assertEqual(code_smoke, 0, err_smoke)
+            self.assertNotIn("dump_pipelines_dir", err_smoke)
+
+            # Without dump_pipelines_dir in boot-options.json, no stale warning is emitted
+            opts_path.write_text(json.dumps({"report_to_log": True}) + "\n", encoding="utf-8")
+            code_clean, _, err_clean, _, _ = fx.run_cli("--trust-build", "--name", "clean-opts")
+            self.assertEqual(code_clean, 0, err_clean)
+            self.assertNotIn("dump_pipelines_dir", err_clean)
+
+    def test_headless_chrome_sets_exact_16_9_viewport_1280x720(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            profile = Path(d) / "prof"
+
+            headless_cmd = rbb.build_chrome_args(
+                fx.chrome, user_data_dir=profile, cdp_port=9222, headless=True
+            )
+            self.assertIn("--headless=new", headless_cmd)
+            self.assertIn("--window-size=1280,720", headless_cmd)
+            self.assertIn("--force-device-scale-factor=1", headless_cmd)
+
+            headed_cmd = rbb.build_chrome_args(
+                fx.chrome, user_data_dir=profile, cdp_port=9222, headless=False
+            )
+            self.assertIn("--window-size=1280,720", headed_cmd)
+            self.assertNotIn("--headless=new", headed_cmd)
+            self.assertNotIn("--force-device-scale-factor=1", headed_cmd)
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            def run_with_headless(headless_flag: bool) -> list[tuple[str, dict[str, Any] | None]]:
+                calls: list[tuple[str, dict[str, Any] | None]] = []
+                fake_clock = {"t": 1.0}
+
+                class RecordingCdp:
+                    def __init__(self, ws_url: str):
+                        pass
+
+                    def connect(self):
+                        pass
+
+                    def close(self):
+                        pass
+
+                    def send(self, method: str, params=None, timeout=None):
+                        calls.append((method, dict(params) if isinstance(params, dict) else params))
+                        if method == "Runtime.evaluate":
+                            return {"result": {"value": make_sample_probe()}}
+                        return {}
+
+                    def drain_events(self, timeout=0.0):
+                        fake_clock["t"] += 0.5
+                        return []
+
+                run_dir = fx.build / "runs" / f"vp-{'headless' if headless_flag else 'headed'}"
+                run_dir.mkdir(parents=True)
+                with mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]):
+                    rbb.run_browser_session(
+                        repo=fx.repo,
+                        run_dir=run_dir,
+                        chrome_path=fx.chrome,
+                        port=0,
+                        boot_dir=None,
+                        game_dir=None,
+                        shaders_dir=None,
+                        duration_s=0.3,
+                        headless=headless_flag,
+                        smoke=True,
+                        send_input=False,
+                        capture_frames=False,
+                        frame_interval_s=1.0,
+                        encode_mp4=False,
+                        popen_fn=lambda cmd, **kw: FakeProc(),
+                        cdp_factory=RecordingCdp,
+                        wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                        wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                    )
+                return calls
+
+            headless_calls = run_with_headless(True)
+            methods = [m for m, _ in headless_calls]
+            self.assertIn("Emulation.setDeviceMetricsOverride", methods)
+            emul_idx = methods.index("Emulation.setDeviceMetricsOverride")
+            nav_idx = methods.index("Page.navigate")
+            self.assertLess(emul_idx, nav_idx)
+            emul_params = headless_calls[emul_idx][1]
+            self.assertEqual(emul_params["width"], 1280)
+            self.assertEqual(emul_params["height"], 720)
+            self.assertEqual(emul_params["deviceScaleFactor"], 1)
+            self.assertFalse(emul_params["mobile"])
+            self.assertEqual(emul_params["screenWidth"], 1280)
+            self.assertEqual(emul_params["screenHeight"], 720)
+            self.assertAlmostEqual(emul_params["width"] / emul_params["height"], 16.0 / 9.0, places=6)
+
+            headed_calls = run_with_headless(False)
+            self.assertNotIn("Emulation.setDeviceMetricsOverride", [m for m, _ in headed_calls])
+
+    def test_wave4_wave5_gpu_hang_recovery_telemetry_forwarding_and_absence(self):
+        # 1. Verify TELEMETRY_PROBE_JS probes all 6 Wave-4/Wave-5 GPU hang & recovery fields
+        for token in (
+            "gpuHangRecovery",
+            "coalescedPresents",
+            "oversizedWgslFallbacks",
+            "deviceLostCount",
+            "deviceRecoveredCount",
+            "swapchainProbeInFlight",
+            "rangedPackActive",
+        ):
+            self.assertIn(token, rbb.TELEMETRY_PROBE_JS)
+
+        # 2. When absent from diagnostics/stats, none of the 6 fields are fabricated
+        clean_sess = make_fake_session_result(probe=make_sample_probe())
+        clean_rep = rbb.build_boot_report(clean_sess, smoke=False, preset="smoke")
+        clean_tel = rbb.build_telemetry_payload(clean_sess, smoke=False, preset="smoke", headless=True)
+        for key in rbb.GPU_HANG_RECOVERY_KEYS:
+            self.assertNotIn(key, clean_rep["summary"])
+            self.assertNotIn(key, clean_tel["summary"])
+            self.assertNotIn(key, clean_tel)
+
+        # 3. Live multi-poll session preserves peak counters + latest booleans across telemetry.json,
+        #    boot-report.json summary, and digest.txt
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            run_dir = fx.build / "runs" / "wave5-telemetry"
+            run_dir.mkdir(parents=True)
+            fake_clock = {"t": 10.0}
+            poll_idx = {"n": 0}
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            class Wave5Cdp:
+                def __init__(self, ws_url: str):
+                    pass
+
+                def connect(self):
+                    pass
+
+                def close(self):
+                    pass
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Runtime.evaluate":
+                        poll_idx["n"] += 1
+                        probe = make_sample_probe(boot_mode="real-wasm64", session_state="running_wasm")
+                        if poll_idx["n"] == 1:
+                            probe["bootState"]["gpu"]["coalescedPresents"] = 14
+                            probe["bootState"]["gpu"]["oversizedWgslFallbacks"] = 3
+                            probe["bootState"]["gpu"]["deviceLostCount"] = 1
+                            probe["bootState"]["gpu"]["deviceRecoveredCount"] = 1
+                            probe["bootState"]["gpu"]["swapchainProbeInFlight"] = True
+                            probe["diagnostics"]["rangedPackActive"] = True
+                        else:
+                            # Final poll: probe finished (swapchainProbeInFlight=False), counters higher/omitted
+                            probe["bootState"]["gpu"]["coalescedPresents"] = 19
+                            probe["bootState"]["gpu"]["swapchainProbeInFlight"] = False
+                            probe["gpuHangRecovery"] = {
+                                "coalescedPresents": 19,
+                                "oversizedWgslFallbacks": 3,
+                                "deviceLostCount": 1,
+                                "deviceRecoveredCount": 1,
+                                "swapchainProbeInFlight": False,
+                                "rangedPackActive": True,
+                            }
+                        return {"result": {"value": probe}}
+                    return {}
+
+                def drain_events(self, timeout=0.0):
+                    fake_clock["t"] += 0.6
+                    return []
+
+            with mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]):
+                sess = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=fx.boot_dir,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=1.0,
+                    headless=True,
+                    smoke=False,
+                    send_input=False,
+                    capture_frames=False,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=Wave5Cdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+
+            rep = rbb.build_boot_report(sess, smoke=False, preset="start-screen")
+            tel = rbb.build_telemetry_payload(sess, smoke=False, preset="start-screen", headless=True)
+            dig = rbb.digest(rep, 0)
+
+            expected = {
+                "coalescedPresents": 19,
+                "oversizedWgslFallbacks": 3,
+                "deviceLostCount": 1,
+                "deviceRecoveredCount": 1,
+                "swapchainProbeInFlight": False,
+                "rangedPackActive": True,
+            }
+            for key, val in expected.items():
+                self.assertEqual(rep["summary"][key], val, f"boot-report summary[{key}]")
+                self.assertEqual(tel["summary"][key], val, f"telemetry summary[{key}]")
+                self.assertEqual(tel[key], val, f"telemetry[{key}]")
+
+            self.assertIn("swapchainProbeInFlight=false", dig)
+            self.assertIn("gpu_hang_recovery:", dig)
+            self.assertIn("coalescedPresents=19", dig)
+            self.assertIn("oversizedWgslFallbacks=3", dig)
+            self.assertIn("deviceLostCount=1", dig)
+            self.assertIn("deviceRecoveredCount=1", dig)
+            self.assertIn("rangedPackActive=true", dig)
+
+        # 4. Fallback from loader coalescedPresentSubmissions & console logs
+        log_sess = make_fake_session_result(
+            probe={
+                **make_sample_probe(),
+                "bootState": {
+                    **make_sample_probe()["bootState"],
+                    "loader": {"coalescedPresentSubmissions": 7},
+                },
+            },
+            console_lines=[
+                "[  1.00s] [console.log] [wgpu_worker] oversizedWgslFallbacks=2 deviceLostCount=1 deviceRecoveredCount=1 swapchainProbeInFlight=true rangedPackActive=false"
+            ],
+        )
+        log_rep = rbb.build_boot_report(log_sess, smoke=False, preset="smoke")
+        log_tel = rbb.build_telemetry_payload(log_sess, smoke=False, preset="smoke", headless=True)
+        self.assertEqual(log_rep["summary"]["coalescedPresents"], 7)
+        self.assertEqual(log_rep["summary"]["oversizedWgslFallbacks"], 2)
+        self.assertEqual(log_rep["summary"]["deviceLostCount"], 1)
+        self.assertEqual(log_rep["summary"]["deviceRecoveredCount"], 1)
+        self.assertIs(log_rep["summary"]["swapchainProbeInFlight"], True)
+        self.assertIs(log_rep["summary"]["rangedPackActive"], False)
+        self.assertEqual(log_tel["coalescedPresents"], 7)
+        self.assertIs(log_tel["swapchainProbeInFlight"], True)
+        self.assertIs(log_tel["rangedPackActive"], False)
 
 
 if __name__ == "__main__":
