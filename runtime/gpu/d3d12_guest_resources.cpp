@@ -3884,7 +3884,7 @@ uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkP
         window_marked_ = marked;
     };
     if (live == nullptr && window_marked_ && !verify_marks && marks != nullptr &&
-        marks->has_unmarked(cpu_va_, static_cast<size_t>(size))) {
+        marks->at_most_half_marked(cpu_va_, static_cast<size_t>(size))) {
         prepare_window();
         if (window_candidates && !verify_marks &&
             std::find(candidate.begin(), candidate.end(), false) != candidate.end()) {

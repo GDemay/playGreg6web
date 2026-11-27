@@ -263,17 +263,22 @@ bool MarkPass::take_dirty(std::vector<uint64_t>* slots) {
     return true;
 }
 
-bool MarkPass::has_unmarked(uint64_t va, size_t len) const {
+bool MarkPass::at_most_half_marked(uint64_t va, size_t len) const {
     if (!scanned_ || !translated(va) || len == 0 || len > kWindowBase + kWindowMaxSize - va) {
         return false;
     }
-    const uint64_t last = slot_of(va + len - 1);
+    const uint64_t end = va + len;
+    const uint64_t last = slot_of(end - 1);
+    uint64_t marked_bytes = 0;
     for (uint64_t slot = slot_of(va); slot <= last; ++slot) {
-        if (scan_marked_[slot] == 0) {
-            return true;
+        if (scan_marked_[slot] != 0) {
+            marked_bytes += std::min(end, slot_va(slot) + kSlotBytes) - std::max(va, slot_va(slot));
+            if (marked_bytes > len / 2) {
+                return false;
+            }
         }
     }
-    return false;
+    return true;
 }
 
 bool MarkPass::take(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets) {

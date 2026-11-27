@@ -594,15 +594,17 @@ void test_write_marks() {
         gw::mark_written(W + 11 * k64K, 1);  // shared slot: keys[0] and keys[1]
         std::vector<uint64_t> dirty;
         CHECK(pass.take_dirty(&dirty) && dirty.size() == 2);
-        CHECK(!pass.has_unmarked(W + 11 * k64K + 5, k64K - 5));
-        CHECK(pass.has_unmarked(W + 10 * k64K + 5, 2 * k64K - 5));
-        CHECK(!pass.has_unmarked(0, k64K) && !pass.has_unmarked(W, 0));
-        CHECK(!pass.has_unmarked(W + gw::kWindowMaxSize - 1, 2));
-        CHECK(!pass.has_unmarked(W, ~uint64_t{0}));
+        CHECK(!pass.at_most_half_marked(W + 11 * k64K + 5, k64K - 5));
+        CHECK(pass.at_most_half_marked(W + 10 * k64K, 2 * k64K));  // exactly half
+        CHECK(!pass.at_most_half_marked(W + 10 * k64K + 5, 2 * k64K - 5));  // over half
+        CHECK(pass.at_most_half_marked(W + 10 * k64K, 2 * k64K - 5));  // below half
+        CHECK(!pass.at_most_half_marked(0, k64K) && !pass.at_most_half_marked(W, 0));
+        CHECK(!pass.at_most_half_marked(W + gw::kWindowMaxSize - 1, 2));
+        CHECK(!pass.at_most_half_marked(W, ~uint64_t{0}));
         std::vector<uint64_t> queried;
         CHECK(pass.take(W + 11 * k64K, k64K, &queried) && queried == std::vector<uint64_t>{0});
         gw::mark_written(W + 10 * k64K, 1);  // a write after the scan belongs to the next pass
-        CHECK(pass.has_unmarked(W + 10 * k64K, 2 * k64K));
+        CHECK(pass.at_most_half_marked(W + 10 * k64K, 2 * k64K));
         CHECK(gw::write_marked(W + 10 * k64K));  // the query did not clear that later write
         std::vector<uint64_t> late;
         CHECK(gw::take_written(W + 10 * k64K, k64K, &late) && late == std::vector<uint64_t>{0});
@@ -620,10 +622,10 @@ void test_write_marks() {
         index.collect(dirty, &visit);
         CHECK(visit.size() == 2);
         pass.begin();
-        CHECK(!pass.has_unmarked(W + 10 * k64K, 2 * k64K));  // no scan yet
+        CHECK(!pass.at_most_half_marked(W + 10 * k64K, 2 * k64K));  // no scan yet
         dirty.clear();
         CHECK(pass.take_dirty(&dirty) && dirty.empty());
-        CHECK(pass.has_unmarked(W + 10 * k64K, 2 * k64K));
+        CHECK(pass.at_most_half_marked(W + 10 * k64K, 2 * k64K));
     }
 
     // Verification counters.
