@@ -50,6 +50,8 @@ const FRAME_BUDGET_TELEMETRY_FIELD_KEYS = Object.freeze([
   'dominantBottleneck',
   'dominant_bottleneck',
   'bottleneck',
+  'frameJitterMs',
+  'frame_jitter_ms',
 ]);
 
 const MEMORY_TELEMETRY_FIELD_KEYS = Object.freeze([
@@ -67,6 +69,22 @@ const MEMORY_TELEMETRY_FIELD_KEYS = Object.freeze([
   'js_heap_used_bytes',
   'jsHeapTotalBytes',
   'js_heap_total_bytes',
+  'liveBufferBytes',
+  'live_buffer_bytes',
+  'liveTextureBytes',
+  'live_texture_bytes',
+  'peakBufferBytes',
+  'peak_buffer_bytes',
+  'peakTextureBytes',
+  'peak_texture_bytes',
+  'stagingPoolBytes',
+  'staging_pool_bytes',
+  'totalLiveGpuBytes',
+  'total_live_gpu_bytes',
+  'vramBytes',
+  'vram_bytes',
+  'wasmLinearMemoryBytes',
+  'wasm_linear_memory_bytes',
 ]);
 
 const IO_TELEMETRY_FIELD_KEYS = Object.freeze([
@@ -175,6 +193,28 @@ const GPU_TELEMETRY_FIELD_KEYS = Object.freeze([
   'loading_assets',
   'isLoadingAssets',
   'is_loading_assets',
+  'rangedShaderReady',
+  'ranged_shader_ready',
+  'rangedShaderFetches',
+  'ranged_shader_fetches',
+  'rangedShaderErrors',
+  'ranged_shader_errors',
+  'asyncShaderPendingCount',
+  'async_shader_pending_count',
+  'rangedPackActive',
+  'ranged_pack_active',
+  'swapchainFormat',
+  'swapchain_format',
+  'swapchainColorMode',
+  'swapchain_color_mode',
+  'toneMapMode',
+  'tone_map_mode',
+  'isHdrStream',
+  'is_hdr_stream',
+  'toneMapActive',
+  'tone_map_active',
+  'applySrgbEncode',
+  'apply_srgb_encode',
 ]);
 
 const GUEST_AUDIO_TELEMETRY_FIELD_KEYS = Object.freeze([
@@ -363,6 +403,11 @@ const SUPPORTED_DISPLAY_ELEMENTS = Object.freeze([
   'bottleneckEl',
   'memoryStatsEl',
   'jsHeapEl',
+  'gpuMemoryEl',
+  'vramStatsEl',
+  'wasmMemoryEl',
+  'shaderStreamingEl',
+  'swapchainColorModeEl',
   'ioMailboxLanesEl',
   'mailboxLanesEl',
   'opfsWarmBootEl',
@@ -419,6 +464,192 @@ function toErrorMessage(err, fallback = 'Unknown error') {
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+const ALLOWED_SWAPCHAIN_FORMATS = new Set([
+  'bgra8unorm',
+  'bgra8unorm-srgb',
+  'rgba8unorm',
+  'rgba8unorm-srgb',
+  'rgba16float',
+  'rgb10a2unorm',
+  'rgb10a2uint',
+  'rg11b10ufloat',
+  'rgb9e5ufloat',
+  'rgba32float',
+  'r8unorm',
+  'rg8unorm',
+  'r16float',
+  'rg16float',
+  'r32float',
+  'rg32float',
+]);
+
+const ALLOWED_SWAPCHAIN_COLOR_MODES = new Set([
+  'sdr-srgb',
+  'sdr-linear',
+  'sdr-tonemap',
+  'sdr-passthrough',
+  'direct-srgb',
+  'srgb-encode',
+  'hdr-linear',
+  'hdr-tonemap',
+  'hdr-tonemap-aces',
+  'hdr-tonemap-reinhard',
+  'hdr-scrgb',
+  'hdr-pq',
+]);
+
+const ALLOWED_TONE_MAP_MODES = new Set(['none', 'reinhard', 'aces']);
+
+function sanitizeSwapchainFormatToken(raw) {
+  if (typeof raw !== 'string') return null;
+  const token = raw.trim().toLowerCase();
+  return token.length > 0 && token.length <= 32 && ALLOWED_SWAPCHAIN_FORMATS.has(token)
+    ? token
+    : null;
+}
+
+function sanitizeToneMapModeToken(raw) {
+  if (typeof raw !== 'string') return null;
+  const token = raw.trim().toLowerCase();
+  return ALLOWED_TONE_MAP_MODES.has(token) ? token : null;
+}
+
+/**
+ * Sanitizes a swapchain color mode string against a strict allowlist or derives
+ * a canonical mode from toneMapMode / isHdrStream / toneMapActive / applySrgbEncode / swapchainFormat.
+ *
+ * @param {unknown} raw
+ * @param {object} [ctx]
+ * @returns {string|null}
+ */
+export function normalizeSwapchainColorMode(raw, ctx = null) {
+  if (typeof raw === 'string') {
+    const token = raw
+      .trim()
+      .toLowerCase()
+      .replace(/[\s_]+/g, '-');
+    if (token.length > 0 && token.length <= 32 && ALLOWED_SWAPCHAIN_COLOR_MODES.has(token)) {
+      return token;
+    }
+  }
+  if (ctx && typeof ctx === 'object') {
+    const toneMapMode = sanitizeToneMapModeToken(ctx.toneMapMode);
+    const isHdr = Boolean(ctx.isHdrStream);
+    const toneMapActive = Boolean(ctx.toneMapActive);
+    const applySrgb = typeof ctx.applySrgbEncode === 'boolean' ? ctx.applySrgbEncode : null;
+    const fmt = sanitizeSwapchainFormatToken(ctx.swapchainFormat);
+    if (toneMapActive) {
+      if (toneMapMode === 'aces') return 'hdr-tonemap-aces';
+      if (toneMapMode === 'reinhard') return 'hdr-tonemap-reinhard';
+      return 'hdr-tonemap';
+    }
+    if (isHdr || fmt === 'rgba16float' || fmt === 'rg11b10ufloat' || fmt === 'rgba32float') {
+      if (toneMapMode === 'aces') return 'hdr-tonemap-aces';
+      if (toneMapMode === 'reinhard') return 'hdr-tonemap-reinhard';
+      return 'hdr-linear';
+    }
+    if (applySrgb === true) {
+      return 'srgb-encode';
+    }
+    if (fmt && fmt.endsWith('-srgb')) {
+      return 'sdr-srgb';
+    }
+    if (fmt && (fmt === 'bgra8unorm' || fmt === 'rgba8unorm' || fmt === 'rgb10a2unorm')) {
+      return 'sdr-passthrough';
+    }
+  }
+  return null;
+}
+
+/**
+ * Recursively clones a value into a JSON-safe structure that never throws on
+ * BigInt values, circular object graphs, Error instances, or typed arrays.
+ *
+ * @param {unknown} value
+ * @param {WeakSet<object>} [seen]
+ * @param {number} [depth]
+ * @returns {unknown}
+ */
+export function sanitizeForJson(value, seen = new WeakSet(), depth = 0) {
+  if (value === null || value === undefined) {
+    return value === undefined ? null : null;
+  }
+  const kind = typeof value;
+  if (kind === 'boolean') return value;
+  if (kind === 'number') return Number.isFinite(value) ? value : null;
+  if (kind === 'bigint') return value.toString();
+  if (kind === 'string') return value;
+  if (kind === 'symbol' || kind === 'function') return undefined;
+  if (depth >= 12) return '[MaxDepth]';
+
+  if (value instanceof Error) {
+    return {
+      name: typeof value.name === 'string' ? value.name : 'Error',
+      message: sanitizeString(typeof value.message === 'string' ? value.message : ''),
+    };
+  }
+  if (value instanceof Date) {
+    return Number.isFinite(value.getTime()) ? value.toISOString() : null;
+  }
+  if (ArrayBuffer.isView(value)) {
+    return `[TypedArray byteLength=${value.byteLength}]`;
+  }
+  if (value instanceof ArrayBuffer) {
+    return `[ArrayBuffer byteLength=${value.byteLength}]`;
+  }
+
+  if (typeof value === 'object') {
+    if (seen.has(value)) {
+      return '[Circular]';
+    }
+    seen.add(value);
+    try {
+      if (Array.isArray(value)) {
+        const out = [];
+        const cap = Math.min(value.length, 512);
+        for (let i = 0; i < cap; i += 1) {
+          const item = sanitizeForJson(value[i], seen, depth + 1);
+          out.push(item === undefined ? null : item);
+        }
+        return out;
+      }
+      const out = {};
+      const keys = Object.keys(value);
+      for (let i = 0; i < keys.length; i += 1) {
+        const key = keys[i];
+        let propVal;
+        try {
+          propVal = value[key];
+        } catch {
+          propVal = '[Unreadable]';
+        }
+        if (propVal === undefined || typeof propVal === 'function' || typeof propVal === 'symbol') {
+          continue;
+        }
+        const cleaned = sanitizeForJson(propVal, seen, depth + 1);
+        if (cleaned !== undefined) {
+          out[key] = cleaned;
+        }
+      }
+      return out;
+    } finally {
+      seen.delete(value);
+    }
+  }
+  return null;
+}
+
+/**
+ * Serializes any value to JSON safely without throwing on BigInt or circular references.
+ *
+ * @param {unknown} value
+ * @param {number} [space=2]
+ * @returns {string}
+ */
+export function safeJsonStringify(value, space = 2) {
+  return JSON.stringify(sanitizeForJson(value), null, space);
 }
 
 function toUint8Array(data) {
@@ -899,6 +1130,74 @@ function formatMemoryValueText(usedMb, totalMb) {
     return `-- / ${formatRoundedMbValue(totalMb)} MB`;
   }
   return '';
+}
+
+function formatMemoryByteSize(bytes) {
+  if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) {
+    return '';
+  }
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+  }
+  if (bytes >= 1024 * 1024) {
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  }
+  if (bytes >= 1024) {
+    return `${(bytes / 1024).toFixed(1)} KiB`;
+  }
+  return `${Math.floor(bytes)} B`;
+}
+
+function formatGpuMemoryValueText(m) {
+  if (!isPlainObject(m)) {
+    return '';
+  }
+  const totalLive =
+    m.totalLiveGpuBytes !== null && m.totalLiveGpuBytes !== undefined
+      ? m.totalLiveGpuBytes
+      : m.liveBufferBytes !== null || m.liveTextureBytes !== null
+        ? (m.liveBufferBytes || 0) + (m.liveTextureBytes || 0)
+        : m.vramBytes;
+  const totalPeak =
+    m.peakBufferBytes !== null || m.peakTextureBytes !== null
+      ? (m.peakBufferBytes || 0) + (m.peakTextureBytes || 0)
+      : null;
+  if (totalLive === null || totalLive === undefined) {
+    if (totalPeak !== null) {
+      return `peak ${formatMemoryByteSize(totalPeak)}`;
+    }
+    return '';
+  }
+  const parts = [];
+  if (m.liveBufferBytes !== null && m.liveBufferBytes !== undefined) {
+    parts.push(`buf ${formatMemoryByteSize(m.liveBufferBytes)}`);
+  }
+  if (m.liveTextureBytes !== null && m.liveTextureBytes !== undefined) {
+    parts.push(`tex ${formatMemoryByteSize(m.liveTextureBytes)}`);
+  }
+  if (totalPeak !== null && totalPeak > 0) {
+    parts.push(`peak ${formatMemoryByteSize(totalPeak)}`);
+  }
+  const base = formatMemoryByteSize(totalLive);
+  return parts.length > 0 ? `${base} (${parts.join(', ')})` : base;
+}
+
+function formatShaderStreamingValueText(g) {
+  if (!isPlainObject(g)) {
+    return '';
+  }
+  const hasReady = typeof g.rangedShaderReady === 'number';
+  const hasFetches = typeof g.rangedShaderFetches === 'number';
+  if (!hasReady && !hasFetches) {
+    return g.rangedPackActive === true ? 'Active' : '';
+  }
+  const ready = hasReady ? g.rangedShaderReady : 0;
+  const fetches = hasFetches ? g.rangedShaderFetches : 0;
+  const pending =
+    typeof g.asyncShaderPendingCount === 'number' && g.asyncShaderPendingCount > 0
+      ? ` (${g.asyncShaderPendingCount} pending)`
+      : '';
+  return `${ready} ready · ${fetches} fetch${fetches === 1 ? '' : 'es'}${pending}`;
 }
 
 /**
@@ -1899,6 +2198,17 @@ function createInitialGpuTelemetry() {
     blackLoadingMs: null,
     firstVisibleFrameMs: null,
     loadingAssets: false,
+    rangedShaderReady: null,
+    rangedShaderFetches: null,
+    rangedShaderErrors: null,
+    asyncShaderPendingCount: null,
+    rangedPackActive: null,
+    swapchainFormat: null,
+    swapchainColorMode: null,
+    toneMapMode: null,
+    isHdrStream: false,
+    toneMapActive: false,
+    applySrgbEncode: null,
     updatedAtMs: null,
   };
 }
@@ -1932,6 +2242,7 @@ function createInitialFrameBudgetTelemetry() {
   return {
     fps30ComplianceRate: null,
     dominantBottleneck: null,
+    frameJitterMs: null,
     updatedAtMs: null,
   };
 }
@@ -1940,6 +2251,14 @@ function createInitialMemoryTelemetry() {
   return {
     jsHeapUsedMb: null,
     jsHeapTotalMb: null,
+    liveBufferBytes: null,
+    liveTextureBytes: null,
+    peakBufferBytes: null,
+    peakTextureBytes: null,
+    stagingPoolBytes: null,
+    totalLiveGpuBytes: null,
+    vramBytes: null,
+    wasmLinearMemoryBytes: null,
     updatedAtMs: null,
   };
 }
@@ -2442,6 +2761,8 @@ export class HudController {
     this._lastPushedBootStage = null;
     this._lastPushedProgressPct = -1;
     this._lastSeenAppFrames = 0;
+    this._baselineAppValidationErrorCount = 0;
+    this._inSetVisible = false;
     this._ignoredStaleAppStage = null;
     this._lastExternalHudStatus = null;
     this._lastConciseHudStatus = null;
@@ -3032,7 +3353,7 @@ export class HudController {
         );
       }
 
-      const json = JSON.stringify(snapshot, null, 2);
+      const json = safeJsonStringify(snapshot, 2);
       const filename = DEFAULT_FILENAMES.USERDATA_BACKUP;
       const downloaded = await this._triggerDownload(filename, json, 'application/json');
 
@@ -3347,16 +3668,104 @@ export class HudController {
         serverStatus = sessionDiagnostics.serverStatus;
       }
 
+      const telemetrySnap = this.getTelemetry();
+      const panel = this._getGpuBootPanel();
+      let panelState = null;
+      if (panel && typeof panel.getState === 'function') {
+        try {
+          panelState = panel.getState();
+        } catch {
+          panelState = null;
+        }
+      }
+      const panelGpuMem =
+        panelState && isPlainObject(panelState.gpuMemoryStats) ? panelState.gpuMemoryStats : null;
+      const panelMem =
+        panelState && isPlainObject(panelState.memoryStats) ? panelState.memoryStats : null;
+      const panelShader =
+        panelState && isPlainObject(panelState.shaderStreamingStats)
+          ? panelState.shaderStreamingStats
+          : null;
+      const panelColor =
+        panelState && isPlainObject(panelState.swapchainColorStats)
+          ? panelState.swapchainColorStats
+          : null;
+      const panelCompat =
+        panelState && isPlainObject(panelState.compatStats) ? panelState.compatStats : null;
+
+      const mem = telemetrySnap.memory;
+      const gpu = telemetrySnap.gpu;
+      const deduplicatedErrors = this.getDeduplicatedValidationErrors();
+      const hudExtra = {
+        memory_stats: {
+          jsHeapUsedMb: mem.jsHeapUsedMb ?? (panelMem ? panelMem.jsHeapUsedMb : null),
+          jsHeapTotalMb: mem.jsHeapTotalMb,
+          vramBudgetUtilization: panelMem ? panelMem.vramBudgetUtilization : null,
+          liveBufferBytes: mem.liveBufferBytes ?? (panelGpuMem ? panelGpuMem.liveBufferBytes : null),
+          liveTextureBytes:
+            mem.liveTextureBytes ?? (panelGpuMem ? panelGpuMem.liveTextureBytes : null),
+          peakBufferBytes: mem.peakBufferBytes ?? (panelGpuMem ? panelGpuMem.peakBufferBytes : null),
+          peakTextureBytes:
+            mem.peakTextureBytes ?? (panelGpuMem ? panelGpuMem.peakTextureBytes : null),
+          stagingPoolBytes:
+            mem.stagingPoolBytes ?? (panelGpuMem ? panelGpuMem.stagingPoolBytes : null),
+          totalLiveGpuBytes:
+            mem.totalLiveGpuBytes ?? (panelGpuMem ? panelGpuMem.totalLiveGpuBytes : null),
+          vramBytes: mem.vramBytes ?? (panelGpuMem ? panelGpuMem.totalLiveGpuBytes : null),
+          wasmLinearMemoryBytes:
+            mem.wasmLinearMemoryBytes ?? (panelGpuMem ? panelGpuMem.wasmLinearMemoryBytes : null),
+        },
+        swapchainFormat: gpu.swapchainFormat ?? (panelCompat ? panelCompat.swapchainFormat : null),
+        swapchainColorMode:
+          gpu.swapchainColorMode ?? (panelColor ? panelColor.swapchainColorMode : null),
+        shaderStreaming: {
+          rangedShaderReady:
+            gpu.rangedShaderReady ?? (panelShader ? panelShader.rangedShaderReady : null),
+          rangedShaderFetches:
+            gpu.rangedShaderFetches ?? (panelShader ? panelShader.rangedShaderFetches : null),
+          rangedShaderErrors:
+            gpu.rangedShaderErrors ?? (panelShader ? panelShader.rangedShaderErrors : null),
+          asyncShaderPendingCount:
+            gpu.asyncShaderPendingCount ??
+            (panelShader ? panelShader.asyncShaderPendingCount : null),
+          rangedPackActive:
+            gpu.rangedPackActive ?? (panelShader ? panelShader.rangedPackActive : null),
+        },
+        gpuValidationErrors: {
+          totalCount: this._validationErrorCount,
+          uniqueCount: deduplicatedErrors.length,
+          deduplicated: deduplicatedErrors,
+        },
+      };
+
       const reportInput = {
         perfSnapshot,
         storageSummary,
         serverStatus,
       };
       if (opts.extra !== undefined) {
-        reportInput.extra = opts.extra;
+        const safeCallerExtra = sanitizeForJson(opts.extra);
+        reportInput.extra = isPlainObject(safeCallerExtra)
+          ? { ...hudExtra, ...safeCallerExtra }
+          : { ...hudExtra, callerExtra: safeCallerExtra };
+      } else {
+        reportInput.extra = hudExtra;
       }
 
-      const json = this._crashReporter.toJson(reportInput);
+      let json;
+      try {
+        json = this._crashReporter.toJson(reportInput);
+      } catch (serializeErr) {
+        const msg = toErrorMessage(serializeErr, '');
+        if (
+          serializeErr instanceof TypeError &&
+          /bigint|circular|converting circular/i.test(msg)
+        ) {
+          json = this._crashReporter.toJson(sanitizeForJson(reportInput));
+        } else {
+          throw serializeErr;
+        }
+      }
       const filename = DEFAULT_FILENAMES.CRASH_REPORT;
       const downloaded = await this._triggerDownload(filename, json, 'application/json');
       const copied = opts.copyToClipboard === true
@@ -3913,6 +4322,7 @@ export class HudController {
   _captureAppFramesBaseline() {
     let appFrames = 0;
     let appStage = null;
+    let appValErrors = 0;
     const app = this._app;
     if (!app || typeof app !== 'object') {
       this._lastSeenAppFrames = 0;
@@ -3933,6 +4343,8 @@ export class HudController {
         if (p > appFrames) appFrames = p;
         const m = normalizeBootMilestone(bt && bt.milestone);
         if (m) appStage = m;
+        const ve = toNonNegativeInt(bt && (bt.gpu?.validationErrorCount ?? bt.validationErrorCount), 0);
+        if (ve > appValErrors) appValErrors = ve;
       }
     } catch {
       // Ignore optional app telemetry errors.
@@ -3951,6 +4363,7 @@ export class HudController {
       // Ignore optional diagnostics snapshot errors.
     }
     this._lastSeenAppFrames = appFrames;
+    this._baselineAppValidationErrorCount = appValErrors;
     this._ignoredStaleAppStage = appStage;
   }
 
@@ -4054,10 +4467,31 @@ export class HudController {
             this._hasGpuTelemetry = true;
             telemetryChanged = true;
           }
-          if (ve !== null && ve > this._validationErrorCount) {
-            this._gpuTelemetry.validationErrorCount = ve;
-            this._validationErrorCount = ve;
-            telemetryChanged = true;
+          if (ve !== null) {
+            if (ve < this._baselineAppValidationErrorCount) {
+              this._baselineAppValidationErrorCount = ve;
+            }
+            const effectiveVe = Math.max(0, ve - this._baselineAppValidationErrorCount);
+            if (effectiveVe > this._validationErrorCount) {
+              this._gpuTelemetry.validationErrorCount = effectiveVe;
+              this._validationErrorCount = effectiveVe;
+              telemetryChanged = true;
+            }
+          }
+          if (isPlainObject(safeGet(appGpu, 'gpuMemory'))) {
+            if (this._applyMemoryTelemetry(safeGet(appGpu, 'gpuMemory'), appGpu)) {
+              telemetryChanged = true;
+            }
+          }
+          if (isPlainObject(safeGet(appGpu, 'shaderPackStats'))) {
+            if (this._applyGpuTelemetry(safeGet(appGpu, 'shaderPackStats'), appGpu)) {
+              telemetryChanged = true;
+            }
+          }
+          if (isPlainObject(safeGet(appGpu, 'swapchainStats'))) {
+            if (this._applyGpuTelemetry(safeGet(appGpu, 'swapchainStats'), appGpu)) {
+              telemetryChanged = true;
+            }
           }
           const appLowFps = toNonNegativeFiniteNumber(
             pickFirstDefined(appGpu, ['onePercentLowFps', 'one_percent_low_fps']),
@@ -4392,6 +4826,13 @@ export class HudController {
       this._gpuTelemetry.validationErrorCount = sanitizedValErrs;
       if (sanitizedValErrs > this._validationErrorCount) {
         this._validationErrorCount = sanitizedValErrs;
+      } else if (
+        sanitizedValErrs === 0 &&
+        this._validationErrors.length === 0 &&
+        this._validationErrorCount > 0
+      ) {
+        this._validationErrorCount = 0;
+        this._lastConciseHudStatus = null;
       }
       touched = true;
     }
@@ -4438,6 +4879,134 @@ export class HudController {
     if (rawZeroCopy !== undefined) {
       this._gpuTelemetry.zeroCopyUploads = toNonNegativeInt(rawZeroCopy, null);
       touched = true;
+    }
+
+    const rawShaderReady = pickTelemetryField(primary, secondary, [
+      'rangedShaderReady',
+      'ranged_shader_ready',
+    ]);
+    if (rawShaderReady !== undefined) {
+      this._gpuTelemetry.rangedShaderReady =
+        rawShaderReady === null ? null : toNonNegativeInt(rawShaderReady, null);
+      touched = true;
+    }
+
+    const rawShaderFetches = pickTelemetryField(primary, secondary, [
+      'rangedShaderFetches',
+      'ranged_shader_fetches',
+    ]);
+    if (rawShaderFetches !== undefined) {
+      this._gpuTelemetry.rangedShaderFetches =
+        rawShaderFetches === null ? null : toNonNegativeInt(rawShaderFetches, null);
+      touched = true;
+    }
+
+    const rawShaderErrors = pickTelemetryField(primary, secondary, [
+      'rangedShaderErrors',
+      'ranged_shader_errors',
+    ]);
+    if (rawShaderErrors !== undefined) {
+      this._gpuTelemetry.rangedShaderErrors =
+        rawShaderErrors === null ? null : toNonNegativeInt(rawShaderErrors, null);
+      touched = true;
+    }
+
+    const rawShaderPending = pickTelemetryField(primary, secondary, [
+      'asyncShaderPendingCount',
+      'async_shader_pending_count',
+    ]);
+    if (rawShaderPending !== undefined) {
+      this._gpuTelemetry.asyncShaderPendingCount =
+        rawShaderPending === null ? null : toNonNegativeInt(rawShaderPending, null);
+      touched = true;
+    }
+
+    const rawRangedActive = pickTelemetryField(primary, secondary, [
+      'rangedPackActive',
+      'ranged_pack_active',
+    ]);
+    if (rawRangedActive !== undefined) {
+      this._gpuTelemetry.rangedPackActive =
+        rawRangedActive === null ? null : Boolean(rawRangedActive);
+      touched = true;
+    }
+
+    const rawSwapFormat = pickTelemetryField(primary, secondary, [
+      'swapchainFormat',
+      'swapchain_format',
+      'streamFormat',
+    ]);
+    if (rawSwapFormat !== undefined) {
+      this._gpuTelemetry.swapchainFormat = sanitizeSwapchainFormatToken(rawSwapFormat);
+      touched = true;
+    }
+
+    const rawToneMap = pickTelemetryField(primary, secondary, ['toneMapMode', 'tone_map_mode']);
+    if (rawToneMap !== undefined) {
+      this._gpuTelemetry.toneMapMode = sanitizeToneMapModeToken(rawToneMap);
+      touched = true;
+    }
+
+    const rawIsHdr = pickTelemetryField(primary, secondary, ['isHdrStream', 'is_hdr_stream']);
+    if (rawIsHdr !== undefined) {
+      this._gpuTelemetry.isHdrStream = Boolean(rawIsHdr);
+      touched = true;
+    }
+
+    const rawToneActive = pickTelemetryField(primary, secondary, [
+      'toneMapActive',
+      'tone_map_active',
+    ]);
+    if (rawToneActive !== undefined) {
+      this._gpuTelemetry.toneMapActive = Boolean(rawToneActive);
+      touched = true;
+    }
+
+    const rawApplySrgb = pickTelemetryField(primary, secondary, [
+      'applySrgbEncode',
+      'apply_srgb_encode',
+    ]);
+    if (rawApplySrgb !== undefined) {
+      this._gpuTelemetry.applySrgbEncode =
+        typeof rawApplySrgb === 'boolean' ? rawApplySrgb : null;
+      touched = true;
+    }
+
+    const rawColorMode = pickTelemetryField(primary, secondary, [
+      'swapchainColorMode',
+      'swapchain_color_mode',
+    ]);
+    if (rawColorMode !== undefined) {
+      this._gpuTelemetry.swapchainColorMode =
+        rawColorMode === null
+          ? null
+          : normalizeSwapchainColorMode(rawColorMode, this._gpuTelemetry);
+      touched = true;
+    } else if (
+      rawSwapFormat !== undefined ||
+      rawToneMap !== undefined ||
+      rawIsHdr !== undefined ||
+      rawToneActive !== undefined ||
+      rawApplySrgb !== undefined
+    ) {
+      const derivedColorMode = normalizeSwapchainColorMode(null, this._gpuTelemetry);
+      if (derivedColorMode !== null) {
+        this._gpuTelemetry.swapchainColorMode = derivedColorMode;
+      }
+    }
+
+    const nestedGpuMemory =
+      (isPlainObject(safeGet(primary, 'gpuMemory')) && safeGet(primary, 'gpuMemory')) ||
+      (isPlainObject(safeGet(primary, 'gpu_memory')) && safeGet(primary, 'gpu_memory')) ||
+      null;
+    if (nestedGpuMemory) {
+      if (this._applyMemoryTelemetry(nestedGpuMemory, primary)) {
+        touched = true;
+      }
+    } else if (hasAnyDefinedKey(primary, MEMORY_TELEMETRY_FIELD_KEYS)) {
+      if (this._applyMemoryTelemetry(primary)) {
+        touched = true;
+      }
     }
 
     const rawGpuAdapter = pickTelemetryField(primary, secondary, [
@@ -4733,10 +5302,17 @@ export class HudController {
       touched = true;
     }
 
+    const rawJitter = pickTelemetryField(primary, secondary, ['frameJitterMs', 'frame_jitter_ms']);
+    if (rawJitter !== undefined) {
+      this._frameBudgetTelemetry.frameJitterMs = toNonNegativeFiniteNumber(rawJitter, null);
+      touched = true;
+    }
+
     if (touched) {
       this._hasFrameBudgetTelemetry =
         this._frameBudgetTelemetry.fps30ComplianceRate !== null ||
-        this._frameBudgetTelemetry.dominantBottleneck !== null;
+        this._frameBudgetTelemetry.dominantBottleneck !== null ||
+        this._frameBudgetTelemetry.frameJitterMs !== null;
       this._frameBudgetTelemetry.updatedAtMs = this._safeNowMs();
     }
     return touched;
@@ -4798,10 +5374,57 @@ export class HudController {
       }
     }
 
+    const gpuMemSub =
+      (isPlainObject(safeGet(primary, 'gpuMemory')) && safeGet(primary, 'gpuMemory')) ||
+      (isPlainObject(safeGet(primary, 'gpu_memory')) && safeGet(primary, 'gpu_memory')) ||
+      (secondary && isPlainObject(safeGet(secondary, 'gpuMemory')) && safeGet(secondary, 'gpuMemory')) ||
+      null;
+    const memPrimary = gpuMemSub || primary;
+    const memSecondary = gpuMemSub ? primary : secondary;
+
+    const applyMemBytes = (prop, keys) => {
+      const raw = pickTelemetryField(memPrimary, memSecondary, keys);
+      if (raw !== undefined) {
+        this._memoryTelemetry[prop] = raw === null ? null : toNonNegativeInt(raw, null);
+        touched = true;
+      }
+    };
+
+    applyMemBytes('liveBufferBytes', ['liveBufferBytes', 'live_buffer_bytes']);
+    applyMemBytes('liveTextureBytes', ['liveTextureBytes', 'live_texture_bytes']);
+    applyMemBytes('peakBufferBytes', ['peakBufferBytes', 'peak_buffer_bytes']);
+    applyMemBytes('peakTextureBytes', ['peakTextureBytes', 'peak_texture_bytes']);
+    applyMemBytes('stagingPoolBytes', ['stagingPoolBytes', 'staging_pool_bytes']);
+    applyMemBytes('totalLiveGpuBytes', ['totalLiveGpuBytes', 'total_live_gpu_bytes']);
+    applyMemBytes('vramBytes', ['vramBytes', 'vram_bytes']);
+    applyMemBytes('wasmLinearMemoryBytes', ['wasmLinearMemoryBytes', 'wasm_linear_memory_bytes']);
+
+    if (
+      this._memoryTelemetry.liveBufferBytes !== null ||
+      this._memoryTelemetry.liveTextureBytes !== null
+    ) {
+      const sumLive =
+        (this._memoryTelemetry.liveBufferBytes || 0) +
+        (this._memoryTelemetry.liveTextureBytes || 0);
+      if (
+        pickTelemetryField(memPrimary, memSecondary, ['totalLiveGpuBytes', 'total_live_gpu_bytes']) ===
+        undefined
+      ) {
+        this._memoryTelemetry.totalLiveGpuBytes = sumLive;
+      }
+    }
+
     if (touched) {
       this._hasMemoryTelemetry =
         this._memoryTelemetry.jsHeapUsedMb !== null ||
-        this._memoryTelemetry.jsHeapTotalMb !== null;
+        this._memoryTelemetry.jsHeapTotalMb !== null ||
+        this._memoryTelemetry.liveBufferBytes !== null ||
+        this._memoryTelemetry.liveTextureBytes !== null ||
+        this._memoryTelemetry.peakBufferBytes !== null ||
+        this._memoryTelemetry.peakTextureBytes !== null ||
+        this._memoryTelemetry.totalLiveGpuBytes !== null ||
+        this._memoryTelemetry.vramBytes !== null ||
+        this._memoryTelemetry.wasmLinearMemoryBytes !== null;
       this._memoryTelemetry.updatedAtMs = this._safeNowMs();
     }
     return touched;
@@ -5229,6 +5852,36 @@ export class HudController {
         if (this._applyFrameBudgetTelemetry(payload)) {
           changed = true;
         }
+      }
+    }
+
+    const shaderPackNested =
+      (isPlainObject(safeGet(payload, 'shaderPackStats')) && safeGet(payload, 'shaderPackStats')) ||
+      (isPlainObject(safeGet(payload, 'shaderStreaming')) && safeGet(payload, 'shaderStreaming')) ||
+      null;
+    if (shaderPackNested) {
+      if (this._applyGpuTelemetry(shaderPackNested, payload)) {
+        changed = true;
+      }
+    }
+
+    const swapchainNested =
+      (isPlainObject(safeGet(payload, 'swapchainStats')) && safeGet(payload, 'swapchainStats')) ||
+      (isPlainObject(safeGet(payload, 'swapchain')) && safeGet(payload, 'swapchain')) ||
+      null;
+    if (swapchainNested) {
+      if (this._applyGpuTelemetry(swapchainNested, payload)) {
+        changed = true;
+      }
+    }
+
+    const gpuMemoryNested =
+      (isPlainObject(safeGet(payload, 'gpuMemory')) && safeGet(payload, 'gpuMemory')) ||
+      (isPlainObject(safeGet(payload, 'gpu_memory')) && safeGet(payload, 'gpu_memory')) ||
+      null;
+    if (gpuMemoryNested) {
+      if (this._applyMemoryTelemetry(gpuMemoryNested, payload)) {
+        changed = true;
       }
     }
 
@@ -5911,6 +6564,9 @@ export class HudController {
     const opts = isPlainObject(options) ? options : {};
     this._gpuTelemetry = createInitialGpuTelemetry();
     this._lastRawGpuAdapter = undefined;
+    this._validationErrors = [];
+    this._validationErrorCount = 0;
+    this._validationErrorSeq = 0;
     this._audioTelemetry = createInitialAudioTelemetry();
     this._pthreadTelemetry = createInitialPthreadTelemetry();
     this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
@@ -6070,6 +6726,18 @@ export class HudController {
         blackLoadingText,
         firstVisibleFrameText,
         loadingStatusText,
+        rangedShaderReady: g.rangedShaderReady,
+        rangedShaderFetches: g.rangedShaderFetches,
+        rangedShaderErrors: g.rangedShaderErrors,
+        asyncShaderPendingCount: g.asyncShaderPendingCount,
+        rangedPackActive: g.rangedPackActive,
+        shaderStreamingText: formatShaderStreamingValueText(g),
+        swapchainFormat: g.swapchainFormat,
+        swapchainColorMode: g.swapchainColorMode,
+        toneMapMode: g.toneMapMode,
+        isHdrStream: g.isHdrStream,
+        toneMapActive: g.toneMapActive,
+        applySrgbEncode: g.applySrgbEncode,
         unboundBindGroupCount: g.unboundBindGroupCount,
         skippedDrawCount: g.skippedDrawCount,
         validationErrorCount: g.validationErrorCount,
@@ -6107,6 +6775,7 @@ export class HudController {
       frameBudget: {
         fps30ComplianceRate: fb.fps30ComplianceRate,
         dominantBottleneck: fb.dominantBottleneck,
+        frameJitterMs: fb.frameJitterMs,
         valueText: frameBudgetValueText,
         statusText: frameBudgetStatusText,
         state: frameBudgetState,
@@ -6115,6 +6784,16 @@ export class HudController {
       memory: {
         jsHeapUsedMb: m.jsHeapUsedMb,
         jsHeapTotalMb: m.jsHeapTotalMb,
+        liveBufferBytes: m.liveBufferBytes,
+        liveTextureBytes: m.liveTextureBytes,
+        peakBufferBytes: m.peakBufferBytes,
+        peakTextureBytes: m.peakTextureBytes,
+        stagingPoolBytes: m.stagingPoolBytes,
+        totalLiveGpuBytes: m.totalLiveGpuBytes,
+        vramBytes: m.vramBytes,
+        wasmLinearMemoryBytes: m.wasmLinearMemoryBytes,
+        gpuMemoryText: formatGpuMemoryValueText(m),
+        wasmMemoryText: formatMemoryByteSize(m.wasmLinearMemoryBytes),
         valueText: memoryValueText,
         statusText: memoryStatusText,
         state: memoryState,
@@ -6778,30 +7457,92 @@ export class HudController {
         ? Math.floor(opts.totalCount)
         : null;
 
+    const hadErrors = this._validationErrorCount > 0;
     this._validationErrors = bounded;
     this._validationErrorCount =
       explicitTotal !== null
         ? Math.max(explicitTotal, sanitizedAll.length)
         : sanitizedAll.length;
+    this._gpuTelemetry.validationErrorCount = this._validationErrorCount;
     this._validationErrorSeq = Math.max(this._validationErrorSeq, maxSeq, this._validationErrorCount);
+    if (hadErrors && this._validationErrorCount === 0) {
+      this._lastConciseHudStatus = null;
+    }
 
-    this._renderBootDiagnostics({ updateHudStatus: false, force: opts.force === true });
+    this._renderBootDiagnostics({
+      updateHudStatus:
+        opts.updateHudStatus !== undefined
+          ? opts.updateHudStatus === true
+          : hadErrors && this._validationErrorCount === 0,
+      force: opts.force === true,
+    });
     return this.getValidationSummary();
   }
 
   /**
-   * Clears all recorded live WebGPU validation errors and resets the counter to zero.
+   * Clears all recorded live WebGPU validation errors and resets the counter to zero,
+   * recovering the HUD status bar from red back to clean green/neutral.
    */
   clearValidationErrors(options = {}) {
     if (this._destroyed) {
       return this.getValidationSummary();
     }
     const opts = isPlainObject(options) ? options : {};
+    const hadErrors = this._validationErrorCount > 0 || this._gpuTelemetry.validationErrorCount > 0;
     this._validationErrors = [];
     this._validationErrorCount = 0;
     this._gpuTelemetry.validationErrorCount = 0;
-    this._renderBootDiagnostics({ updateHudStatus: false, force: opts.force === true });
+    this._lastConciseHudStatus = null;
+    this._renderBootDiagnostics({
+      updateHudStatus:
+        opts.updateHudStatus !== undefined ? opts.updateHudStatus === true : hadErrors,
+      force: opts.force === true,
+    });
     return this.getValidationSummary();
+  }
+
+  /**
+   * Returns deduplicated sanitized GPU validation errors grouped by (type, message)
+   * with occurrence counts and first/last timestamps for clean diagnostic export.
+   *
+   * @returns {Array<{ type: string, message: string, occurrences: number, firstSeenMs: number|null, lastSeenMs: number|null, source: string|null }>}
+   */
+  getDeduplicatedValidationErrors() {
+    const grouped = new Map();
+    for (let i = 0; i < this._validationErrors.length; i += 1) {
+      const entry = this._validationErrors[i];
+      if (!entry) continue;
+      const type = entry.type || 'validation';
+      const message = entry.message || 'WebGPU validation error';
+      const key = `${type}|${message}`;
+      const ts = typeof entry.timestampMs === 'number' && Number.isFinite(entry.timestampMs)
+        ? entry.timestampMs
+        : null;
+      const existing = grouped.get(key);
+      if (!existing) {
+        grouped.set(key, {
+          type,
+          message,
+          occurrences: 1,
+          firstSeenMs: ts,
+          lastSeenMs: ts,
+          source: entry.source || null,
+        });
+      } else {
+        existing.occurrences += 1;
+        if (ts !== null) {
+          if (existing.firstSeenMs === null || ts < existing.firstSeenMs) {
+            existing.firstSeenMs = ts;
+          }
+          if (existing.lastSeenMs === null || ts > existing.lastSeenMs) {
+            existing.lastSeenMs = ts;
+          }
+        }
+      }
+    }
+    return Array.from(grouped.values()).sort(
+      (a, b) => b.occurrences - a.occurrences || a.message.localeCompare(b.message)
+    );
   }
 
   /**
@@ -7330,8 +8071,9 @@ export class HudController {
     }
 
     if (els.validationLatestEl) {
-      const latestText =
-        validation.hasErrors && validation.latestMessage ? validation.latestMessage : 'None';
+      const latestText = validation.hasErrors
+        ? validation.latestMessage || validation.statusText
+        : 'None';
       safeSetText(els.validationLatestEl, latestText, domStats);
       safeSetDataset(els.validationLatestEl, 'state', validation.hasErrors ? 'err' : '', domStats);
       safeSetTitle(els.validationLatestEl, latestText, domStats);
@@ -7708,6 +8450,74 @@ export class HudController {
       safeSetTitle(bottleneckEl, bn ? `Bottleneck: ${bn}` : '', domStats);
     }
 
+    const gpuMemoryEl = els.gpuMemoryEl || els.vramStatsEl || null;
+    if (gpuMemoryEl && memoryTelemetry) {
+      safeSetText(gpuMemoryEl, memoryTelemetry.gpuMemoryText || '--', domStats);
+      safeSetDataset(
+        gpuMemoryEl,
+        'liveBufferBytes',
+        memoryTelemetry.liveBufferBytes !== null ? String(memoryTelemetry.liveBufferBytes) : '',
+        domStats
+      );
+      safeSetDataset(
+        gpuMemoryEl,
+        'liveTextureBytes',
+        memoryTelemetry.liveTextureBytes !== null ? String(memoryTelemetry.liveTextureBytes) : '',
+        domStats
+      );
+      safeSetDataset(
+        gpuMemoryEl,
+        'peakBufferBytes',
+        memoryTelemetry.peakBufferBytes !== null ? String(memoryTelemetry.peakBufferBytes) : '',
+        domStats
+      );
+      safeSetDataset(
+        gpuMemoryEl,
+        'peakTextureBytes',
+        memoryTelemetry.peakTextureBytes !== null ? String(memoryTelemetry.peakTextureBytes) : '',
+        domStats
+      );
+      safeSetTitle(gpuMemoryEl, memoryTelemetry.gpuMemoryText, domStats);
+    }
+
+    if (els.wasmMemoryEl && memoryTelemetry) {
+      safeSetText(els.wasmMemoryEl, memoryTelemetry.wasmMemoryText || '--', domStats);
+      safeSetDataset(
+        els.wasmMemoryEl,
+        'wasmLinearMemoryBytes',
+        memoryTelemetry.wasmLinearMemoryBytes !== null
+          ? String(memoryTelemetry.wasmLinearMemoryBytes)
+          : '',
+        domStats
+      );
+    }
+
+    if (els.shaderStreamingEl && gpuTelemetry) {
+      safeSetText(els.shaderStreamingEl, gpuTelemetry.shaderStreamingText || '--', domStats);
+      safeSetDataset(
+        els.shaderStreamingEl,
+        'rangedShaderReady',
+        gpuTelemetry.rangedShaderReady !== null ? String(gpuTelemetry.rangedShaderReady) : '',
+        domStats
+      );
+      safeSetDataset(
+        els.shaderStreamingEl,
+        'rangedShaderFetches',
+        gpuTelemetry.rangedShaderFetches !== null ? String(gpuTelemetry.rangedShaderFetches) : '',
+        domStats
+      );
+    }
+
+    if (els.swapchainColorModeEl && gpuTelemetry) {
+      safeSetText(els.swapchainColorModeEl, gpuTelemetry.swapchainColorMode || '--', domStats);
+      safeSetDataset(
+        els.swapchainColorModeEl,
+        'swapchainColorMode',
+        gpuTelemetry.swapchainColorMode || '',
+        domStats
+      );
+    }
+
     const memoryStatsEl = els.memoryStatsEl || els.jsHeapEl || null;
     if (memoryStatsEl && memoryTelemetry) {
       safeSetText(memoryStatsEl, memoryTelemetry.statusText || '--', domStats);
@@ -7923,6 +8733,80 @@ export class HudController {
             safeSetDataset(mounted.opfsValueEl, 'state', '', domStats);
             safeSetTitle(mounted.opfsValueEl, '', domStats);
           }
+
+          const ensureOptionalRow = (prop, labelText, metricKey) => {
+            if (!mounted[prop] && mounted.doc && mounted.kvList) {
+              try {
+                const row = mounted.doc.createElement('div');
+                row.className = 'kv-row';
+                const labelEl = mounted.doc.createElement('span');
+                labelEl.className = 'kv-label';
+                labelEl.textContent = labelText;
+                const valueEl = mounted.doc.createElement('span');
+                valueEl.className = 'kv-value';
+                valueEl.textContent = '--';
+                if (typeof valueEl.setAttribute === 'function') {
+                  valueEl.setAttribute('data-hud-metric', metricKey);
+                }
+                row.appendChild(labelEl);
+                row.appendChild(valueEl);
+                mounted.kvList.appendChild(row);
+                mounted[prop] = valueEl;
+              } catch {
+                mounted[prop] = null;
+              }
+            }
+            return mounted[prop];
+          };
+
+          if (memoryTelemetry.gpuMemoryText) {
+            const vramEl = ensureOptionalRow('gpuVramValueEl', 'GPU VRAM', 'gpu-vram');
+            if (vramEl) {
+              safeSetText(vramEl, memoryTelemetry.gpuMemoryText, domStats);
+              safeSetDataset(vramEl, 'state', 'ok', domStats);
+              safeSetTitle(vramEl, memoryTelemetry.gpuMemoryText, domStats);
+            }
+          } else if (mounted.gpuVramValueEl) {
+            safeSetText(mounted.gpuVramValueEl, '--', domStats);
+            safeSetDataset(mounted.gpuVramValueEl, 'state', '', domStats);
+          }
+
+          if (memoryTelemetry.wasmMemoryText) {
+            const wasmEl = ensureOptionalRow('wasmMemoryValueEl', 'Wasm Memory', 'wasm-memory');
+            if (wasmEl) {
+              safeSetText(wasmEl, memoryTelemetry.wasmMemoryText, domStats);
+              safeSetDataset(wasmEl, 'state', 'ok', domStats);
+            }
+          } else if (mounted.wasmMemoryValueEl) {
+            safeSetText(mounted.wasmMemoryValueEl, '--', domStats);
+            safeSetDataset(mounted.wasmMemoryValueEl, 'state', '', domStats);
+          }
+
+          if (gpuTelemetry && gpuTelemetry.shaderStreamingText) {
+            const shaderEl = ensureOptionalRow(
+              'shaderStreamingValueEl',
+              'Shader Stream',
+              'shader-stream'
+            );
+            if (shaderEl) {
+              safeSetText(shaderEl, gpuTelemetry.shaderStreamingText, domStats);
+              safeSetDataset(shaderEl, 'state', 'ok', domStats);
+            }
+          } else if (mounted.shaderStreamingValueEl) {
+            safeSetText(mounted.shaderStreamingValueEl, '--', domStats);
+            safeSetDataset(mounted.shaderStreamingValueEl, 'state', '', domStats);
+          }
+
+          if (gpuTelemetry && gpuTelemetry.swapchainColorMode) {
+            const colorEl = ensureOptionalRow('swapchainColorValueEl', 'Color Mode', 'color-mode');
+            if (colorEl) {
+              safeSetText(colorEl, gpuTelemetry.swapchainColorMode, domStats);
+              safeSetDataset(colorEl, 'state', 'ok', domStats);
+            }
+          } else if (mounted.swapchainColorValueEl) {
+            safeSetText(mounted.swapchainColorValueEl, '--', domStats);
+            safeSetDataset(mounted.swapchainColorValueEl, 'state', '', domStats);
+          }
         } else if (diagTarget.explicit) {
           safeSetText(diagTarget.container, diagSummaryText || '--', domStats);
           safeSetDataset(
@@ -7995,6 +8879,29 @@ export class HudController {
     }
     const domStats = this._domWriteStats;
     const hidden = !this._visible;
+    if (hidden) {
+      try {
+        const doc =
+          rootEl.ownerDocument || (typeof document !== 'undefined' ? document : null);
+        const activeEl = doc && doc.activeElement ? doc.activeElement : null;
+        if (
+          activeEl &&
+          typeof rootEl.contains === 'function' &&
+          rootEl.contains(activeEl) &&
+          typeof activeEl.blur === 'function'
+        ) {
+          activeEl.blur();
+        }
+      } catch {
+        // Ignore focus blur errors on lightweight mock DOM nodes.
+      }
+    } else if (rootEl.style && rootEl.style.display === 'none') {
+      try {
+        rootEl.style.display = '';
+      } catch {
+        // Ignore style errors on frozen mocks.
+      }
+    }
     safeSetHidden(rootEl, hidden, domStats);
     safeSetAttribute(rootEl, 'aria-hidden', hidden ? 'true' : 'false', domStats);
     safeSetDataset(rootEl, 'hudVisible', this._visible ? 'true' : 'false', domStats);
@@ -8045,24 +8952,41 @@ export class HudController {
    * @returns {boolean} Current HUD visibility.
    */
   setVisible(visible) {
-    if (this._destroyed) {
+    if (this._destroyed || this._inSetVisible) {
       return this._visible;
     }
     const nextVisible = Boolean(visible);
     const becameVisible = nextVisible && !this._visible;
-    this._visible = nextVisible;
-    this._renderVisibility();
-    if (becameVisible && (this._hiddenRenderDeferred || this._renderDirty)) {
-      this._renderBootDiagnostics({ updateHudStatus: false, force: true, skipStatusReturn: true });
-    }
-    if (this._hud && typeof this._hud.setVisible === 'function') {
-      try {
-        this._hud.setVisible(this._visible);
-      } catch {
-        // Ignore optional HUD visibility callback errors.
+    this._inSetVisible = true;
+    try {
+      this._visible = nextVisible;
+      this._renderVisibility();
+      const panel = this._getGpuBootPanel();
+      if (panel) {
+        try {
+          if (this._visible && typeof panel.show === 'function') {
+            panel.show();
+          } else if (!this._visible && typeof panel.hide === 'function') {
+            panel.hide();
+          }
+        } catch {
+          // Ignore optional panel visibility errors.
+        }
       }
+      if (becameVisible && (this._hiddenRenderDeferred || this._renderDirty)) {
+        this._renderBootDiagnostics({ updateHudStatus: false, force: true, skipStatusReturn: true });
+      }
+      if (this._hud && typeof this._hud.setVisible === 'function') {
+        try {
+          this._hud.setVisible(this._visible);
+        } catch {
+          // Ignore optional HUD visibility callback errors.
+        }
+      }
+      return this._visible;
+    } finally {
+      this._inSetVisible = false;
     }
-    return this._visible;
   }
 
   /**
@@ -8148,7 +9072,7 @@ export class HudController {
       const eventCode = typeof event.code === 'string' ? event.code : '';
       const matchesKey =
         eventKey.toLowerCase() === expectedKeyLower ||
-        (expectedKeyLower === 'f3' && eventCode.toLowerCase() === 'f3');
+        (eventCode.length > 0 && eventCode.toLowerCase() === expectedKeyLower);
       if (!matchesKey) {
         return;
       }
@@ -8420,7 +9344,10 @@ export class HudController {
       this._currentSideModule = null;
       this._runtimeInitialized = false;
       this._gpuTelemetry = createInitialGpuTelemetry();
-    this._lastRawGpuAdapter = undefined;
+      this._lastRawGpuAdapter = undefined;
+      this._validationErrors = [];
+      this._validationErrorCount = 0;
+      this._validationErrorSeq = 0;
       this._audioTelemetry = createInitialAudioTelemetry();
       this._pthreadTelemetry = createInitialPthreadTelemetry();
       this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
