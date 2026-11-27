@@ -438,3 +438,5 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Handles Emscripten 7.0.1 `em-pthread` worker bootstrap and forwards `env.host_*` host-import bindings across worker threads inside `web/loader.js`.
 - [x] **W63 — Fix Inline `detectWasm64` (`address: 'i64'` + `index: 'i64'`) in `web/index.html`** — `DONE` (PR #385, closes #384) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
   - Updates the inline HUD `detectWasm64` probe in `web/index.html` to check `address: 'i64'` with `index: 'i64'` fallback consistently across all browser entrypoints.
+
+- [ ] **Performance #2048 — FNV64 streaming verification arithmetic** — `IN PROGRESS` (#2048, @GDemay) *(synthetic validation; no game files required)*
