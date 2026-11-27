@@ -2296,7 +2296,7 @@ test('W160 ranged cache telemetry (inFlightCoalesced, rangeFetchCount, rangeByte
 // ---------------------------------------------------------------------------
 
 test('W162 bounded FIFO semaphore caps concurrent HTTP 206 Range fetches, preserves order, coalesces duplicates before acquiring slots, and supports unlimited (0)', async () => {
-  assert.equal(DEFAULT_MAX_CONCURRENT_RANGE_FETCHES, 8);
+  assert.equal(DEFAULT_MAX_CONCURRENT_RANGE_FETCHES, 3);
   assert.equal(DEFAULT_MAX_RANGE_FETCH_RETRIES, 2);
   assert.equal(DEFAULT_RANGE_RETRY_DELAY_MS, 25);
 

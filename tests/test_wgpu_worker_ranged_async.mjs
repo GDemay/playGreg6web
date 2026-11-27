@@ -762,6 +762,7 @@ test('W159 concurrent async getWgslAsync resolution upgrades pending v1/v2 rende
   const mock = createMockWebGpu();
   const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
     format: 'bgra8unorm',
+    deferRangedFallbackPipelines: false,
   });
   installRenderStatePackets(processor);
 
@@ -958,6 +959,7 @@ test('W159 destroying a pending pipeline before ranged shaders resolve prevents 
   const mock = createMockWebGpu();
   const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
     format: 'bgra8unorm',
+    deferRangedFallbackPipelines: false,
   });
 
   await processor.loadShaderPackUrl('/shaders/full-destroy.wgsl.pack', {
@@ -1671,6 +1673,7 @@ test('W185 (W179) exports bounded, sanitized missingShaderSummary on getStats, g
 
   const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
     format: 'bgra8unorm',
+    deferRangedFallbackPipelines: false,
   });
 
   // Trigger not_in_pack misses + compile_failed + reflection_failed + real-shader guard.
@@ -1984,6 +1987,7 @@ test('live Chrome streamShaders=1 + asyncPipelines: rejected fallback PSO stays 
     format: 'bgra8unorm',
     streamShaders: true,
     enableShaderFallback: true,
+    deferRangedFallbackPipelines: false,
   });
   const rsHandler = installRenderStatePackets(processor);
   processor.asyncPipelineCache.coalesceByDescriptor = true;
@@ -2152,6 +2156,7 @@ test('pending ranged compute pipeline skips Dispatch cleanly with 0 errors and p
     format: 'bgra8unorm',
     enablePipelineCache: true,
     enableShaderFallback: true,
+    deferRangedFallbackPipelines: false,
   });
   await procB.loadShaderPackUrl('/shaders/comp-b.wgsl.pack', {
     fetch: netB.fetchImpl,

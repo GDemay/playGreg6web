@@ -57,8 +57,9 @@ export const DEFAULT_MAX_FULL_FALLBACK_BYTES = 256 * 1024 * 1024;
 /** Default bounded in-memory LRU cache budget for on-demand WGSL strings in ranged mode (32 MiB). */
 export const DEFAULT_MAX_CACHED_WGSL_BYTES = 32 * 1024 * 1024;
 
-/** Default maximum concurrent HTTP 206 Range payload fetches per ranged pack (`0` = unlimited). */
-export const DEFAULT_MAX_CONCURRENT_RANGE_FETCHES = 8;
+/** Default maximum concurrent HTTP 206 Range payload fetches per ranged pack (`0` = unlimited).
+ * Kept at 3 so Chrome's 6 HTTP/1.1 connections/origin budget leaves >=3 slots free for io_worker.js .rpf streaming. */
+export const DEFAULT_MAX_CONCURRENT_RANGE_FETCHES = 3;
 
 /** Default maximum retries on transient HTTP 206 Range fetch failures (`0` = no retries). */
 export const DEFAULT_MAX_RANGE_FETCH_RETRIES = 2;
