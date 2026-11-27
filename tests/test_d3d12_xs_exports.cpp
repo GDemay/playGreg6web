@@ -6631,12 +6631,12 @@ void test_window_write_marks_flush() {
             scene.execute({list});
             CHECK(writes(m).empty() && res->shadow_resident_bytes() == 0);
         }
-        // A marked write is uploaded; only the written 64 KiB chunk of the shadow gets host memory.
+        // A marked write is uploaded; only its written 4 KiB shadow page gets host memory.
         CHECK(com::write_guest(C + 5 * k64K + 0x2000, one));
         size_t mark = fx.captured.size();
         scene.execute({list});
         CHECK((writes(mark) == std::vector<uint32_t>{static_cast<uint32_t>(k64K + 0x2000)}));
-        CHECK(res->shadow_resident_bytes() == k64K);
+        CHECK(res->shadow_resident_bytes() == 4096);
         // A write back to zero in an allocated chunk is still seen.
         {
             const uint32_t zero = 0;
@@ -6659,6 +6659,7 @@ void test_window_write_marks_flush() {
         mark = fx.captured.size();
         scene.execute({list});
         CHECK((writes(mark) == std::vector<uint32_t>{0}));
+        CHECK(res->shadow_resident_bytes() == 2 * 4096);
         // An unmarked write is not compared...
         auto* raw = static_cast<uint32_t*>(gw::translate(C + 5 * k64K + 0x3000));
         CHECK(raw != nullptr);
@@ -6672,6 +6673,7 @@ void test_window_write_marks_flush() {
         scene.execute({list});
         CHECK((writes(mark) == std::vector<uint32_t>{static_cast<uint32_t>(k64K + 0x3000)}));
         CHECK(gw::verify_misses() == 1);
+        CHECK(res->shadow_resident_bytes() == 3 * 4096);
         gw::set_write_marks_verified(false);
         // Remapping a slot marks it: other bytes appear there and are uploaded.
         CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&slots[0], 1, &pfn[1]) == 1);

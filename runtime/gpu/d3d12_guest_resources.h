@@ -32,7 +32,7 @@
 //    the changed runs (before the command lists' packets). Map/Unmap need no bookkeeping, so
 //    persistently mapped buffers and memory the guest writes without Map work the same way. Cost:
 //    one memcmp of every tracked buffer per submission (only written pages where the arena or
-//    the window tracks writes). The shadow's host memory is allocated lazily per 64 KiB chunk on
+//    the window tracks writes). The shadow's host memory is allocated lazily per 4 KiB page on
 //    the first upload into it; an unallocated chunk compares as zeros.
 //  * CopyBufferRegion / CopyResource from a CPU-visible buffer and CopyTextureRegion from a placed
 //    footprint in a CPU-visible buffer become WriteBuffer / WriteTexture packets built from guest
@@ -235,7 +235,7 @@ public:
     // (O36: lazy chunks, see shadow_chunks_).
     uint64_t shadow_bytes() const { return shadow_size_; }
     uint64_t shadow_resident_bytes() const { return shadow_resident_; }
-    static constexpr uint64_t kShadowChunk = 64u << 10;
+    static constexpr uint64_t kShadowChunk = 4u << 10;
     bool slot_indexed() const { return slot_indexed_; }
     void set_slot_indexed(bool v) { slot_indexed_ = v; }
     // Marks the texture as the presented back buffer (Device::set_back_buffer).

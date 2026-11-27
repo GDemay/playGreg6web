@@ -111,6 +111,12 @@ target_include_directories(playgta6_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+option(PLAYGTA6_PERFORMANCE_BENCHMARKS "Build synthetic production-path performance benchmarks" OFF)
+if(PLAYGTA6_PERFORMANCE_BENCHMARKS)
+    add_executable(bench_buffer_shadows ../tests/bench_buffer_shadows.cpp)
+    target_link_libraries(bench_buffer_shadows PRIVATE playgta6_core)
+endif()
+
 # Precompiled standard headers (MSVC only, standard library only: no project or Windows headers,
 # so no TU's macro setup is affected). The ~70 core TUs spend most of their compile time parsing
 # the same STL headers; a fresh build directory (every agent worktree, every harness build) pays it.
