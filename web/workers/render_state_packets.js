@@ -88,6 +88,11 @@ const V2_OPCODES = Object.freeze({
   CREATE_TEXTURE2: 35,
 });
 
+// Native-executor extension opcode outside GpuOpcode (runtime/abi/playgta6_abi.h kGpuOpcodeClearTexture).
+// Kept separate from V2_OPCODES so enum parity tests against GpuOpcode stay exact.
+const OPCODE_CLEAR_TEXTURE = 63;
+const CLEAR_TEXTURE_PAYLOAD_BYTES = 8;
+
 const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
 
 const SWAPCHAIN_TEXTURE_ID = 0xffffffff;
@@ -3984,6 +3989,8 @@ class RenderStatePackets {
       skippedComputeDispatchCount: 0,
       clampedComputeDispatchCount: 0,
       texture2Count: 0,
+      textureClears: 0,
+      textureClearsMissing: 0,
       bcFormatFallbacks: 0,
       usageStrips: 0,
       unfilterableFloatFallbacks: 0,
@@ -4364,6 +4371,8 @@ class RenderStatePackets {
         return this._count(payloadBytes >= 24 && this._createSampler(view, offset));
       case V2_OPCODES.CREATE_TEXTURE2:
         return this._count(this._createTexture2(view, offset, payloadBytes));
+      case OPCODE_CLEAR_TEXTURE:
+        return this._count(this._clearTexture(view, offset, payloadBytes));
       default:
         return false;
     }
@@ -7141,6 +7150,34 @@ class RenderStatePackets {
     return true;
   }
 
+  _clearTexture(view, offset, payloadBytes) {
+    if (
+      !view ||
+      payloadBytes < CLEAR_TEXTURE_PAYLOAD_BYTES ||
+      offset + CLEAR_TEXTURE_PAYLOAD_BYTES > view.byteLength
+    ) {
+      this._packetError = `ClearTexture: payload ${payloadBytes} < ${CLEAR_TEXTURE_PAYLOAD_BYTES} bytes`;
+      return false;
+    }
+    const textureId = view.getUint32(offset, true);
+    const meta = this.textureMeta.get(textureId) || null;
+    if (this.processor && typeof this.processor._clearTextureById === 'function') {
+      const result = this.processor._clearTextureById(textureId, meta);
+      if (result.status === 'cleared') {
+        this.telemetry.textureClears += 1;
+        return true;
+      }
+      if (result.status === 'missing') {
+        this.telemetry.textureClearsMissing += 1;
+        return true;
+      }
+      this._packetError = result.error || `ClearTexture ${textureId}: invalid texture`;
+      return false;
+    }
+    this.telemetry.textureClearsMissing += 1;
+    return true;
+  }
+
   _resolveTextureMetaFull(textureId) {
     const meta = this.textureMeta.get(textureId) || null;
     const texture =
@@ -9480,6 +9517,8 @@ const exportedApi = {
   BLENDABLE_CORE_FORMATS,
   VERTEX_FORMAT_BYTE_SIZES,
   V2_OPCODES,
+  OPCODE_CLEAR_TEXTURE,
+  CLEAR_TEXTURE_PAYLOAD_BYTES,
   SWAPCHAIN_TEXTURE_ID,
   BINDING_ARRAYS_LAYOUT_FLAG,
   BINDING_ARRAYS_BG_FLAG,
