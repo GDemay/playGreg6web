@@ -1968,6 +1968,19 @@ enum SgprOrigin {
         def_inst_idx: usize,
         value: Option<u32>,
     },
+    /// Merged/divergent descriptor-load origin whose exact static binding could not be uniquely
+    /// resolved across divergent CFG branches or scalar selects (e.g. `if/else` loading two
+    /// different sampler/resource offsets, 3+ branch choices, or mixing a table descriptor with
+    /// an inline/dynamic/unknown origin).
+    ///
+    /// Preserves a representative `def_inst_idx` (with all merged reaching `s_load_dword*` defs
+    /// linked via `divergent_def_aliases`) so downstream hardware descriptor consumers (`MIMG`
+    /// T#/S#, `MUBUF`/`MTBUF` V#, `s_buffer_load_*` V#) still suppress the reaching descriptor
+    /// loads instead of leaking bogus `RootDescriptor` CBVs, while `tainted_defs` continues to
+    /// protect genuine non-descriptor CBV loads consumed by VALU/SALU arithmetic.
+    DivergentDesc {
+        def_inst_idx: usize,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -2107,11 +2120,12 @@ impl OriginState {
         &mut self,
         other: &Self,
         def_aliases: &mut BTreeMap<usize, BTreeSet<usize>>,
+        divergent_def_aliases: &mut BTreeMap<usize, BTreeSet<usize>>,
     ) -> bool {
         let mut changed = false;
         let prev_self_vgprs = self.vgpr_uniform_origins;
         for (dst, &src) in self.origins.iter_mut().zip(other.origins.iter()) {
-            let joined = join_cfg_origin(*dst, src, Some(def_aliases));
+            let joined = join_cfg_origin(*dst, src, Some(def_aliases), Some(divergent_def_aliases));
             if joined != *dst {
                 *dst = joined;
                 changed = true;
@@ -2122,7 +2136,7 @@ impl OriginState {
             .iter_mut()
             .zip(other.vgpr_uniform_origins.iter())
         {
-            let joined = join_cfg_origin(*dst, src, Some(def_aliases));
+            let joined = join_cfg_origin(*dst, src, Some(def_aliases), Some(divergent_def_aliases));
             if joined != *dst {
                 *dst = joined;
                 changed = true;
@@ -2136,7 +2150,8 @@ impl OriginState {
                     .get(&k)
                     .copied()
                     .unwrap_or_else(|| other.vgpr_origin(k.0));
-                let joined = join_cfg_origin(*dst, src, Some(def_aliases));
+                let joined =
+                    join_cfg_origin(*dst, src, Some(def_aliases), Some(divergent_def_aliases));
                 if matches!(joined, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
                     to_remove.push(k);
                 } else if joined != *dst {
@@ -2156,7 +2171,12 @@ impl OriginState {
                         .get(usize::from(k.0))
                         .copied()
                         .unwrap_or(SgprOrigin::Unknown);
-                    let joined = join_cfg_origin(self_default, src, Some(def_aliases));
+                    let joined = join_cfg_origin(
+                        self_default,
+                        src,
+                        Some(def_aliases),
+                        Some(divergent_def_aliases),
+                    );
                     if !matches!(joined, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
                         self.lane_origins.insert(k, joined);
                         changed = true;
@@ -2233,8 +2253,10 @@ struct AnalysisCollector {
     tainted_defs: BTreeSet<usize>,
     def_parents: BTreeMap<usize, usize>,
     def_aliases: BTreeMap<usize, BTreeSet<usize>>,
+    divergent_def_aliases: BTreeMap<usize, BTreeSet<usize>>,
     direct_descriptor_defs: BTreeSet<usize>,
     raw_descriptor_defs: BTreeSet<usize>,
+    divergent_descriptor_defs: BTreeSet<usize>,
     buffer_load_uses: Vec<BufferLoadUse>,
     cbv_ptr_loads: Vec<CbvPtrLoad>,
     direct_root_cbvs: Vec<DirectRootCbvLoad>,
@@ -2545,7 +2567,65 @@ fn is_known_descriptor_or_table(o: SgprOrigin) -> bool {
             | SgprOrigin::VbDesc { .. }
             | SgprOrigin::RawTableDesc { .. }
             | SgprOrigin::PatchedDescWord { .. }
+            | SgprOrigin::DivergentDesc { .. }
     )
+}
+
+/// Extract reaching `s_load_dword*` descriptor-definition instruction index(es) carried by an
+/// `SgprOrigin`. Excludes non-SMEM origins (such as `ConstImmediate` and synthesized
+/// `PatchedDescBase::RootDescriptor` SALU words).
+fn loaded_desc_defs(origin: SgprOrigin) -> Option<(usize, Option<usize>)> {
+    match origin {
+        SgprOrigin::TableDesc { def_inst_idx, .. }
+        | SgprOrigin::DynamicHeapDesc { def_inst_idx, .. }
+        | SgprOrigin::CbvIndexedHeapDesc { def_inst_idx, .. }
+        | SgprOrigin::LaneIndexedHeapDesc { def_inst_idx, .. }
+        | SgprOrigin::BoundedCbvIndexedHeapDesc { def_inst_idx, .. }
+        | SgprOrigin::RawTableDesc { def_inst_idx, .. }
+        | SgprOrigin::VbDesc { def_inst_idx, .. }
+        | SgprOrigin::DivergentDesc { def_inst_idx } => Some((def_inst_idx, None)),
+        SgprOrigin::TableDescChoice { def_insts, .. } => Some((def_insts[0], Some(def_insts[1]))),
+        SgprOrigin::PatchedDescWord {
+            def_inst_idx,
+            base,
+        } if !matches!(base, PatchedDescBase::RootDescriptor { .. }) => Some((def_inst_idx, None)),
+        _ => None,
+    }
+}
+
+/// Collapse two non-unifiable origins while preserving any reaching descriptor-load `def_inst_idx`
+/// values in `SgprOrigin::DivergentDesc` and linking them in `divergent_def_aliases`.
+/// Returns `SgprOrigin::Unknown` when neither side carries a loaded descriptor def.
+fn merge_divergent_desc(
+    a: SgprOrigin,
+    b: SgprOrigin,
+    mut divergent_def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
+) -> SgprOrigin {
+    let mut min_def: Option<usize> = None;
+    let mut add_def = |d: usize| {
+        if let Some(cur) = min_def {
+            record_def_alias(divergent_def_aliases.as_deref_mut(), cur, d);
+            min_def = Some(cur.min(d));
+        } else {
+            min_def = Some(d);
+        }
+    };
+    if let Some((d0, d1)) = loaded_desc_defs(a) {
+        add_def(d0);
+        if let Some(d) = d1 {
+            add_def(d);
+        }
+    }
+    if let Some((d0, d1)) = loaded_desc_defs(b) {
+        add_def(d0);
+        if let Some(d) = d1 {
+            add_def(d);
+        }
+    }
+    match min_def {
+        Some(def_inst_idx) => SgprOrigin::DivergentDesc { def_inst_idx },
+        None => SgprOrigin::Unknown,
+    }
 }
 
 fn patched_desc_word_of(origin: SgprOrigin) -> Option<(usize, PatchedDescBase)> {
@@ -2940,22 +3020,33 @@ fn is_const_zero(o: SgprOrigin) -> bool {
     matches!(o, SgprOrigin::ConstImmediate { value: Some(0), .. })
 }
 
-/// Monotonic 4-level lattice join for CFG block merges:
-/// `Unwritten (Bottom) < ConstZero < { NonZeroConst | KnownTable/Desc } < Unknown (Top)`.
+/// Monotonic lattice join for CFG block merges:
+/// `Unwritten (Bottom) < ConstZero < { NonZeroConst | KnownTable/Desc } < TableDescChoice < Unknown < DivergentDesc (Top)`.
 fn join_cfg_origin(
     a: SgprOrigin,
     b: SgprOrigin,
     mut def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
+    divergent_def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
 ) -> SgprOrigin {
     if a == b {
         return a;
     }
     match (a, b) {
         (SgprOrigin::Unwritten, other) | (other, SgprOrigin::Unwritten) => other,
-        (SgprOrigin::Unknown, _) | (_, SgprOrigin::Unknown) => SgprOrigin::Unknown,
-        (SgprOrigin::ExeczScratch, td @ SgprOrigin::TableDesc { .. })
-        | (td @ SgprOrigin::TableDesc { .. }, SgprOrigin::ExeczScratch) => td,
-        (SgprOrigin::ExeczScratch, _) | (_, SgprOrigin::ExeczScratch) => SgprOrigin::Unknown,
+        (SgprOrigin::Unknown, other) | (other, SgprOrigin::Unknown) => {
+            merge_divergent_desc(SgprOrigin::Unknown, other, divergent_def_aliases)
+        }
+        (
+            SgprOrigin::ExeczScratch,
+            td @ (SgprOrigin::TableDesc { .. } | SgprOrigin::TableDescChoice { .. }),
+        )
+        | (
+            td @ (SgprOrigin::TableDesc { .. } | SgprOrigin::TableDescChoice { .. }),
+            SgprOrigin::ExeczScratch,
+        ) => td,
+        (SgprOrigin::ExeczScratch, other) | (other, SgprOrigin::ExeczScratch) => {
+            merge_divergent_desc(SgprOrigin::ExeczScratch, other, divergent_def_aliases)
+        }
         (
             SgprOrigin::RightShiftedPtr {
                 def_inst_idx: d1,
@@ -3248,7 +3339,7 @@ fn join_cfg_origin(
         },
         // Zero-init / null-pointer fallback (`0`) promotes to the non-null table/descriptor origin.
         (z, known) | (known, z) if is_const_zero(z) && is_known_descriptor_or_table(known) => known,
-        _ => SgprOrigin::Unknown,
+        _ => merge_divergent_desc(a, b, divergent_def_aliases),
     }
 }
 
@@ -3260,6 +3351,7 @@ fn merge_select_origin(
     b: SgprOrigin,
     inst_idx: usize,
     def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
+    divergent_def_aliases: Option<&mut BTreeMap<usize, BTreeSet<usize>>>,
 ) -> SgprOrigin {
     if a == b {
         return a;
@@ -3446,7 +3538,7 @@ fn merge_select_origin(
         {
             known
         }
-        _ => SgprOrigin::Unknown,
+        _ => merge_divergent_desc(a, b, divergent_def_aliases),
     }
 }
 
@@ -3529,7 +3621,8 @@ fn apply_const_offset(origin: SgprOrigin, delta: i32) -> SgprOrigin {
         // heap binding.
         SgprOrigin::DynamicHeapDesc { .. }
         | SgprOrigin::CbvIndexedHeapDesc { .. }
-        | SgprOrigin::LaneIndexedHeapDesc { .. } => origin,
+        | SgprOrigin::LaneIndexedHeapDesc { .. }
+        | SgprOrigin::DivergentDesc { .. } => origin,
         SgprOrigin::VbDesc { .. } if delta == 0 => origin,
         SgprOrigin::RawTableDesc { .. } if delta == 0 => origin,
         SgprOrigin::PatchedDescWord {
@@ -3608,6 +3701,7 @@ fn apply_or_const(origin: SgprOrigin, imm: u32, inst_idx: usize) -> SgprOrigin {
         {
             origin
         }
+        SgprOrigin::DivergentDesc { .. } => origin,
         // GFX10.3 V#/T# in-place descriptor word patching (e.g. OOB_SELECT, format/type/mip/DCC/stride).
         other => {
             if let Some((def_inst_idx, base)) = patched_desc_word_of(other) {
@@ -3795,6 +3889,7 @@ fn apply_and_const(origin: SgprOrigin, mask: u32, inst_idx: usize) -> SgprOrigin
         {
             origin
         }
+        SgprOrigin::DivergentDesc { .. } => origin,
         SgprOrigin::ScaledUserSgpr {
             user_sgpr,
             stride,
@@ -4364,6 +4459,64 @@ fn sop1_reads_pair(op: u8) -> bool {
     )
 }
 
+fn taint_def_and_aliases(
+    tainted_defs: &mut BTreeSet<usize>,
+    def_aliases: &BTreeMap<usize, BTreeSet<usize>>,
+    divergent_def_aliases: Option<&BTreeMap<usize, BTreeSet<usize>>>,
+    start_def: usize,
+) {
+    let mut visited: BTreeSet<usize> = BTreeSet::new();
+    let mut stack: Vec<usize> = vec![start_def];
+    while let Some(cur) = stack.pop() {
+        if visited.len() >= 128 || !visited.insert(cur) {
+            continue;
+        }
+        tainted_defs.insert(cur);
+        if let Some(aliases) = def_aliases.get(&cur) {
+            for &alias in aliases {
+                if !visited.contains(&alias) {
+                    stack.push(alias);
+                }
+            }
+        }
+        if let Some(div_aliases) = divergent_def_aliases.and_then(|m| m.get(&cur)) {
+            for &alias in div_aliases {
+                if !visited.contains(&alias) {
+                    stack.push(alias);
+                }
+            }
+        }
+    }
+}
+
+/// Returns `true` when a `v_cmp(x)_eq_{i32,i64,u32,u64}` compares a `v_readfirstlane_b32`-extracted
+/// descriptor SGPR against the VGPR holding the exact same loaded descriptor origin (the standard
+/// RDNA2 non-uniform descriptor waterfall loop predicate: `v_readfirstlane_b32 s_d, v_d;
+/// v_cmp_eq_u64 mask, s_d, v_d; s_and_saveexec; image_sample/buffer_load ... s_d`).
+/// Such lane-equality predicates do not consume loaded CBV data and must not taint descriptor defs.
+fn is_waterfall_desc_cmp(state: &OriginState, vopc_op: u16, src0: u16, src1: u16) -> bool {
+    if !matches!(vopc_op, 0x82 | 0x92 | 0xA2 | 0xB2 | 0xC2 | 0xD2 | 0xE2 | 0xF2) {
+        return false;
+    }
+    let (s_reg, v_reg) = if src0 <= u16::from(MAX_TRACKED_SGPR) && (256..=511).contains(&src1) {
+        (src0 as u8, (src1 - 256) as u8)
+    } else if src1 <= u16::from(MAX_TRACKED_SGPR) && (256..=511).contains(&src0) {
+        (src1 as u8, (src0 - 256) as u8)
+    } else {
+        return false;
+    };
+    let s_defs = loaded_desc_defs(state.sgpr_origin(s_reg));
+    if s_defs.is_none() {
+        return false;
+    }
+    let v_orig = state
+        .lane_origins
+        .get(&(v_reg, 0))
+        .copied()
+        .unwrap_or_else(|| state.vgpr_origin(v_reg));
+    loaded_desc_defs(v_orig) == s_defs
+}
+
 fn taint_sgpr_if_loaded(
     collector: &mut Option<&mut AnalysisCollector>,
     origins: &[SgprOrigin; TRACKED_SGPR_COUNT],
@@ -4377,10 +4530,23 @@ fn taint_sgpr_if_loaded(
             | SgprOrigin::DynamicHeapDesc { def_inst_idx, .. }
             | SgprOrigin::CbvIndexedHeapDesc { def_inst_idx, .. }
             | SgprOrigin::LaneIndexedHeapDesc { def_inst_idx, .. }
+            | SgprOrigin::BoundedCbvIndexedHeapDesc { def_inst_idx, .. }
             | SgprOrigin::RawTableDesc { def_inst_idx, .. }
             | SgprOrigin::VbDesc { def_inst_idx, .. }
             | SgprOrigin::PatchedDescWord { def_inst_idx, .. } => {
                 col.tainted_defs.insert(def_inst_idx);
+            }
+            SgprOrigin::TableDescChoice { def_insts, .. } => {
+                taint_def_and_aliases(&mut col.tainted_defs, &col.def_aliases, None, def_insts[0]);
+                taint_def_and_aliases(&mut col.tainted_defs, &col.def_aliases, None, def_insts[1]);
+            }
+            SgprOrigin::DivergentDesc { def_inst_idx } => {
+                taint_def_and_aliases(
+                    &mut col.tainted_defs,
+                    &col.def_aliases,
+                    Some(&col.divergent_def_aliases),
+                    def_inst_idx,
+                );
             }
             _ => {}
         }
@@ -4593,6 +4759,16 @@ fn resolve_vsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
                 return recovered;
             }
         }
+        for (wi, wj) in [(2usize, 3usize), (1, 3), (1, 2), (0, 1), (0, 2), (0, 3)] {
+            if let (
+                SgprOrigin::DivergentDesc { def_inst_idx: di },
+                SgprOrigin::DivergentDesc { def_inst_idx: dj },
+            ) = (origin_at(origins, idx + wi), origin_at(origins, idx + wj))
+                && di == dj
+            {
+                return SgprOrigin::DivergentDesc { def_inst_idx: di };
+            }
+        }
     }
     w0
 }
@@ -4639,6 +4815,18 @@ fn resolve_tsharp_origin(
             for wj in (wi + 1)..word_count {
                 if let Some(recovered) = recover_desc_origin_from_word_pair(origins, idx, wi, wj) {
                     return recovered;
+                }
+            }
+        }
+        for wi in 0..word_count {
+            for wj in (wi + 1)..word_count {
+                if let (
+                    SgprOrigin::DivergentDesc { def_inst_idx: di },
+                    SgprOrigin::DivergentDesc { def_inst_idx: dj },
+                ) = (origin_at(origins, idx + wi), origin_at(origins, idx + wj))
+                    && di == dj
+                {
+                    return SgprOrigin::DivergentDesc { def_inst_idx: di };
                 }
             }
         }
@@ -4748,6 +4936,7 @@ fn is_valid_carry_hi(sdst: u8, origin: SgprOrigin, last_carry_lo_reg: Option<u8>
             | SgprOrigin::LaneIndexedHeapDesc { .. }
             | SgprOrigin::VbDesc { .. }
             | SgprOrigin::PatchedDescWord { .. }
+            | SgprOrigin::DivergentDesc { .. }
     )
 }
 
@@ -5507,18 +5696,16 @@ fn step_origin_state(
                                 resolve_src_pair_origins(*ssrc0, *literal, inst_idx, &state.origins);
                             let dst_lo = state.sgpr_origin(*sdst);
                             let dst_hi = state.sgpr_origin(sdst.saturating_add(1));
-                            let lo = merge_select_origin(
-                                dst_lo,
-                                src_lo,
-                                inst_idx,
-                                collector.as_deref_mut().map(|c| &mut c.def_aliases),
-                            );
-                            let hi = merge_select_origin(
-                                dst_hi,
-                                src_hi,
-                                inst_idx,
-                                collector.as_deref_mut().map(|c| &mut c.def_aliases),
-                            );
+                            let (da, dda) = match collector.as_deref_mut() {
+                                Some(c) => (Some(&mut c.def_aliases), Some(&mut c.divergent_def_aliases)),
+                                None => (None, None),
+                            };
+                            let lo = merge_select_origin(dst_lo, src_lo, inst_idx, da, dda);
+                            let (da, dda) = match collector.as_deref_mut() {
+                                Some(c) => (Some(&mut c.def_aliases), Some(&mut c.divergent_def_aliases)),
+                                None => (None, None),
+                            };
+                            let hi = merge_select_origin(dst_hi, src_hi, inst_idx, da, dda);
                             (lo, hi)
                         }
                         0x08 => {
@@ -5661,12 +5848,11 @@ fn step_origin_state(
                     0x05 => {
                         // s_cmov_b32
                         let src = resolve_src_origin_u8(*ssrc0, *literal, inst_idx, &state.origins);
-                        merge_select_origin(
-                            prev,
-                            src,
-                            inst_idx,
-                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
-                        )
+                        let (da, dda) = match collector.as_deref_mut() {
+                            Some(c) => (Some(&mut c.def_aliases), Some(&mut c.divergent_def_aliases)),
+                            None => (None, None),
+                        };
+                        merge_select_origin(prev, src, inst_idx, da, dda)
                     }
                     0x07 => {
                         // s_not_b32
@@ -5837,6 +6023,10 @@ fn step_origin_state(
                     }
                     0x02 => {
                         // s_cmovk_i32
+                        let (da, dda) = match collector.as_deref_mut() {
+                            Some(c) => (Some(&mut c.def_aliases), Some(&mut c.divergent_def_aliases)),
+                            None => (None, None),
+                        };
                         merge_select_origin(
                             prev_origin,
                             SgprOrigin::ConstImmediate {
@@ -5844,7 +6034,8 @@ fn step_origin_state(
                                 value: Some(imm as u32),
                             },
                             inst_idx,
-                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
+                            da,
+                            dda,
                         )
                     }
                     0x0F => {
@@ -5966,18 +6157,16 @@ fn step_origin_state(
                 let (new_lo, new_hi) = match *op {
                     0x0B => {
                         // s_cselect_b64
-                        let lo = merge_select_origin(
-                            s0_lo,
-                            s1_lo,
-                            inst_idx,
-                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
-                        );
-                        let hi = merge_select_origin(
-                            s0_hi,
-                            s1_hi,
-                            inst_idx,
-                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
-                        );
+                        let (da, dda) = match collector.as_deref_mut() {
+                            Some(c) => (Some(&mut c.def_aliases), Some(&mut c.divergent_def_aliases)),
+                            None => (None, None),
+                        };
+                        let lo = merge_select_origin(s0_lo, s1_lo, inst_idx, da, dda);
+                        let (da, dda) = match collector.as_deref_mut() {
+                            Some(c) => (Some(&mut c.def_aliases), Some(&mut c.divergent_def_aliases)),
+                            None => (None, None),
+                        };
+                        let hi = merge_select_origin(s0_hi, s1_hi, inst_idx, da, dda);
                         (lo, hi)
                     }
                     0x0F => {
@@ -6532,12 +6721,11 @@ fn step_origin_state(
                     0x0A => {
                         let s0 = resolve_src_origin_u8(*ssrc0, *literal, inst_idx, &state.origins);
                         let s1 = resolve_src_origin_u8(*ssrc1, *literal, inst_idx, &state.origins);
-                        next_origin = merge_select_origin(
-                            s0,
-                            s1,
-                            inst_idx,
-                            collector.as_deref_mut().map(|c| &mut c.def_aliases),
-                        );
+                        let (da, dda) = match collector.as_deref_mut() {
+                            Some(c) => (Some(&mut c.def_aliases), Some(&mut c.divergent_def_aliases)),
+                            None => (None, None),
+                        };
+                        next_origin = merge_select_origin(s0, s1, inst_idx, da, dda);
                     }
                     // s_and_b32
                     0x0E => {
@@ -7068,6 +7256,16 @@ fn step_origin_state(
                                 source: None,
                             });
                         }
+                        SgprOrigin::TableDescChoice { def_insts, .. } => {
+                            col.raw_descriptor_defs.insert(def_insts[0]);
+                            col.raw_descriptor_defs.insert(def_insts[1]);
+                        }
+                        SgprOrigin::BoundedCbvIndexedHeapDesc { def_inst_idx, .. } => {
+                            col.direct_descriptor_defs.insert(def_inst_idx);
+                        }
+                        SgprOrigin::DivergentDesc { def_inst_idx } => {
+                            col.divergent_descriptor_defs.insert(def_inst_idx);
+                        }
                         SgprOrigin::UserTable {
                             user_sgpr,
                             byte_offset,
@@ -7403,8 +7601,20 @@ fn step_origin_state(
                         SgprOrigin::RawTableDesc {
                             def_inst_idx: ptr_def,
                             ..
+                        }
+                        | SgprOrigin::DivergentDesc {
+                            def_inst_idx: ptr_def,
                         } => {
                             col.def_parents.insert(inst_idx, ptr_def);
+                        }
+                        SgprOrigin::TableDescChoice { def_insts, .. } => {
+                            let rep = def_insts[0].min(def_insts[1]);
+                            record_def_alias(
+                                Some(&mut col.divergent_def_aliases),
+                                def_insts[0],
+                                def_insts[1],
+                            );
+                            col.def_parents.insert(inst_idx, rep);
                         }
                         _ => {}
                     }
@@ -7612,6 +7822,21 @@ fn step_origin_state(
                                     }
                                 }
                             }
+                            SgprOrigin::DivergentDesc { .. }
+                            | SgprOrigin::TableDescChoice { .. } => {
+                                if matches!(*op, 0x02 | 0x03 | 0x04) && (*sdata % 2 == 0) {
+                                    for k in 0..count {
+                                        if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                            state.set_sgpr_origin(
+                                                reg,
+                                                SgprOrigin::DivergentDesc {
+                                                    def_inst_idx: inst_idx,
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             _ => {
                                 if matches!(*op, 0x02 | 0x03 | 0x04) && (*sdata % 2 == 0) {
                                     for k in 0..count {
@@ -7777,9 +8002,14 @@ fn step_origin_state(
             }
         }
         Rdna2Detail::Vopc {
-            op, src0, literal, ..
+            op,
+            vsrc1,
+            src0,
+            literal,
         } => {
-            taint_sgpr_if_loaded(&mut collector, &state.origins, *src0);
+            if !is_waterfall_desc_cmp(state, u16::from(*op), *src0, 256 + u16::from(*vsrc1)) {
+                taint_sgpr_if_loaded(&mut collector, &state.origins, *src0);
+            }
             if (*op & 0x10) == 0 {
                 // GFX10.3 `VOP_SDWAB` (`src0 == 0xF9`, `w1[15] == 1`) writes `sdst = w1[14:8]`
                 // instead of `vcc`; standard VOPC writes `vcc` (`106` in Wave32, `106..=107` Wave64).
@@ -7839,11 +8069,12 @@ fn step_origin_state(
         } => {
             let is_interp_f16 = vop3_is_interp_f16(*op);
             let is_spill_or_move = matches!(*op, 0x181 | 0x182 | 0x1E5 | 0x360 | 0x361);
-            if !is_interp_f16 && !is_spill_or_move {
+            let is_waterfall_cmp = is_waterfall_desc_cmp(state, *op, *src0, *src1);
+            if !is_interp_f16 && !is_spill_or_move && !is_waterfall_cmp {
                 taint_sgpr_if_loaded(&mut collector, &state.origins, *src0);
             }
             let is_unary = (0x180..=0x1FF).contains(op);
-            if !is_unary && !is_spill_or_move {
+            if !is_unary && !is_spill_or_move && !is_waterfall_cmp {
                 taint_sgpr_if_loaded(&mut collector, &state.origins, *src1);
             }
             if matches!(*op, 0x2FF..=0x301) && *src1 <= u16::from(MAX_TRACKED_SGPR_PAIR) {
@@ -8173,6 +8404,16 @@ fn step_origin_state(
                                 StorageDispatch::BoundedIndexed { choice_id, keys },
                             );
                         }
+                        SgprOrigin::TableDescChoice { def_insts, .. } => {
+                            col.raw_descriptor_defs.insert(def_insts[0]);
+                            col.raw_descriptor_defs.insert(def_insts[1]);
+                        }
+                        SgprOrigin::BoundedCbvIndexedHeapDesc { def_inst_idx, .. } => {
+                            col.direct_descriptor_defs.insert(def_inst_idx);
+                        }
+                        SgprOrigin::DivergentDesc { def_inst_idx } => {
+                            col.divergent_descriptor_defs.insert(def_inst_idx);
+                        }
                         SgprOrigin::RawTableDesc {
                             def_inst_idx,
                             is_dynamic: true,
@@ -8245,6 +8486,16 @@ fn step_origin_state(
                                         ResourceKey::LaneIndexedSamplerHeap(origin),
                                     );
                                 }
+                            }
+                            SgprOrigin::TableDescChoice { def_insts, .. } => {
+                                col.raw_descriptor_defs.insert(def_insts[0]);
+                                col.raw_descriptor_defs.insert(def_insts[1]);
+                            }
+                            SgprOrigin::BoundedCbvIndexedHeapDesc { def_inst_idx, .. } => {
+                                col.direct_descriptor_defs.insert(def_inst_idx);
+                            }
+                            SgprOrigin::DivergentDesc { def_inst_idx } => {
+                                col.divergent_descriptor_defs.insert(def_inst_idx);
                             }
                             SgprOrigin::ConstImmediate { def_inst_idx, .. } => {
                                 if !layout.is_get_lod {
@@ -8399,6 +8650,16 @@ fn step_origin_state(
                             StorageDispatch::TwoWayChoice { choice_id, keys },
                         );
                     }
+                    SgprOrigin::TableDescChoice { def_insts, .. } => {
+                        col.raw_descriptor_defs.insert(def_insts[0]);
+                        col.raw_descriptor_defs.insert(def_insts[1]);
+                    }
+                    SgprOrigin::BoundedCbvIndexedHeapDesc { def_inst_idx, .. } => {
+                        col.direct_descriptor_defs.insert(def_inst_idx);
+                    }
+                    SgprOrigin::DivergentDesc { def_inst_idx } => {
+                        col.divergent_descriptor_defs.insert(def_inst_idx);
+                    }
                     SgprOrigin::UserTable { user_sgpr, .. }
                         if (stage != ShaderStage::Vertex || !*idxen)
                             && rsrc_sgpr_opt.is_some_and(|rsrc_sgpr| {
@@ -8539,6 +8800,16 @@ fn step_origin_state(
                             StorageDispatch::TwoWayChoice { choice_id, keys },
                         );
                     }
+                    SgprOrigin::TableDescChoice { def_insts, .. } => {
+                        col.raw_descriptor_defs.insert(def_insts[0]);
+                        col.raw_descriptor_defs.insert(def_insts[1]);
+                    }
+                    SgprOrigin::BoundedCbvIndexedHeapDesc { def_inst_idx, .. } => {
+                        col.direct_descriptor_defs.insert(def_inst_idx);
+                    }
+                    SgprOrigin::DivergentDesc { def_inst_idx } => {
+                        col.divergent_descriptor_defs.insert(def_inst_idx);
+                    }
                     SgprOrigin::UserTable { user_sgpr, .. }
                         if (stage != ShaderStage::Vertex || !*idxen)
                             && rsrc_sgpr_opt.is_some_and(|rsrc_sgpr| {
@@ -8592,16 +8863,18 @@ fn mark_untainted_def_and_parents(
     force_start: bool,
     def_parents: &BTreeMap<usize, usize>,
     def_aliases: &BTreeMap<usize, BTreeSet<usize>>,
+    divergent_def_aliases: Option<&BTreeMap<usize, BTreeSet<usize>>>,
     tainted_defs: &BTreeSet<usize>,
     vsharp_fetch_insts: &mut BTreeSet<usize>,
 ) {
     let mut visited: BTreeSet<usize> = BTreeSet::new();
     let mut stack: Vec<(usize, bool)> = vec![(start_def, force_start)];
     while let Some((cur, forced)) = stack.pop() {
-        if visited.len() >= 32 || !visited.insert(cur) {
+        if visited.len() >= 128 || !visited.insert(cur) {
             continue;
         }
-        if forced || !tainted_defs.contains(&cur) {
+        let suppressed = forced || !tainted_defs.contains(&cur);
+        if suppressed {
             vsharp_fetch_insts.insert(cur);
         }
         if let Some(aliases) = def_aliases.get(&cur) {
@@ -8611,7 +8884,15 @@ fn mark_untainted_def_and_parents(
                 }
             }
         }
-        if let Some(&parent) = def_parents.get(&cur)
+        if let Some(div_aliases) = divergent_def_aliases.and_then(|m| m.get(&cur)) {
+            for &alias in div_aliases {
+                if !visited.contains(&alias) {
+                    stack.push((alias, false));
+                }
+            }
+        }
+        if suppressed
+            && let Some(&parent) = def_parents.get(&cur)
             && !visited.contains(&parent)
         {
             stack.push((parent, false));
@@ -9044,6 +9325,7 @@ fn analyze_vsharp_indirections(
     let mut visits: Vec<u8> = vec![0; num_blocks];
     let mut worklist: BTreeSet<BlockId> = BTreeSet::new();
     let mut pass1_def_aliases: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
+    let mut pass1_divergent_def_aliases: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
     let entry_state = OriginState::initial(stage, is_mesh, &unreferenced_user_sgprs);
     let Some(entry) = cfg.entry() else {
         return DescriptorAnalysis::default();
@@ -9149,7 +9431,11 @@ fn analyze_vsharp_indirections(
                     worklist.insert(succ);
                 }
                 Some(existing) => {
-                    if existing.join_from(edge_state, &mut pass1_def_aliases) {
+                    if existing.join_from(
+                        edge_state,
+                        &mut pass1_def_aliases,
+                        &mut pass1_divergent_def_aliases,
+                    ) {
                         worklist.insert(succ);
                     }
                 }
@@ -9161,6 +9447,7 @@ fn analyze_vsharp_indirections(
     // record descriptor uses, tainting, nested pointer chains, and CBV sources.
     let mut collector = AnalysisCollector {
         def_aliases: pass1_def_aliases,
+        divergent_def_aliases: pass1_divergent_def_aliases,
         ..AnalysisCollector::default()
     };
     for (bid, block) in cfg.blocks.iter().enumerate() {
@@ -9193,8 +9480,10 @@ fn analyze_vsharp_indirections(
         tainted_defs,
         def_parents,
         def_aliases,
+        divergent_def_aliases,
         direct_descriptor_defs,
         raw_descriptor_defs,
+        divergent_descriptor_defs,
         buffer_load_uses,
         cbv_ptr_loads,
         direct_root_cbvs,
@@ -9207,22 +9496,34 @@ fn analyze_vsharp_indirections(
             true,
             &def_parents,
             &def_aliases,
+            None,
             &tainted_defs,
             &mut out.vsharp_fetch_insts,
         );
     }
 
     for def_idx in raw_descriptor_defs {
-        if !tainted_defs.contains(&def_idx) {
-            mark_untainted_def_and_parents(
-                def_idx,
-                false,
-                &def_parents,
-                &def_aliases,
-                &tainted_defs,
-                &mut out.vsharp_fetch_insts,
-            );
-        }
+        mark_untainted_def_and_parents(
+            def_idx,
+            false,
+            &def_parents,
+            &def_aliases,
+            None,
+            &tainted_defs,
+            &mut out.vsharp_fetch_insts,
+        );
+    }
+
+    for def_idx in divergent_descriptor_defs {
+        mark_untainted_def_and_parents(
+            def_idx,
+            false,
+            &def_parents,
+            &def_aliases,
+            Some(&divergent_def_aliases),
+            &tainted_defs,
+            &mut out.vsharp_fetch_insts,
+        );
     }
 
     for buf_use in buffer_load_uses {
@@ -9236,6 +9537,7 @@ fn analyze_vsharp_indirections(
                 true,
                 &def_parents,
                 &def_aliases,
+                None,
                 &tainted_defs,
                 &mut out.vsharp_fetch_insts,
             );
@@ -9253,6 +9555,7 @@ fn analyze_vsharp_indirections(
                 false,
                 &def_parents,
                 &def_aliases,
+                None,
                 &tainted_defs,
                 &mut out.vsharp_fetch_insts,
             );
@@ -9272,6 +9575,7 @@ fn analyze_vsharp_indirections(
                     false,
                     &def_parents,
                     &def_aliases,
+                    None,
                     &tainted_defs,
                     &mut out.vsharp_fetch_insts,
                 );
@@ -32272,5 +32576,304 @@ fn cs_main() { return; }
             SgprOrigin::Unwritten,
             "mesh s20 written by SMEM before any read must be Unwritten"
         );
+    }
+
+    #[test]
+    fn divergent_branch_sampler_desc_loads_do_not_leak_root_descriptor_in_mesh_compute_vertex() {
+        // 1) Mesh shader (`Rdna2StageOverride::Mesh`, user data starts at `s16`, implicit sampler
+        //    heap at `s24`) exercising all three divergent sampler-load suppression paths (#663):
+        //    (a) 16-byte-stride `if/else` loading `s[0:3]` from `s24 + 1024` vs `s24 + 1072`
+        //        -> `DivergentDesc` consumed by `image_sample_lz`.
+        //    (b) 32-byte-aligned `if/else` loading `s[4:7]` from `s24 + 1024` vs `s24 + 1056`
+        //        -> `TableDescChoice` consumed by non-store `image_sample_lz`.
+        //    (c) Divergent VGPR-spilled sampler (`s24 + 1040` vs `s24 + 1072`) restored inside a
+        //        non-uniform waterfall loop (`v_readfirstlane_b32` + `v_cmp_eq_u64` +
+        //        `s_and_saveexec_b64` + `image_sample_lz`): `v_cmp_eq_u64` must NOT taint the
+        //        spilled sampler defs.
+        //    Plus a normal static sampler at `s24 + 1024` and a T# at `s16 + 0x20`.
+        //    Must produce zero leaked `RootDescriptor { user_sgpr: 24 }` uniform binding, valid
+        //    `mesh_output`, and Naga-validated WGSL.
+        let mut mesh_words = Vec::new();
+        // s[40:41] = {s16, 0} (resource table ptr), s[42:43] = {s24, 0} (sampler heap ptr)
+        mesh_words.push(enc_sop1(0x03, 40, 16));
+        mesh_words.push(enc_sop1(0x03, 41, 0x80));
+        mesh_words.push(enc_sop1(0x03, 42, 24));
+        mesh_words.push(enc_sop1(0x03, 43, 0x80));
+        // Load T# at s16 + 0x20 into s[48:55]
+        mesh_words.extend_from_slice(&enc_smem(0x03, 48, 20, 0x7D, 0x20, false, false));
+        // Static sampler at s24 + 1024 into s[56:59] -> gives s24 a reflected sampler binding
+        mesh_words.extend_from_slice(&enc_smem(0x02, 56, 21, 0x7D, 1024, false, false));
+        mesh_words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 10, 12, 14)); // image_sample_lz v[10:13], v[0:1], s[48:55], s[56:59]
+
+        // (a) if/else loading s[0:3] from s24 + 1024 vs s24 + 1072
+        mesh_words.push(enc_sopc(0x06, 17, 128 + 0)); // s_cmp_eq_u32 s17, 0
+        let cbr_a = mesh_words.len();
+        mesh_words.push(0); // s_cbranch_scc0 ELSE_A
+        mesh_words.extend_from_slice(&enc_smem(0x02, 0, 21, 0x7D, 1024, false, false));
+        let br_a = mesh_words.len();
+        mesh_words.push(0); // s_branch MERGE_A
+        let else_a = mesh_words.len() * 4;
+        mesh_words.extend_from_slice(&enc_smem(0x02, 0, 21, 0x7D, 1072, false, false));
+        let merge_a = mesh_words.len() * 4;
+        mesh_words[cbr_a] = enc_sopp(0x04, branch_simm(cbr_a * 4, else_a));
+        mesh_words[br_a] = enc_sopp(0x02, branch_simm(br_a * 4, merge_a));
+        mesh_words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 14, 12, 0)); // ssamp=0 (s[0:3])
+
+        // (b) if/else loading s[4:7] from s24 + 1024 vs s24 + 1056 (32B-aligned TableDescChoice)
+        mesh_words.push(enc_sopc(0x06, 17, 128 + 1)); // s_cmp_eq_u32 s17, 1
+        let cbr_b = mesh_words.len();
+        mesh_words.push(0);
+        mesh_words.extend_from_slice(&enc_smem(0x02, 4, 21, 0x7D, 1024, false, false));
+        let br_b = mesh_words.len();
+        mesh_words.push(0);
+        let else_b = mesh_words.len() * 4;
+        mesh_words.extend_from_slice(&enc_smem(0x02, 4, 21, 0x7D, 1056, false, false));
+        let merge_b = mesh_words.len() * 4;
+        mesh_words[cbr_b] = enc_sopp(0x04, branch_simm(cbr_b * 4, else_b));
+        mesh_words[br_b] = enc_sopp(0x02, branch_simm(br_b * 4, merge_b));
+        mesh_words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 18, 12, 1)); // ssamp=1 (s[4:7])
+
+        // (c) Divergent VGPR-spilled sampler + v_readfirstlane_b32 + v_cmp_eq_u64 waterfall
+        mesh_words.push(enc_sopc(0x06, 17, 128 + 2)); // s_cmp_eq_u32 s17, 2
+        let cbr_c = mesh_words.len();
+        mesh_words.push(0);
+        mesh_words.extend_from_slice(&enc_smem(0x02, 60, 21, 0x7D, 1040, false, false));
+        let br_c = mesh_words.len();
+        mesh_words.push(0);
+        let else_c = mesh_words.len() * 4;
+        mesh_words.extend_from_slice(&enc_smem(0x02, 60, 21, 0x7D, 1072, false, false));
+        let merge_c = mesh_words.len() * 4;
+        mesh_words[cbr_c] = enc_sopp(0x04, branch_simm(cbr_c * 4, else_c));
+        mesh_words[br_c] = enc_sopp(0x02, branch_simm(br_c * 4, merge_c));
+        for k in 0..4u8 {
+            mesh_words.push(enc_vop1(0x01, 30 + k, u16::from(60 + k))); // v_mov_b32 v[30+k], s[60+k]
+        }
+        for k in 0..4u8 {
+            mesh_words.push(enc_vop1(0x02, 64 + k, 256 + u16::from(30 + k))); // v_readfirstlane_b32 s[64+k], v[30+k]
+        }
+        // v_cmp_eq_u64 vcc, s[64:65], v[30:31] (VOPC 0xE2) and VOP3 v_cmp_eq_u64 s[6:7], s[66:67], v[32:33]
+        mesh_words.push(enc_vopc(0xE2, 64, 30));
+        mesh_words.extend_from_slice(&enc_vop3(
+            0xE2,
+            6,
+            66,
+            256 + 32,
+            0,
+            false,
+            0,
+            0,
+            0,
+        ));
+        mesh_words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 22, 12, 16)); // ssamp=16 (s[64:67])
+
+        // Mesh output exports so `mesh_output` is emitted cleanly
+        mesh_words.push(enc_sop1(0x03, 124, 0xFF));
+        mesh_words.push((1u32 << 12) | 3u32);
+        mesh_words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_ALLOC_REQ)));
+        mesh_words.push(enc_vop2(0x03, 10, 256 + 10, 14));
+        mesh_words.push(enc_vop2(0x03, 10, 256 + 10, 18));
+        mesh_words.push(enc_vop2(0x03, 10, 256 + 10, 22));
+        mesh_words.push(enc_vop1(0x01, 8, 0xFF));
+        mesh_words.push((2u32 << 20) | (1u32 << 10));
+        mesh_words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [10, 11, 12, 13]));
+        mesh_words.extend_from_slice(&enc_exp(20, 0x1, false, true, false, [8, 0, 0, 0]));
+        mesh_words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_DONE)));
+        mesh_words.push(enc_sopp(0x01, 0));
+
+        let mesh_bytes = words_to_bytes(&mesh_words);
+        let mesh_opts = Rdna2TranslateOptions {
+            stage: Rdna2StageOverride::Mesh,
+            ..Rdna2TranslateOptions::default()
+        };
+        let mesh_out =
+            translate_rdna2_to_wgsl(&mesh_bytes, &mesh_opts).expect("mesh translation must succeed");
+        assert!(mesh_out.naga_validated);
+        assert_eq!(
+            mesh_out.mesh_output,
+            Some(MeshOutputLayout {
+                max_vertices: 3,
+                max_primitives: 1,
+                vertex_words: 4,
+            })
+        );
+        assert!(
+            !mesh_out.bindings.iter().any(|b| {
+                b.kind == "uniform"
+                    && matches!(
+                        b.source,
+                        Some(WgslBindingSource::RootDescriptor { user_sgpr: 24, .. })
+                    )
+            }),
+            "must NOT leak RootDescriptor(s24) uniform binding: {:?}",
+            mesh_out.bindings
+        );
+        assert!(
+            mesh_out.bindings.iter().any(|b| {
+                b.kind == "sampler"
+                    && b.source
+                        == Some(WgslBindingSource::Table {
+                            user_sgpr: 24,
+                            table_byte_offset: 1024,
+                        })
+            }),
+            "expected reflected sampler at s24+1024: {:?}",
+            mesh_out.bindings
+        );
+        assert_naga_wgsl_valid(&mesh_out.wgsl);
+
+        // 2) Compute shader (`s11` sampler heap, user data starts at `s4`):
+        //    if/else selecting `s11 + 1024` vs `s11 + 1072` + `s_cselect_b64` selecting T#s.
+        let mut cs_words = Vec::new();
+        cs_words.push(enc_sop1(0x03, 30, 4));
+        cs_words.push(enc_sop1(0x03, 31, 0x80));
+        cs_words.push(enc_sop1(0x03, 32, 11));
+        cs_words.push(enc_sop1(0x03, 33, 0x80));
+        // Static sampler on s11 + 1024 + divergent T# selected via s_cselect_b64
+        cs_words.extend_from_slice(&enc_smem(0x03, 40, 15, 0x7D, 0x20, false, false)); // T#0 @ s4+0x20
+        cs_words.extend_from_slice(&enc_smem(0x03, 48, 15, 0x7D, 0x60, false, false)); // T#1 @ s4+0x60
+        cs_words.push(enc_sopc(0x06, 5, 128 + 0));
+        cs_words.push(enc_sop2(0x0B, 40, 40, 48)); // s_cselect_b64 s[40:41], s[40:41], s[48:49]
+        cs_words.push(enc_sop2(0x0B, 42, 42, 50));
+        cs_words.push(enc_sop2(0x0B, 44, 44, 52));
+        cs_words.push(enc_sop2(0x0B, 46, 46, 54));
+        let cs_cbr = cs_words.len();
+        cs_words.push(0);
+        cs_words.extend_from_slice(&enc_smem(0x02, 56, 16, 0x7D, 1024, false, false));
+        let cs_br = cs_words.len();
+        cs_words.push(0);
+        let cs_else = cs_words.len() * 4;
+        cs_words.extend_from_slice(&enc_smem(0x02, 56, 16, 0x7D, 1072, false, false));
+        let cs_merge = cs_words.len() * 4;
+        cs_words[cs_cbr] = enc_sopp(0x04, branch_simm(cs_cbr * 4, cs_else));
+        cs_words[cs_br] = enc_sopp(0x02, branch_simm(cs_br * 4, cs_merge));
+        cs_words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 4, 10, 14)); // T#=s[40:47], S#=s[56:59]
+        // Store result via UAV V# at s4 + 0x100
+        cs_words.extend_from_slice(&enc_smem(0x02, 60, 15, 0x7D, 0x100, false, false));
+        cs_words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 4, 15, 0x7D));
+        cs_words.push(enc_sopp(0x01, 0));
+
+        let cs_out = translate_as(&cs_words, Rdna2StageOverride::Compute);
+        assert!(cs_out.naga_validated);
+        assert_eq!(cs_out.unsupported_op_count, 0, "WGSL:\n{}", cs_out.wgsl);
+        assert!(
+            !cs_out.bindings.iter().any(|b| {
+                b.kind == "uniform"
+                    && matches!(
+                        b.source,
+                        Some(WgslBindingSource::RootDescriptor {
+                            user_sgpr: 4 | 11,
+                            ..
+                        })
+                    )
+            }),
+            "compute must NOT leak RootDescriptor(s4/s11) uniform binding: {:?}",
+            cs_out.bindings
+        );
+        assert_naga_wgsl_valid(&cs_out.wgsl);
+
+        // 3) Vertex shader (`s19` sampler heap, user data starts at `s8`) + negative tests:
+        //    (a) Divergent sampler on `s19` (`1024` vs `1072`) -> MUST be suppressed (zero leak).
+        //    (b) Genuine `RootDescriptor` CBV on `s[8:9]` loaded across `if/else` (`+0` vs `+16`)
+        //        and consumed by VALU (`v_add_f32`) -> MUST NOT be suppressed!
+        //    (c) Disjoint-branch register reuse: branch 1 loads CBV floats from `s[10:11] + 0`
+        //        into `s[24:27]` and consumes `s24` in VALU (tainted!), branch 2 loads sampler
+        //        from `s19 + 1040` into `s[24:27]` (untainted!), after merge `image_sample_lz`
+        //        consumes `s[24:27]` -> `s10` CBV MUST stay, `s19` sampler MUST be suppressed!
+        let mut vs_words = Vec::new();
+        vs_words.push(enc_sop1(0x03, 30, 12)); // s30 = s12 (resource table ptr)
+        vs_words.push(enc_sop1(0x03, 31, 0x80));
+        vs_words.push(enc_sop1(0x03, 32, 19)); // s32 = s19 (sampler heap ptr)
+        vs_words.push(enc_sop1(0x03, 33, 0x80));
+        vs_words.extend_from_slice(&enc_smem(0x03, 40, 15, 0x7D, 0x20, false, false)); // T# @ s12+0x20
+
+        // (a) Divergent sampler on s19 (1024 vs 1072)
+        vs_words.push(enc_sopc(0x06, 13, 128 + 0));
+        let vs_cbr_a = vs_words.len();
+        vs_words.push(0);
+        vs_words.extend_from_slice(&enc_smem(0x02, 48, 16, 0x7D, 1024, false, false));
+        let vs_br_a = vs_words.len();
+        vs_words.push(0);
+        let vs_else_a = vs_words.len() * 4;
+        vs_words.extend_from_slice(&enc_smem(0x02, 48, 16, 0x7D, 1072, false, false));
+        let vs_merge_a = vs_words.len() * 4;
+        vs_words[vs_cbr_a] = enc_sopp(0x04, branch_simm(vs_cbr_a * 4, vs_else_a));
+        vs_words[vs_br_a] = enc_sopp(0x02, branch_simm(vs_br_a * 4, vs_merge_a));
+        vs_words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 4, 10, 12)); // T#=s[40:47], S#=s[48:51]
+
+        // (b) Genuine RootDescriptor CBV on s[8:9] across if/else (+0 vs +16) -> consumed by VALU
+        vs_words.push(enc_sopc(0x06, 13, 128 + 1));
+        let vs_cbr_b = vs_words.len();
+        vs_words.push(0);
+        vs_words.extend_from_slice(&enc_smem(0x02, 52, 4, 0x7D, 0, false, false)); // s[8:9] + 0
+        let vs_br_b = vs_words.len();
+        vs_words.push(0);
+        let vs_else_b = vs_words.len() * 4;
+        vs_words.extend_from_slice(&enc_smem(0x02, 52, 4, 0x7D, 16, false, false)); // s[8:9] + 16
+        let vs_merge_b = vs_words.len() * 4;
+        vs_words[vs_cbr_b] = enc_sopp(0x04, branch_simm(vs_cbr_b * 4, vs_else_b));
+        vs_words[vs_br_b] = enc_sopp(0x02, branch_simm(vs_br_b * 4, vs_merge_b));
+        vs_words.push(enc_vop2(0x03, 4, 52, 4)); // v4 = s52 + v4 (VALU consumer!)
+
+        // (c) Mixed disjoint-branch register reuse on s[24:27]:
+        //     branch 1: CBV load from s[10:11]+0 -> consumed by v_add_f32 (tainted!)
+        //     branch 2: sampler load from s19+1040 (untainted!)
+        //     after merge: image_sample_lz reads s[24:27]
+        vs_words.push(enc_sopc(0x06, 13, 128 + 2));
+        let vs_cbr_c = vs_words.len();
+        vs_words.push(0);
+        vs_words.extend_from_slice(&enc_smem(0x02, 24, 5, 0x7D, 0, false, false)); // s[10:11] + 0
+        vs_words.push(enc_vop2(0x03, 5, 24, 5)); // v5 = s24 + v5 (taints s[10:11] load!)
+        let vs_br_c = vs_words.len();
+        vs_words.push(0);
+        let vs_else_c = vs_words.len() * 4;
+        vs_words.extend_from_slice(&enc_smem(0x02, 24, 16, 0x7D, 1040, false, false)); // s19 + 1040
+        let vs_merge_c = vs_words.len() * 4;
+        vs_words[vs_cbr_c] = enc_sopp(0x04, branch_simm(vs_cbr_c * 4, vs_else_c));
+        vs_words[vs_br_c] = enc_sopp(0x02, branch_simm(vs_br_c * 4, vs_merge_c));
+        vs_words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 8, 10, 6)); // S#=s[24:27]
+
+        vs_words.push(enc_vop2(0x03, 4, 256 + 4, 8));
+        vs_words.extend_from_slice(&enc_exp(12, 0xF, false, true, false, [4, 5, 6, 7]));
+        vs_words.push(enc_sopp(0x01, 0));
+
+        let vs_out = translate_as(&vs_words, Rdna2StageOverride::Vertex);
+        assert!(vs_out.naga_validated);
+        assert_eq!(vs_out.unsupported_op_count, 0, "WGSL:\n{}", vs_out.wgsl);
+        assert!(
+            !vs_out.bindings.iter().any(|b| {
+                b.kind == "uniform"
+                    && matches!(
+                        b.source,
+                        Some(WgslBindingSource::RootDescriptor { user_sgpr: 19, .. })
+                    )
+            }),
+            "vertex must NOT leak RootDescriptor(s19) uniform binding: {:?}",
+            vs_out.bindings
+        );
+        assert!(
+            vs_out.bindings.iter().any(|b| {
+                b.kind == "uniform"
+                    && b.source
+                        == Some(WgslBindingSource::RootDescriptor {
+                            user_sgpr: 8,
+                            table_byte_offset: None,
+                        })
+            }),
+            "genuine RootDescriptor CBV s[8:9] consumed by VALU across branches must NOT be suppressed: {:?}",
+            vs_out.bindings
+        );
+        assert!(
+            vs_out.bindings.iter().any(|b| {
+                b.kind == "uniform"
+                    && b.source
+                        == Some(WgslBindingSource::RootDescriptor {
+                            user_sgpr: 10,
+                            table_byte_offset: None,
+                        })
+            }),
+            "tainted CBV s[10:11] in disjoint-branch reuse must NOT be suppressed: {:?}",
+            vs_out.bindings
+        );
+        assert_naga_wgsl_valid(&vs_out.wgsl);
     }
 }
