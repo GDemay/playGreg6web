@@ -1440,6 +1440,7 @@ void test_failed_async_pipeline_resolves(NativeExecutor& ex) {
     // would invalidate the whole command buffer.
     CHECK(ex.stats().draws_skipped > before.draws_skipped);
     CHECK(ex.stats().pipeline_failed_skips > before.pipeline_failed_skips);
+    CHECK(!ex.stats().failed_pipeline_hashes.empty());  // feeds --auto-quarantine
 
     // Same for a compute pipeline whose async compile failed.
     const ExecutorStats mid = ex.stats();

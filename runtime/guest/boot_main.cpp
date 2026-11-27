@@ -24,6 +24,7 @@
 //   --present-interval honor|min1  title-driven present gap: honor = the title's sync interval (30 fps menus like the console), min1 = 1 vblank (default)
 //   --timer-resolution 1ms|default  host timer: 1ms (default) raises the OS tick + high-resolution sleeps; default = OS tick (A/B baseline)
 //   --skip-shader <hash>[,<hash>]  native executor: skip every draw / dispatch of these shaders (diagnostic; counted as `quarantined` in the drop table)
+//   --auto-quarantine <path>  native executor: load <path> as a skip list and append every shader whose pipeline creation failed (pipeline_failed) to it, so later runs of the title skip it; delete the file to reset
 //   --skip-shader-file <path>  same, one `<hash> [reason] [issue]` per line; the repo list runtime/gpu/native_exec/shader_quarantine.txt is loaded too when present (--no-quarantine-list skips it)
 //   --profile-guest[=hz] opt-in sampling profiler (Windows, default 1000 Hz): suspends each guest thread, maps the host RIP and stack to
 //                        lifted functions (sub_<guest VA>) / runtime / OS and writes `guest_profile` (flat + inclusive top-N per thread)
@@ -290,6 +291,7 @@ struct Options {
     bool window = false;            // --window: live GPU stream to the native executor (PLAYGTA6_NATIVE_EXECUTOR builds)
     std::string show_target;        // --show-target <selector>
     playgta6::gpu::native_exec::ShaderQuarantine quarantine;  // --skip-shader / --skip-shader-file / repo list
+    std::string auto_quarantine;  // --auto-quarantine <path>
     bool no_quarantine_list = false;  // --no-quarantine-list
     bool overlay = false;           // --overlay: start with the stats overlay on (F3 toggles)
     uint32_t window_width = 1280, window_height = 720;  // --window-size WxH
@@ -454,6 +456,17 @@ bool parse(int argc, char** argv, Options& o) {
             if (!f || !o.quarantine.add_text(text, false, path, &err)) {
                 std::fprintf(stderr, "--skip-shader-file: %s\n", f ? err.c_str() : ("cannot read " + path).c_str());
                 return false;
+            }
+        } else if (a == "--auto-quarantine" && i + 1 < argc) {
+            o.auto_quarantine = argv[++i];
+            std::ifstream f(o.auto_quarantine, std::ios::binary);
+            if (f) {  // a missing file is fine: it is created on the first failure
+                std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                std::string err;
+                if (!o.quarantine.add_text(text, false, o.auto_quarantine, &err)) {
+                    std::fprintf(stderr, "--auto-quarantine: %s\n", err.c_str());
+                    return false;
+                }
             }
         } else if (a == "--no-quarantine-list") {
             o.no_quarantine_list = true;
@@ -1135,6 +1148,25 @@ std::atomic<bool> g_guest_faulted{false};  // set before the window is held open
 std::string g_fault_text;                  // one-line fault summary for the overlay, written before g_guest_faulted
 std::string g_stop_message;                // the "Stopped: ..." / "Crashed: ..." banner (guest/stop_message.h), same timing
 
+// --auto-quarantine: appends newly failed pipeline hashes to the file as soon as they show up (a hang or
+// crash right after must not lose them).
+void persist_auto_quarantine(const std::vector<uint64_t>& failed) {
+    static size_t written = 0;
+    if (g_options.auto_quarantine.empty() || failed.size() <= written) return;
+    written = failed.size();
+    std::string existing;
+    {
+        std::ifstream f(g_options.auto_quarantine, std::ios::binary);
+        if (f) existing.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    }
+    const std::string out = playgta6::gpu::native_exec::ShaderQuarantine::merge_auto_file(existing, failed);
+    if (out.empty()) return;
+    std::ofstream o(g_options.auto_quarantine, std::ios::binary | std::ios::trunc);
+    o << out;
+    std::fprintf(stderr, "auto-quarantine: %zu failed pipeline hash(es) recorded in %s\n", failed.size(),
+                 g_options.auto_quarantine.c_str());
+}
+
 // Window title on the pump thread, about 4 times a second: fps, frames presented, draws per frame
 // of the newest interval, and the fault state.
 void live_title_tick(ne::NativeExecutor& exec) {
@@ -1153,6 +1185,7 @@ void live_title_tick(ne::NativeExecutor& exec) {
         g_live_final_stats = std::move(json);
     }
     const ne::ExecutorStats& st = exec.stats();
+    persist_auto_quarantine(st.failed_pipeline_hashes);
     const auto now = std::chrono::steady_clock::now();
     if (last.t.time_since_epoch().count() != 0) {
         const double dt = std::chrono::duration<double>(now - last.t).count();

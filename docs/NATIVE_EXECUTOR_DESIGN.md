@@ -415,6 +415,8 @@ one step further, it rebuilds.
 ## Shader quarantine (diagnostic)
 
 `--skip-shader <hash>[,<hash>]`, `--skip-shader-file <path>` and the repo list `runtime/gpu/native_exec/shader_quarantine.txt`
+
+`--auto-quarantine <path>` loads `<path>` as a skip list and appends every shader whose pipeline creation failed (`pipeline_failed`, `failed_pipeline_hashes` in the stats) as `<hash> pipeline_failed auto`, written as soon as it happens so a following hang does not lose it; delete the file to reset (keep one per title). `tools/bisect_shader_skip.py init|next|report` halves a suspect list between runs through `--skip-shader-file` to find the shader behind a hang.
 (empty by default; format `<hash> <reason> <issue link>`, `--no-quarantine-list` ignores it) make the executor skip every
 draw and dispatch (indirect ones too) of the listed shaders, so a program that hangs or crashes the GPU can be bisected
 without a rebuild. Each skip is counted per phase in the boot report's drop table as `quarantined` with the hash; no
