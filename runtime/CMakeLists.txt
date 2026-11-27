@@ -611,6 +611,12 @@ else()
     target_link_libraries(test_guest_window_e2e PRIVATE playgta6_core)
     add_test(NAME playgta6_guest_window_e2e_tests COMMAND test_guest_window_e2e)
 
+    add_executable(test_fragmented_buffer_flush ../tests/bench_fragmented_buffer_flush.cpp)
+    target_link_libraries(test_fragmented_buffer_flush PRIVATE playgta6_core)
+    add_test(NAME fragmented_buffer_sparse COMMAND test_fragmented_buffer_flush 2 2 fragmented)
+    add_test(NAME fragmented_buffer_unaligned_tail COMMAND test_fragmented_buffer_flush 2 2 fragmented-unaligned)
+    add_test(NAME fragmented_buffer_dense COMMAND test_fragmented_buffer_flush 2 1 fragmented-dense)
+
     add_executable(test_d3d12_xs_exports ../tests/test_d3d12_xs_exports.cpp)
     target_link_libraries(test_d3d12_xs_exports PRIVATE playgta6_core)
     add_test(NAME playgta6_d3d12_xs_exports_tests COMMAND test_d3d12_xs_exports)
