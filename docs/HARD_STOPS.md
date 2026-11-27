@@ -104,6 +104,10 @@ There is no package-licence or entitlement answer anywhere: no slot returns a li
 2. What XSystemGetAppSpecificDeviceId should return, if anything.
 3. Which HRESULT slot 71/72 should settle on long term (see section 2).
 4. Any policy for XStore slots 20/21/22/65/68 if the boot reaches them.
+5. S7: Media Foundation object-creating imports (MFCreateAttributes, MFCreateMediaType, MFCreateSourceResolver,
+   MFCreateSourceReaderFromMediaSource) are still `deny` in `runtime/os/shim_audit.h` (section 7.4).
+6. S8: CRT `fopen` / `_wfopen` / `remove` (and the msvcp140 `_fsopen` / `_wfsopen`) are `ok` since #1998; no owner
+   decision is left (section 7.5).
 
 ## 7. Pending owner decisions: device id, XUser sign-in state and XStore licence
 
@@ -190,3 +194,57 @@ Recommendation: **A**.
 
 Confidence: high for the state machines and the result codes they test; medium for "no error screen" (not every
 consumer of the add-on callback was traced) and the exact retry interval.
+
+Evidence (static, re-checked against main after #1998):
+- The surface survey on #663 (`tools/surface_survey.py`) marks 20, 22, 23, 28, 65, 67 and 69 as tier A (call site
+  reachable from the entry); the other 33 called XStore slots are tier C (no evidence). No recorded run has hit any
+  of them yet: the boot stops earlier at the device-id and XUser decisions (7.1, 7.2).
+- When: after XUserAddAsync has produced an active local user (past the Start Screen, "OFFLINEPLAYER (A)"), and only
+  once slot 14 reports that user as signed in. Game licence first (28), add-on licences (65, then 20) as the title
+  asks for each item.
+- Result handling: every failure path is a local state change (full game / item unavailable) plus a quiet retry;
+  no call site treats a store error as fatal. With option A only 28 and 65 are ever answered, and the tripwire
+  slots (20, 22, 23, 67, 69) stay unreachable because no success is ever claimed.
+
+### 7.4 S7: Media Foundation imports (MFPlat / MFReadWrite)
+
+State on main: MFStartup, MFShutdown and MFGetSystemTime are `ok` (MFStartup returns `S_OK`). MFCreateAttributes,
+MFCreateMediaType, MFCreateSourceResolver and MFReadWrite MFCreateSourceReaderFromMediaSource are `deny` ("host COM:
+IUnknown stub with a host vtable"), so the first call traps as an unresolved import. Not a store or licence item; it
+is listed here because the bridge verdict needs a decision.
+
+What the title does (static, behaviour only):
+- All seven MF imports are used by one small media-playback module that decodes a file into NV12 video and PCM audio
+  (the audio path only accepts 16-bit, 48 kHz, at most 2 channels). It runs on its own worker thread, created
+  lazily on the first playback request; nothing in start-up calls it.
+- Open sequence: CoInitializeEx, MFStartup, MFCreateAttributes, MFCreateSourceResolver (open by URL), the source
+  reader, then media types per stream. Every step tests the HRESULT; any failure releases what was created and
+  marks the request failed. No retry, no assertion, no abort in the module. Who consumes the "failed" state was
+  not traced beyond the module.
+- When: tier C in the surface survey; no recorded native or browser run has reached the module.
+
+| Option | Consequence |
+|---|---|
+| A. Bind the four denied imports as failing shims: write a null object, return an MF error (for example `MF_E_UNSUPPORTED_SERVICE` or `E_NOTIMPL`) (recommended) | Playback requests fail cleanly through the title's own error path; no host COM object reaches the guest. |
+| B. Make MFStartup fail instead | Same outcome one step earlier, but MFStartup is already `ok` and shared with MFShutdown bookkeeping. |
+| C. Real decoding (guest-callable IMFAttributes / IMFSourceReader) | Large; needs a guest-vtable COM layer and a decoder. Only worth it if a run shows the content matters. |
+| D. Leave `deny` | Boot traps the first time the title plays such a file. |
+
+Recommendation: **A** now (cheap, truthful "unavailable"), revisit C only if a run shows missing content.
+
+### 7.5 S8: CRT `fopen` / `_wfopen` / `remove`
+
+State on main: resolved, no owner decision left. #1998 (Marc) changed `pg6_crt_fopen`, `pg6_crt_wfopen`,
+`pg6_crt_remove`, `pg6_crt_fsopen` and `pg6_crt_wfsopen` from `deny` to `ok` in `runtime/os/shim_audit.h`: they go
+through the sandboxed virtual `FILE*` over the writable `/userdata` overlay and the read-only game root and never
+touch the host file system. The surface survey lines on #663 that still list them as denied predate #1998.
+
+What the title does with them (static):
+- `_wfopen` (two call sites): only the crash-report writer, which saves a `.crash.log` file after a fault and logs
+  "failed to save" if the open fails. Never reached on a healthy boot.
+- `fopen` (one call site): a generic file-stream open that picks the mode from flags and records errno on a null
+  result; the caller handles failure.
+- `remove` (one call site): the local-storage service's delete; failure is logged with errno and reported to the
+  caller.
+
+Recommendation: nothing to decide; keep the sandbox rules (writes only under `/userdata`) as the guard.
