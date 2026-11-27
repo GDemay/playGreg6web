@@ -328,7 +328,11 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 - [ ] **Web performance #2081 — Nonchunked shared texture sources** — `IN PROGRESS` (#2081, @GDemay). Native WebGPU shared-source writes avoid application snapshots when supported; cached legacy fallback and huge-upload chunking preserved. No game FPS claim.
 
 ## Track 5: Browser Shell, Streaming I/O & Audio (`web/`, `server/`, `tools/`, JS + Python + Rust)
+
 **Goal:** Fast, resilient browser loading, streaming, caching, and audio playback.
+
+- [x] **Web performance — WGSL metadata binding scans** — `DONE` (#2149, @GDemay) *(synthetic data; no game FPS claim)*
+  - Batch bounded reference matching during shader metadata compaction, preserving identifier and comment semantics.
 
 - [x] **W1 — OPFS + LRU Range Cache in `io_worker.js`** — `DONE` (PR #15, closes #2) *(no game files required)*
   - Cache fetched HTTP `206` byte chunks in Origin Private File System (OPFS) with a configurable budget + `bootset.json` prefetch on startup.
