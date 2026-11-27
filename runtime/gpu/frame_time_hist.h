@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <vector>
 
 namespace playgta6::gpu {
 
@@ -79,10 +80,21 @@ public:
     // the title's requested minimum gap in vblanks (0: immediate/unknown).
     void add(uint64_t dt_us, uint64_t draws, uint32_t gap_vblanks, uint64_t wall_ms) {
         accumulate(phases_[kAll], dt_us, gap_vblanks, wall_ms);
+        if (dt_us >= kHitchUs) {
+            if (hitches_.size() < kMaxHitches) hitches_.push_back({wall_ms, dt_us});
+            else ++hitches_dropped_;
+        }
         accumulate(phases_[phase_for_draws(draws)], dt_us, gap_vblanks, wall_ms);
     }
     const Phase_& phase(int p) const { return phases_[p]; }
-    void clear() { phases_ = {}; }
+    void clear() { phases_ = {}; hitches_.clear(); hitches_dropped_ = 0; }
+
+    // Bounded log of the first kMaxHitches present gaps of at least kHitchUs: {end of the gap in ms since
+    // boot, gap in ms}. Lets other reports (audio_out.underrun_events) be correlated with guest stalls.
+    static constexpr uint64_t kHitchUs = 100000;
+    static constexpr size_t kMaxHitches = 32;
+    struct Hitch { uint64_t at_ms; uint64_t dt_us; };
+    const std::vector<Hitch>& hitches() const { return hitches_; }
 
     std::string to_json() const {
         std::string o = "{\"vblank_ms\": 16.667, \"bucket_edges_ms\": [";
@@ -114,7 +126,13 @@ public:
             }
             o += "]}";
         }
-        o += first ? "]}" : "\n  ]}";
+        o += first ? "]" : "\n  ]";
+        o += ", \"hitches_dropped\": " + std::to_string(hitches_dropped_) + ", \"hitches\": [";
+        for (size_t i = 0; i < hitches_.size(); ++i) {
+            o += (i ? ", " : "") + std::string("{\"at_ms\": ") + std::to_string(hitches_[i].at_ms) +
+                 ", \"ms\": " + num(static_cast<double>(hitches_[i].dt_us) / 1000.0) + "}";
+        }
+        o += "]}";
         return o;
     }
 
@@ -146,6 +164,8 @@ private:
     }
 
     std::array<Phase_, kPhaseCount> phases_{};
+    std::vector<Hitch> hitches_;
+    uint64_t hitches_dropped_ = 0;
 };
 
 }  // namespace playgta6::gpu

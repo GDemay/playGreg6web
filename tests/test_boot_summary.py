@@ -180,6 +180,21 @@ class BootSummaryTest(unittest.TestCase):
             self.assertEqual(bs.main([d]), 0)
             self.assertEqual(bs.main([str(Path(d) / "missing.json")]), 2)
 
+    def test_underruns_next_to_frame_hitches(self):
+        rep = {"audio_out": {"device_open": True, "frames_played": 1, "underruns": 2,
+                             "underruns_guest_stalled": 1, "underruns_host_starved": 1,
+                             "underrun_events": [
+                                 {"at_ms": 5300, "frames_missing": 480, "cause": "guest_stalled", "ms_since_push": 380,
+                                  "ring_fill_ms": 40, "present_index": 311},
+                                 {"at_ms": 9000, "frames_missing": 96, "cause": "host_starved", "ms_since_push": 3,
+                                  "ring_fill_ms": 40, "present_index": 600}]},
+               "frame_times": {"hitches": [{"at_ms": 5400, "ms": 410}, {"at_ms": 20000, "ms": 150}]}}
+        text = chr(10).join(bs.underrun_lines(rep))
+        self.assertIn("1 guest_stalled, 1 host_starved", text)
+        self.assertIn("<- frame hitch 410 ms ending at 5400 ms", text)
+        self.assertNotIn("9000 ms  96 frames missing  host_starved  3 ms since push, ring 40 ms, present #600  <-", text)
+        self.assertIn("frame hitch 150 ms ending at 20000 ms: no underrun", text)
+
 
 if __name__ == "__main__":
     unittest.main()
