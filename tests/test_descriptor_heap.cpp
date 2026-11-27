@@ -2896,6 +2896,85 @@ void test_copy_descriptors_batched_gen_and_overlap_fastpath() {
     CHECK(cache.size() == 0);
 }
 
+void test_large_descriptor_range_intersections() {
+    // Reference: snapshot every source, then scatter in caller order. Exercise
+    // zero ranges, nested/duplicate sources, late overlap, and mixed heaps.
+    constexpr uint32_t ranges = 256, slots = 272;
+    for (uint32_t seed = 0; seed < 3; ++seed) for (uint32_t scenario = 0; scenario < 6; ++scenario) {
+        DescriptorHeapRegistry reg;
+        std::array<DescriptorHeap*, 3> heaps{};
+        std::array<std::vector<ViewDescriptor>, 3> expected;
+        for (uint32_t h = 0; h < heaps.size(); ++h) {
+            heaps[h] = make_heap(reg, DescriptorHeapType::CbvSrvUav, slots, false);
+            fill_srvs(reg, heaps[h], 0, slots, 10000 * h + 1);
+            for (uint32_t i = 0; i < slots; ++i) expected[h].push_back(*heaps[h]->view(i));
+        }
+        std::vector<CpuDescriptorHandle> src, dst;
+        std::vector<uint32_t> counts, src_heap, dst_heap, src_index, dst_index;
+        for (uint32_t i = 0; i < ranges; ++i) {
+            const uint32_t sh = scenario == 2 ? 1 + i % 2 : (scenario == 3 ? i % 3 : 0);
+            const uint32_t dh = scenario == 4 ? i % 2 : 0;
+            src_heap.push_back(sh); dst_heap.push_back(dh);
+            src_index.push_back(8 * ((i * 7 + seed) % 32) + i % 2);
+            dst_index.push_back(8 * ((i * 13 + seed) % 32) + 4);
+            counts.push_back(i % 4);
+        }
+        // This alias occurs beyond the short destination prefix and corrupts a
+        // source read later unless the whole source stream is snapshotted first.
+        if (scenario == 1) dst_index[65] = src_index[3];
+        for (uint32_t i = 0; i < ranges; ++i) {
+            src.push_back(counts[i] ? cpu_at(heaps[src_heap[i]], src_index[i]) : CpuDescriptorHandle{0});
+            dst.push_back(counts[i] ? cpu_at(heaps[dst_heap[i]], dst_index[i]) : CpuDescriptorHandle{0});
+        }
+        std::array<uint64_t, 3> updates{}, generations{};
+        for (uint32_t h = 0; h < heaps.size(); ++h) generations[h] = heaps[h]->generation();
+        if (scenario == 5) {
+            src.back() = cpu_at(heaps[0], slots);  // late failure must not write any destination
+        } else {
+            std::vector<ViewDescriptor> stream;
+            for (uint32_t i = 0; i < ranges; ++i) for (uint32_t j = 0; j < counts[i]; ++j)
+                stream.push_back(expected[src_heap[i]][src_index[i] + j]);
+            size_t cursor = 0;
+            for (uint32_t i = 0; i < ranges; ++i) {
+                bool changed = false;
+                for (uint32_t j = 0; j < counts[i]; ++j) {
+                    auto& target = expected[dst_heap[i]][dst_index[i] + j];
+                    changed |= std::memcmp(&target, &stream[cursor], sizeof(target)) != 0;
+                    target = stream[cursor++];
+                }
+                updates[dst_heap[i]] += changed;
+            }
+        }
+        const auto status = reg.copy_descriptors(ranges, dst.data(), counts.data(), ranges,
+                                                 src.data(), counts.data(), DescriptorHeapType::CbvSrvUav);
+        CHECK(scenario == 5 ? status != Status::Ok : status == Status::Ok);
+        for (uint32_t h = 0; h < heaps.size(); ++h) {
+            CHECK(heaps[h]->generation() == generations[h] + updates[h]);
+            for (uint32_t i = 0; i < slots; ++i)
+                CHECK(std::memcmp(heaps[h]->view(i), &expected[h][i], sizeof(ViewDescriptor)) == 0);
+        }
+    }
+}
+
+void test_large_sampler_range_intersections() {
+    DescriptorHeapRegistry reg;
+    auto* heap = make_heap(reg, DescriptorHeapType::Sampler, 256, false);
+    std::array<CpuDescriptorHandle, 128> src{}, dst{};
+    for (uint32_t i = 0; i < src.size(); ++i) {
+        SamplerDesc sampler;
+        sampler.mip_lod_bias = static_cast<float>(i) * 0.001f;
+        CHECK(reg.create_sampler(sampler, cpu_at(heap, 2 * i)) == Status::Ok);
+        src[i] = cpu_at(heap, 2 * ((i * 67) % 128));
+        dst[i] = cpu_at(heap, 2 * i + 1);
+    }
+    const auto generation = heap->generation();
+    CHECK(reg.copy_descriptors(src.size(), dst.data(), nullptr, src.size(), src.data(), nullptr,
+                               DescriptorHeapType::Sampler) == Status::Ok);
+    CHECK(heap->generation() == generation + src.size());
+    for (uint32_t i = 0; i < src.size(); ++i)
+        CHECK(heap->sampler(2 * i + 1)->desc.mip_lod_bias == static_cast<float>((i * 67) % 128) * 0.001f);
+}
+
 }  // namespace
 
 int main() {
@@ -2933,6 +3012,8 @@ int main() {
     test_handle_overflow_guard_and_cbv_alignment_guard();
     test_slot_source_switch_and_rebuild_clears_metadata();
     test_copy_descriptors_batched_gen_and_overlap_fastpath();
+    test_large_descriptor_range_intersections();
+    test_large_sampler_range_intersections();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_descriptor_heap failed with %d failure(s)\n", g_failures);

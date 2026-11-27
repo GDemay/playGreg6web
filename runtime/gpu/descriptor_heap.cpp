@@ -5,6 +5,7 @@
 #include <iterator>
 #include <cstring>
 #include <limits>
+#include <utility>
 
 namespace playgta6::gpu::d3d12_state {
 
@@ -791,6 +792,7 @@ struct CopyScratch {
     std::vector<ResolvedDescriptor> src;
     std::vector<ViewDescriptor> views;
     std::vector<SamplerDescriptor> samplers;
+    std::vector<std::pair<uint64_t, uint64_t>> source_intervals;
 };
 
 CopyScratch& copy_scratch() {
@@ -922,9 +924,14 @@ Status DescriptorHeapRegistry::copy_descriptors(
         }
     }
 
+    // Large single-destination-heap batches need not compare every range pair. Keep a short
+    // destination prefix on the old path so common early overlaps remain cheap.
+    const bool indexed_overlap = may_overlap && !multi_dst_heap &&
+                                 num_dst_ranges >= 64 && num_src_ranges >= 64;
+    const uint32_t checked_dst = indexed_overlap ? 4u : num_dst_ranges;
     bool overlap = false;
     if (may_overlap) {
-        for (uint32_t d = 0; d < num_dst_ranges && !overlap; ++d) {
+        for (uint32_t d = 0; d < checked_dst && !overlap; ++d) {
             const uint32_t dn = size_of(dst_range_sizes, d);
             if (dn == 0) {
                 continue;
@@ -941,6 +948,35 @@ Status DescriptorHeapRegistry::copy_descriptors(
                     break;
                 }
             }
+        }
+    }
+
+    if (indexed_overlap && !overlap) {
+        auto& intervals = scratch.source_intervals;
+        intervals.clear();
+        for (uint32_t s = 0; s < num_src_ranges; ++s) {
+            const uint32_t n = size_of(src_range_sizes, s);
+            if (n != 0 && scratch.src[s].heap == single_dst_heap) {
+                const uint64_t lo = scratch.src[s].index;
+                intervals.emplace_back(lo, lo + n);
+            }
+        }
+        if (!std::is_sorted(intervals.begin(), intervals.end())) {
+            std::sort(intervals.begin(), intervals.end());
+        }
+        // A predecessor's prefix maximum also covers nested/duplicate source ranges.
+        uint64_t end = 0;
+        for (auto& interval : intervals) {
+            end = std::max(end, interval.second);
+            interval.second = end;
+        }
+        for (uint32_t d = checked_dst; d < num_dst_ranges && !overlap; ++d) {
+            const uint32_t n = size_of(dst_range_sizes, d);
+            if (n == 0) continue;
+            const uint64_t lo = scratch.dst[d].index;
+            const auto after = std::lower_bound(intervals.begin(), intervals.end(), lo + n,
+                [](const auto& interval, uint64_t limit) { return interval.first < limit; });
+            overlap = after != intervals.begin() && std::prev(after)->second > lo;
         }
     }
 
