@@ -242,7 +242,39 @@ struct BinkGlobals {
     uint64_t open_calls = 0;     // every BinkOpenWithOptions call that reached this shim
     uint64_t refused_opens = 0;  // BinkOpenWithOptions calls answered with no movie
     std::unordered_map<Pg6HBink, BinkClock> clocks;  // playback clock per open movie
+    uint64_t lookup_null = 0;                        // A4(a): Bink* export lookups that returned null
+    std::vector<std::string> lookup_null_names;      // first distinct names
+    struct OpenRecord {
+        std::string path;
+        uint32_t flags = 0;
+        bool opened = false;
+    };
+    std::vector<OpenRecord> open_log;  // A4(c): first calls
 };
+
+constexpr size_t kBinkLogKeep = 16;
+constexpr size_t kBinkLogPrint = 8;
+
+void record_open_locked(BinkGlobals& g, const char* name, uint32_t flags, bool from_memory, bool opened) {
+    if (g.open_log.size() >= kBinkLogKeep) {
+        return;
+    }
+    BinkGlobals::OpenRecord r;
+    if (from_memory) {
+        r.path = "<memory image>";
+    } else if (name != nullptr) {
+        r.path.assign(name, strnlen(name, 260));
+    } else {
+        r.path = "<null>";
+    }
+    r.flags = flags;
+    r.opened = opened;
+    if (g.open_log.size() < kBinkLogPrint) {
+        std::fprintf(stderr, "Bink2: stream create path=%s flags=0x%x -> %s\n", r.path.c_str(),
+                     static_cast<unsigned>(flags), opened ? "opened" : "refused");
+    }
+    g.open_log.push_back(std::move(r));
+}
 
 BinkGlobals& bink_globals() {
     static BinkGlobals g;
@@ -671,6 +703,59 @@ void pg6_bink_shim_stats(uint64_t* open_calls, uint64_t* refused_opens) {
     if (refused_opens != nullptr) {
         *refused_opens = g.refused_opens;
     }
+}
+
+void pg6_bink_note_lookup_null(const char* name) {
+    auto& g = mw::bink_globals();
+    std::lock_guard<std::mutex> lock(g.mutex);
+    ++g.lookup_null;
+    const std::string n = name != nullptr ? std::string(name, strnlen(name, 128)) : std::string("<null>");
+    for (const std::string& s : g.lookup_null_names) {
+        if (s == n) {
+            return;
+        }
+    }
+    if (g.lookup_null_names.size() < mw::kBinkLogKeep) {
+        if (g.lookup_null_names.size() < mw::kBinkLogPrint) {
+            std::fprintf(stderr, "Bink2: export lookup returned null: %s\n", n.c_str());
+        }
+        g.lookup_null_names.push_back(n);
+    }
+}
+
+uint64_t pg6_bink_lookup_null_count(void) {
+    auto& g = mw::bink_globals();
+    std::lock_guard<std::mutex> lock(g.mutex);
+    return g.lookup_null;
+}
+
+size_t pg6_bink_lookup_null_name(size_t i, char* buf, size_t cap) {
+    auto& g = mw::bink_globals();
+    std::lock_guard<std::mutex> lock(g.mutex);
+    if (i >= g.lookup_null_names.size() || buf == nullptr || cap == 0) {
+        return 0;
+    }
+    std::snprintf(buf, cap, "%s", g.lookup_null_names[i].c_str());
+    return 1;
+}
+
+size_t pg6_bink_open_log(size_t i, char* path, size_t path_cap, uint32_t* flags, int* opened) {
+    auto& g = mw::bink_globals();
+    std::lock_guard<std::mutex> lock(g.mutex);
+    if (i >= g.open_log.size()) {
+        return 0;
+    }
+    const auto& r = g.open_log[i];
+    if (path != nullptr && path_cap != 0) {
+        std::snprintf(path, path_cap, "%s", r.path.c_str());
+    }
+    if (flags != nullptr) {
+        *flags = r.flags;
+    }
+    if (opened != nullptr) {
+        *opened = r.opened ? 1 : 0;
+    }
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,6 +1411,7 @@ Pg6HBink pg6_mw_bink_open_with_options(const char* name,
         auto& g = mw::bink_globals();
         std::lock_guard<std::mutex> lock(g.mutex);
         ++g.refused_opens;
+        mw::record_open_locked(g, name, flags, from_memory, false);
         if (g.refused_opens <= 4) {
             std::fprintf(stderr, "Bink2: BinkOpenWithOptions(flags 0x%x): %s, movie not opened\n",
                          static_cast<unsigned>(flags),
@@ -1362,6 +1448,7 @@ Pg6HBink pg6_mw_bink_open_with_options(const char* name,
     auto& g = mw::bink_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
     g.live_handles.insert(bink);
+    mw::record_open_locked(g, name, flags, from_memory, true);
     g.clocks[bink] = mw::BinkClock{std::chrono::steady_clock::now(), {}, false};
     std::fprintf(stderr, "Bink2: opened an in-memory movie: %ux%u, %u frames at %u/%u fps (not decoded)\n",
                  h.width, h.height, h.frames, h.frame_rate, h.frame_rate_div);
