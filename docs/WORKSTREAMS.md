@@ -98,6 +98,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Implement synchronous worker-to-worker `Atomics.wait` range reads over a `SharedArrayBuffer` so `host_httpfs_open`/`read`/`close` work from pthreads.
 - [x] **O3 — Virtual Memory & Threading/TLS Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Implement Win32/Xbox `VirtualAlloc`/`VirtualProtect` arena mapping, `TlsAlloc`, SRW locks, and `XTaskQueue` on top of Emscripten pthreads.
+- [x] **OS-PERF2052 — Preserve first-fit while skipping occupied VA prefixes** — `DONE` (#2052, @GDemay). Scope: `runtime/os/vmem.{h,cpp}`, focused differential tests and synthetic reserve-only benchmark. Native allocation-search measurements only; game/browser boot impact unmeasured.
+
 - [x] **O4 — `GameInput` & `/userdata` Shims** — `DONE` (PR #12, closes #3) *(no game files required)*
   - Read `playgta6::InputState` from the input `SharedArrayBuffer` and map save paths to IndexedDB `/userdata`.
 - [x] **O5 — Xbox GDK `xgameruntime` & Win32 Kernel/File/Sync C-ABI Shims** — `DONE` (PR #36, closes #16) *(no game files required)*

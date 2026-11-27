@@ -262,6 +262,7 @@ VirtualMemoryArena::VirtualMemoryArena(uint64_t default_base,
         default_base_ = kDefaultArenaBase;
     }
     space_base_ = default_base_;
+    occupied_prefix_end_ = default_base_;
 
     uint64_t size = 0;
     if (space_size == 0 || !align_up_checked(space_size, kAllocationGranularity, size) ||
@@ -473,14 +474,21 @@ bool VirtualMemoryArena::range_overlaps_locked(uint64_t start, uint64_t end) con
     return false;
 }
 
-uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) const {
+uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) {
     const uint64_t space_end = shared_zone_size_ != 0 ? shared_zone_base_ : space_base_ + space_size_;
-    uint64_t candidate = default_base_;
-    for (const auto& [base, res] : reservations_) {
+    uint64_t candidate = occupied_prefix_end_;
+    // Hinted inserts and placeholder coalesces may cover the cached boundary.
+    auto it = reservations_.upper_bound(candidate);
+    if (it != reservations_.begin()) --it;
+    for (; it != reservations_.end(); ++it) {
+        const auto& res = it->second;
         const uint64_t res_end = res.base + res.granularity_size;
         if (res_end <= candidate) {
             continue;
         }
+        // Learn only contiguous occupied prefixes, never skip a hole that a smaller
+        // future request could use. Do this lazily so hinted reservations pay no search.
+        if (res.base <= occupied_prefix_end_) occupied_prefix_end_ = res_end;
         if (candidate <= UINT64_MAX - granularity_size &&
             candidate + granularity_size <= res.base) {
             break;
@@ -849,6 +857,7 @@ bool VirtualMemoryArena::release_locked(uint64_t base_addr) {
     deferred_noaccess_bytes_ -= res_deferred_noaccess;
     committed_bytes_ -= res_committed;
     invalidate_lookup_cache_locked();
+    occupied_prefix_end_ = std::min(occupied_prefix_end_, base_addr);
     reservations_.erase(it);
     return true;
 }
