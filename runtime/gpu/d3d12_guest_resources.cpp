@@ -2009,6 +2009,14 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     return !staged.empty();
 }
 
+void Device::note_address_texture_evicted(const AddressTextureKey& key) {
+    if (evicted_address_keys_.size() >= kMaxEvictedAddressKeys) {
+        evicted_address_keys_.clear();
+    }
+    evicted_address_keys_.insert(AddressTextureKeyHash{}(key));
+    small_texture_pool().note_address_eviction();
+}
+
 uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, uint32_t width, uint32_t height,
                                         uint32_t depth, uint32_t mip_levels, uint32_t d3d12_layout,
                                         GpuTextureDimension dim, bool uav) {
@@ -2093,6 +2101,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
             }
             const uint32_t victim = victim_it->second.id;
             const uint64_t victim_bytes = victim_it->second.budget_bytes;
+            note_address_texture_evicted(victim_it->first);
             address_textures_.erase(victim_it);
             untrack_guest_texture(victim);
             bridge_->unregister_resource(victim);
@@ -2124,6 +2133,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         const uint32_t victim = oldest->second.id;
         const AddressTextureEntry victim_entry = oldest->second;
         const bool victim_in_frame = oldest_in_frame;
+        note_address_texture_evicted(oldest->first);
         address_textures_.erase(oldest);
         untrack_guest_texture(victim);
         bridge_->unregister_resource(victim);
@@ -2151,6 +2161,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     if (drop.size() != 0) {
         submit(drop);
     }
+    small_texture_pool().note_address_miss(evicted_address_keys_.erase(AddressTextureKeyHash{}(key)) != 0);
 
     // Backlog 38: the host texture of a released small texture of the same shape is reused; every
     // texel of every mip is zeroed below, so nothing of its previous content stays visible.
