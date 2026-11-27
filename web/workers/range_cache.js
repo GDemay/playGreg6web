@@ -3004,17 +3004,34 @@ class RangeCache {
         list = [];
         byPath.set(e.path, list);
       }
-      list.push(e);
+      list.push({ ...e, order: i });
+    }
+    for (const list of byPath.values()) {
+      list.sort((a, b) => a.offset - b.offset);
     }
 
     return coalesced.map((span) => {
+      if (span.mergedCount <= 1) return { ...span, savedBytes: 0 };
       const pathEntries = byPath.get(span.path) || [];
-      let sumIndividualAligned = 0;
-      for (let i = 0; i < pathEntries.length; i += 1) {
+      // Only entries starting inside this span can contribute. Keep the end inclusive:
+      // at very large integer offsets, adding a small positive length can leave the offset unchanged.
+      let lo = 0;
+      let hi = pathEntries.length;
+      while (lo < hi) {
+        const mid = lo + Math.floor((hi - lo) / 2);
+        if (pathEntries[mid].offset < span.offset) lo = mid + 1;
+        else hi = mid;
+      }
+      const contained = [];
+      for (let i = lo; i < pathEntries.length && pathEntries[i].offset <= span.end; i += 1) {
         const e = pathEntries[i];
-        if (e.offset >= span.offset && e.offset + e.length <= span.end) {
-          sumIndividualAligned += this._chunkAlignedSpanBytes(e.offset, e.length);
-        }
+        if (e.offset + e.length <= span.end) contained.push(e);
+      }
+      // Retain input summation order even for counts above Number's exact integer range.
+      contained.sort((a, b) => a.order - b.order);
+      let sumIndividualAligned = 0;
+      for (const e of contained) {
+        sumIndividualAligned += this._chunkAlignedSpanBytes(e.offset, e.length);
       }
       const mergedAligned = this._chunkAlignedSpanBytes(span.offset, span.length);
       const chunkRoundingSavings = Math.max(0, sumIndividualAligned - mergedAligned);
