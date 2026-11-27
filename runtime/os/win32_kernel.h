@@ -74,14 +74,25 @@ inline constexpr uint32_t MEM_DECOMMIT = kMemDecommit;
 inline constexpr uint32_t MEM_RELEASE = kMemRelease;
 inline constexpr uint32_t MEM_FREE = kMemFree;
 inline constexpr uint32_t MEM_PRIVATE = 0x00020000u;
+inline constexpr uint32_t MEM_RESET = kMemReset;
+inline constexpr uint32_t MEM_TOP_DOWN = 0x00100000u;
+inline constexpr uint32_t MEM_WRITE_WATCH = 0x00200000u;
+inline constexpr uint32_t MEM_RESET_UNDO = kMemResetUndo;
+inline constexpr uint32_t MEM_LARGE_PAGES = 0x20000000u;
 
 // Page protection flags.
 inline constexpr uint32_t PAGE_NOACCESS = static_cast<uint32_t>(PageProtect::NoAccess);
 inline constexpr uint32_t PAGE_READONLY = static_cast<uint32_t>(PageProtect::ReadOnly);
 inline constexpr uint32_t PAGE_READWRITE = static_cast<uint32_t>(PageProtect::ReadWrite);
+inline constexpr uint32_t PAGE_WRITECOPY = 0x08u;
+inline constexpr uint32_t PAGE_EXECUTE = 0x10u;
 inline constexpr uint32_t PAGE_EXECUTE_READ = static_cast<uint32_t>(PageProtect::ExecuteRead);
 inline constexpr uint32_t PAGE_EXECUTE_READWRITE =
     static_cast<uint32_t>(PageProtect::ExecuteReadWrite);
+inline constexpr uint32_t PAGE_EXECUTE_WRITECOPY = 0x80u;
+inline constexpr uint32_t PAGE_GUARD = 0x100u;
+inline constexpr uint32_t PAGE_NOCACHE = 0x200u;
+inline constexpr uint32_t PAGE_WRITECOMBINE = 0x400u;
 
 // TLS sentinel.
 inline constexpr uint32_t TLS_OUT_OF_INDEXES = TlsTable::kInvalidIndex;
@@ -95,6 +106,19 @@ inline constexpr uint32_t INFINITE_TIMEOUT = 0xFFFFFFFFu;
 // File access / sharing / creation / seek constants.
 inline constexpr uint32_t GENERIC_READ = 0x80000000u;
 inline constexpr uint32_t GENERIC_WRITE = 0x40000000u;
+inline constexpr uint32_t GENERIC_ALL = 0x10000000u;
+inline constexpr uint32_t FILE_READ_DATA = 0x00000001u;
+inline constexpr uint32_t FILE_WRITE_DATA = 0x00000002u;
+inline constexpr uint32_t FILE_APPEND_DATA = 0x00000004u;
+inline constexpr uint32_t FILE_FLAG_OVERLAPPED = 0x40000000u;
+
+inline constexpr bool has_read_access(uint32_t desired_access) {
+    return (desired_access & (GENERIC_READ | GENERIC_ALL | FILE_READ_DATA)) != 0u;
+}
+
+inline constexpr bool has_write_access(uint32_t desired_access) {
+    return (desired_access & (GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0u;
+}
 
 inline constexpr uint32_t FILE_SHARE_READ = 0x00000001u;
 inline constexpr uint32_t FILE_SHARE_WRITE = 0x00000002u;

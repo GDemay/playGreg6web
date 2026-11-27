@@ -3,6 +3,7 @@
 #include "os/audio_file_stats.h"
 #include "os/guest_window.h"
 #include "os/host_sleep.h"
+#include "os/win32_sync.h"
 #include "os/xmem_windows.h"
 
 #include <algorithm>
@@ -140,6 +141,7 @@ struct FileObject final : KernelObject {
 
     std::shared_mutex mutex;
     bool is_userdata = false;
+    bool is_overlapped = false;
     uint32_t desired_access = 0;
     std::atomic<uint64_t> cursor{0};
     std::string userdata_key;
@@ -158,16 +160,17 @@ struct KernelHandleTable {
         std::unordered_map<Handle, std::shared_ptr<KernelObject>> objects;
     };
 
-    std::atomic<Handle> next_handle{1};
+    // Step by 4 like Windows kernel handles so bit 0 is always 0 (safe for OVERLAPPED::hEvent | 1).
+    std::atomic<Handle> next_handle{4};
     std::array<Shard, kNumShards> shards;
 
     static size_t shard_index(Handle h) {
-        return static_cast<size_t>(h & (kNumShards - 1));
+        return static_cast<size_t>((h >> 2) & (kNumShards - 1));
     }
 
     Handle allocate_candidate() {
         for (;;) {
-            const Handle h = next_handle.fetch_add(1, std::memory_order_relaxed);
+            const Handle h = next_handle.fetch_add(4, std::memory_order_relaxed);
             if (h != kNullHandle && h != INVALID_HANDLE_VALUE) {
                 return h;
             }
@@ -304,7 +307,11 @@ std::string parent_key(const std::string& key) {
 // ---------------------------------------------------------------------------
 
 bool to_page_protect(uint32_t protect, PageProtect& out) {
-    switch (protect) {
+    constexpr uint32_t kModifiers = PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE;
+    if ((protect & ~(0xFFu | kModifiers)) != 0u) {
+        return false;
+    }
+    switch (protect & 0xFFu) {
         case PAGE_NOACCESS:
             out = PageProtect::NoAccess;
             return true;
@@ -312,12 +319,15 @@ bool to_page_protect(uint32_t protect, PageProtect& out) {
             out = PageProtect::ReadOnly;
             return true;
         case PAGE_READWRITE:
+        case PAGE_WRITECOPY:
             out = PageProtect::ReadWrite;
             return true;
+        case PAGE_EXECUTE:
         case PAGE_EXECUTE_READ:
             out = PageProtect::ExecuteRead;
             return true;
         case PAGE_EXECUTE_READWRITE:
+        case PAGE_EXECUTE_WRITECOPY:
             out = PageProtect::ExecuteReadWrite;
             return true;
         default:
@@ -458,7 +468,8 @@ bool resolve_httpfs_file_size_locked(FileObject& file, uint64_t& out_size) {
 
 Handle create_file_impl_inner(std::string_view raw_path,
                         uint32_t desired_access,
-                        uint32_t creation_disposition) {
+                        uint32_t creation_disposition,
+                        uint32_t flags_and_attributes) {
     if (raw_path.empty()) {
         SetLastError(ERROR_PATH_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -474,6 +485,10 @@ Handle create_file_impl_inner(std::string_view raw_path,
     if (is_userdata) {
         auto& overlay = userdata_overlay();
         std::lock_guard<std::mutex> lock(overlay.mutex);
+        if (overlay.dirs.count(normalized) != 0) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return INVALID_HANDLE_VALUE;
+        }
         auto it = overlay.files.find(normalized);
         const bool exists = (it != overlay.files.end());
 
@@ -517,7 +532,7 @@ Handle create_file_impl_inner(std::string_view raw_path,
                     SetLastError(ERROR_FILE_NOT_FOUND);
                     return INVALID_HANDLE_VALUE;
                 }
-                if ((desired_access & GENERIC_WRITE) == 0) {
+                if (!has_write_access(desired_access)) {
                     SetLastError(ERROR_ACCESS_DENIED);
                     return INVALID_HANDLE_VALUE;
                 }
@@ -533,13 +548,14 @@ Handle create_file_impl_inner(std::string_view raw_path,
 
         auto file = std::make_shared<FileObject>();
         file->is_userdata = true;
+        file->is_overlapped = (flags_and_attributes & FILE_FLAG_OVERLAPPED) != 0u;
         file->desired_access = desired_access;
         file->userdata_key = normalized;
         return handle_table().insert(std::move(file));
     }
 
     // Read-only HTTPFS asset path.
-    if ((desired_access & GENERIC_WRITE) != 0 ||
+    if (has_write_access(desired_access) ||
         creation_disposition == CREATE_NEW ||
         creation_disposition == CREATE_ALWAYS ||
         creation_disposition == TRUNCATE_EXISTING) {
@@ -565,6 +581,7 @@ Handle create_file_impl_inner(std::string_view raw_path,
 
     auto file = std::make_shared<FileObject>();
     file->is_userdata = false;
+    file->is_overlapped = (flags_and_attributes & FILE_FLAG_OVERLAPPED) != 0u;
     file->desired_access = desired_access;
     file->httpfs_client = client;
     file->httpfs_handle = hfs_handle;
@@ -575,8 +592,11 @@ Handle create_file_impl_inner(std::string_view raw_path,
 
 bool audio_trace_enabled();
 
-Handle create_file_impl(std::string_view raw_path, uint32_t desired_access, uint32_t creation_disposition) {
-    const Handle h = create_file_impl_inner(raw_path, desired_access, creation_disposition);
+Handle create_file_impl(std::string_view raw_path,
+                        uint32_t desired_access,
+                        uint32_t creation_disposition,
+                        uint32_t flags_and_attributes) {
+    const Handle h = create_file_impl_inner(raw_path, desired_access, creation_disposition, flags_and_attributes);
     audio_files::stats().record(raw_path, h != INVALID_HANDLE_VALUE);
     // PG6_AUDIO_TRACE=1: every open of a path naming audio, with the key it resolved to.
     if (audio_trace_enabled() && audio_files::path_names_audio(raw_path)) {
@@ -1152,7 +1172,7 @@ bool set_end_of_file_at_cursor(Handle handle) {
     }
     auto* file = static_cast<FileObject*>(obj.get());
     std::unique_lock<std::shared_mutex> lock(file->mutex);
-    if (!file->is_userdata || (file->desired_access & GENERIC_WRITE) == 0) {
+    if (!file->is_userdata || !has_write_access(file->desired_access)) {
         SetLastError(ERROR_ACCESS_DENIED);
         return false;
     }
@@ -1355,9 +1375,17 @@ uint64_t VirtualAlloc(uint64_t address,
                       uint32_t allocation_type,
                       uint32_t protect) {
     PageProtect pp = PageProtect::NoAccess;
-    if (size == 0 || allocation_type == 0 ||
-        (allocation_type & ~(MEM_RESERVE | MEM_COMMIT)) != 0 ||
+    constexpr uint32_t kHintFlags = MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_LARGE_PAGES;
+    constexpr uint32_t kAllowedFlags = MEM_RESERVE | MEM_COMMIT | MEM_RESET | MEM_RESET_UNDO | kHintFlags;
+    const uint32_t core_type = allocation_type & ~kHintFlags;
+    if (size == 0 || core_type == 0 ||
+        (allocation_type & ~kAllowedFlags) != 0 ||
         !to_page_protect(protect, pp)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if ((core_type & (MEM_RESET | MEM_RESET_UNDO)) != 0 &&
+        core_type != MEM_RESET && core_type != MEM_RESET_UNDO) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -1368,12 +1396,14 @@ uint64_t VirtualAlloc(uint64_t address,
         SetLastError(ERROR_INVALID_ADDRESS);
         return 0;
     }
-    uint64_t result = get_vmem_arena()->virtual_alloc(address, size, allocation_type, pp);
+    uint64_t result = get_vmem_arena()->virtual_alloc(address, size, core_type, pp);
     if (result != 0 && window_address != address) {
         result = window_address - address + result;  // the title's form of the address
     }
     if (result == 0) {
-        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        SetLastError((core_type == MEM_RESET || core_type == MEM_RESET_UNDO)
+                         ? ERROR_INVALID_PARAMETER
+                         : ERROR_NOT_ENOUGH_MEMORY);
     }
     return result;
 }
@@ -1677,10 +1707,7 @@ std::recursive_mutex* critical_section_lock(const CriticalSection* cs, bool crea
 }
 
 uint64_t current_thread_owner_id() {
-    // Any nonzero per-thread value works for inline OwningThread checks; prefer the shim's id.
-    static std::atomic<uint64_t> next{1};
-    thread_local const uint64_t id = next.fetch_add(1, std::memory_order_relaxed);
-    return id;
+    return static_cast<uint64_t>(win32::GetCurrentThreadId());
 }
 
 inline void cpu_pause_hint() {
@@ -1752,6 +1779,7 @@ void EnterCriticalSection(CriticalSection* critical_section) {
         lock->lock();
     }
     ++critical_section->recursion_count;
+    critical_section->lock_count = critical_section->recursion_count - 1;
     critical_section->owning_thread = current_thread_owner_id();
 }
 
@@ -1764,6 +1792,7 @@ bool TryEnterCriticalSection(CriticalSection* critical_section) {
         return false;
     }
     ++critical_section->recursion_count;
+    critical_section->lock_count = critical_section->recursion_count - 1;
     critical_section->owning_thread = current_thread_owner_id();
     return true;
 }
@@ -1775,8 +1804,12 @@ void LeaveCriticalSection(CriticalSection* critical_section) {
         SetLastError(ERROR_INVALID_HANDLE);
         return;
     }
-    if (critical_section->recursion_count > 0 && --critical_section->recursion_count == 0) {
-        critical_section->owning_thread = 0;
+    if (critical_section->recursion_count > 0) {
+        --critical_section->recursion_count;
+        critical_section->lock_count = critical_section->recursion_count - 1;
+        if (critical_section->recursion_count == 0) {
+            critical_section->owning_thread = 0;
+        }
     }
     lock->unlock();
 }
@@ -1796,13 +1829,12 @@ Handle CreateFileA(const char* file_name,
                    Handle template_file) {
     (void)share_mode;
     (void)security_attributes;
-    (void)flags_and_attributes;
     (void)template_file;
     if (file_name == nullptr) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
-    return create_file_impl(file_name, desired_access, creation_disposition);
+    return create_file_impl(file_name, desired_access, creation_disposition, flags_and_attributes);
 }
 
 Handle CreateFileW(const char16_t* file_name,
@@ -1814,14 +1846,13 @@ Handle CreateFileW(const char16_t* file_name,
                    Handle template_file) {
     (void)share_mode;
     (void)security_attributes;
-    (void)flags_and_attributes;
     (void)template_file;
     if (file_name == nullptr) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return INVALID_HANDLE_VALUE;
     }
     const std::string utf8_path = utf16_to_utf8(file_name);
-    return create_file_impl(utf8_path, desired_access, creation_disposition);
+    return create_file_impl(utf8_path, desired_access, creation_disposition, flags_and_attributes);
 }
 
 namespace {
@@ -1850,8 +1881,10 @@ void complete_overlapped(void* overlapped, uint32_t status, uint64_t transferred
     o.internal = status;
     o.internal_high = transferred;
     std::memcpy(overlapped, &o, sizeof(o));
-    if (o.event != 0) {
-        SetEvent(static_cast<Handle>(o.event));
+    // Bit 0 of hEvent suppresses IOCP notification on Windows and is not part of the event handle.
+    const Handle ev = static_cast<Handle>(o.event & ~uint64_t{1});
+    if (ev != 0) {
+        SetEvent(ev);
     }
 }
 
@@ -1913,8 +1946,10 @@ bool read_file_at(Handle file_handle,
     if (start != nullptr && !file->is_userdata) {
         std::shared_lock<std::shared_mutex> lock(file->mutex);
         const uint64_t offset = *start;
-        file->cursor.store(offset, std::memory_order_relaxed);
-        if ((file->desired_access & GENERIC_READ) == 0) {
+        if (!file->is_overlapped) {
+            file->cursor.store(offset, std::memory_order_relaxed);
+        }
+        if (!has_read_access(file->desired_access)) {
             SetLastError(ERROR_ACCESS_DENIED);
             return false;
         }
@@ -1943,7 +1978,9 @@ bool read_file_at(Handle file_handle,
             SetLastError(ERROR_READ_FAULT);
             return false;
         }
-        file->cursor.store(offset + static_cast<uint64_t>(got), std::memory_order_relaxed);
+        if (!file->is_overlapped) {
+            file->cursor.store(offset + static_cast<uint64_t>(got), std::memory_order_relaxed);
+        }
         if (bytes_read != nullptr) {
             *bytes_read = static_cast<uint32_t>(got);
         }
@@ -1952,11 +1989,11 @@ bool read_file_at(Handle file_handle,
 
     std::unique_lock<std::shared_mutex> lock(file->mutex);
     uint64_t cursor = start != nullptr ? *start : file->cursor.load(std::memory_order_relaxed);
-    if (start != nullptr) {
+    if (start != nullptr && !file->is_overlapped) {
         file->cursor.store(cursor, std::memory_order_relaxed);
     }
 
-    if ((file->desired_access & GENERIC_READ) == 0) {
+    if (!has_read_access(file->desired_access)) {
         SetLastError(ERROR_ACCESS_DENIED);
         return false;
     }
@@ -1986,7 +2023,9 @@ bool read_file_at(Handle file_handle,
         const size_t avail = data.size() - static_cast<size_t>(cursor);
         const size_t to_copy = std::min<size_t>(avail, bytes_to_read);
         std::memcpy(buffer, data.data() + static_cast<size_t>(cursor), to_copy);
-        file->cursor.store(cursor + to_copy, std::memory_order_relaxed);
+        if (start == nullptr || !file->is_overlapped) {
+            file->cursor.store(cursor + to_copy, std::memory_order_relaxed);
+        }
         if (bytes_read != nullptr) {
             *bytes_read = static_cast<uint32_t>(to_copy);
         }
@@ -2012,7 +2051,9 @@ bool read_file_at(Handle file_handle,
         SetLastError(ERROR_READ_FAULT);
         return false;
     }
-    file->cursor.store(cursor + static_cast<uint64_t>(got), std::memory_order_relaxed);
+    if (start == nullptr || !file->is_overlapped) {
+        file->cursor.store(cursor + static_cast<uint64_t>(got), std::memory_order_relaxed);
+    }
     if (bytes_read != nullptr) {
         *bytes_read = static_cast<uint32_t>(got);
     }
@@ -2033,11 +2074,11 @@ bool write_file_at(Handle file_handle,
     auto* file = static_cast<FileObject*>(obj.get());
     std::unique_lock<std::shared_mutex> lock(file->mutex);
     uint64_t cursor = start != nullptr ? *start : file->cursor.load(std::memory_order_relaxed);
-    if (start != nullptr) {
+    if (start != nullptr && !file->is_overlapped) {
         file->cursor.store(cursor, std::memory_order_relaxed);
     }
 
-    if (!file->is_userdata || (file->desired_access & GENERIC_WRITE) == 0) {
+    if (!file->is_userdata || !has_write_access(file->desired_access)) {
         SetLastError(ERROR_ACCESS_DENIED);
         return false;
     }
@@ -2049,15 +2090,28 @@ bool write_file_at(Handle file_handle,
         return false;
     }
 
+    constexpr uint64_t kMaxUserdataFileBytes = 1ull << 32;
+    if (cursor > kMaxUserdataFileBytes || bytes_to_write > kMaxUserdataFileBytes - cursor) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+
     auto& overlay = userdata_overlay();
     std::lock_guard<std::mutex> ud_lock(overlay.mutex);
-    auto& data = overlay.files[file->userdata_key];
+    auto it = overlay.files.find(file->userdata_key);
+    if (it == overlay.files.end()) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return false;
+    }
+    auto& data = it->second;
     const uint64_t end_pos = cursor + bytes_to_write;
     if (end_pos > data.size()) {
         data.resize(static_cast<size_t>(end_pos), 0);
     }
     std::memcpy(data.data() + static_cast<size_t>(cursor), buffer, bytes_to_write);
-    file->cursor.store(end_pos, std::memory_order_relaxed);
+    if (start == nullptr || !file->is_overlapped) {
+        file->cursor.store(end_pos, std::memory_order_relaxed);
+    }
     stamp_locked(overlay, file->userdata_key, false);
     if (bytes_written != nullptr) {
         *bytes_written = bytes_to_write;

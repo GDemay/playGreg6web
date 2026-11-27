@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -52,7 +53,7 @@ public:
         file_ = nullptr;
     }
 
-    uint64_t frames() const { return frames_; }
+    uint64_t frames() const { return frames_.load(std::memory_order_acquire); }
 
     static void sink(void* user, const float* stereo, uint32_t frames, uint32_t sample_rate) {
         static_cast<Writer*>(user)->append(stereo, frames, sample_rate);
@@ -89,7 +90,7 @@ private:
 
     std::mutex mutex_;
     std::FILE* file_ = nullptr;
-    uint64_t frames_ = 0;
+    std::atomic<uint64_t> frames_{0};
 };
 
 }  // namespace playgta6::os::audio_wav_dump

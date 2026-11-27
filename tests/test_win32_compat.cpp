@@ -1855,12 +1855,105 @@ static void test_concurrent_overlapped_httpfs_reads_and_paths() {
     set_httpfs_client(nullptr);
 }
 
+static void test_virtual_flags_access_masks_and_overlapped_iocp_bit() {
+    // 1. VirtualAlloc / VirtualProtect extended Windows flags.
+    const uint64_t va = VirtualAlloc(0, 8192, MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN,
+                                     PAGE_READWRITE | PAGE_WRITECOMBINE);
+    CHECK(va != 0);
+    uint32_t old_prot = 0;
+    CHECK(VirtualProtect(va, 4096, PAGE_READWRITE | PAGE_GUARD, &old_prot));
+    CHECK(VirtualProtect(va, 4096, PAGE_WRITECOPY, &old_prot));
+    CHECK(VirtualProtect(va, 4096, PAGE_EXECUTE_WRITECOPY, &old_prot));
+    CHECK(VirtualAlloc(va, 4096, MEM_RESET, PAGE_READWRITE) == va);
+    CHECK(VirtualAlloc(va, 4096, MEM_RESET_UNDO, PAGE_READWRITE) == va);
+    CHECK(VirtualAlloc(va, 4096, MEM_RESET | MEM_COMMIT, PAGE_READWRITE) == 0);
+    CHECK(GetLastError() == ERROR_INVALID_PARAMETER);
+    CHECK(VirtualFree(va, 0, MEM_RELEASE));
+
+    // 2. Specific file access masks (FILE_READ_DATA / FILE_WRITE_DATA / GENERIC_ALL).
+    clear_userdata_overlay();
+    CHECK(pg6_win32_create_directory_w(u"T:\\userdata\\mask_dir", nullptr) == 1);
+    // Reject file creation colliding with an existing directory.
+    CHECK(CreateFileW(u"T:\\userdata\\mask_dir", GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, kNullHandle) ==
+          INVALID_HANDLE_VALUE);
+    CHECK(GetLastError() == ERROR_ACCESS_DENIED);
+
+    const Handle fh = CreateFileW(u"T:\\userdata\\mask_dir\\file.bin",
+                                  FILE_READ_DATA | FILE_WRITE_DATA, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_FLAG_OVERLAPPED, kNullHandle);
+    CHECK(fh != INVALID_HANDLE_VALUE);
+    const uint8_t payload[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    struct Overlapped {
+        uint64_t internal = 0;
+        uint64_t internal_high = 0;
+        uint32_t offset = 0;
+        uint32_t offset_high = 0;
+        uint64_t event = 0;
+    };
+    const Handle ev = CreateEventW(nullptr, true, false, nullptr);
+    CHECK(ev != kNullHandle && (ev & 1ULL) == 0);  // kernel handles are 4-byte aligned
+    Overlapped ov{};
+    ov.offset = 4;
+    ov.event = ev | 1ULL;  // low-bit IOCP suppression flag must still signal `ev`
+    uint32_t written = 0;
+    CHECK(WriteFile(fh, payload, 8, &written, &ov) && written == 8);
+    CHECK(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+    // FILE_FLAG_OVERLAPPED must preserve the sequential file pointer (still 0).
+    int64_t pos = -1;
+    CHECK(SetFilePointerEx(fh, 0, &pos, FILE_CURRENT) && pos == 0);
+    CHECK(pg6_win32_flush_file_buffers(fh) == 1);
+
+    uint8_t read_back[8]{};
+    uint32_t got = 0;
+    ResetEvent(ev);
+    ov.offset = 4;
+    ov.event = ev | 1ULL;
+    CHECK(ReadFile(fh, read_back, 8, &got, &ov) && got == 8);
+    CHECK(WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+    CHECK(std::memcmp(read_back, payload, 8) == 0);
+
+    // Deleting an open /userdata file must not be resurrected by WriteFile.
+    CHECK(pg6_win32_delete_file_w(u"T:\\userdata\\mask_dir\\file.bin") == 1);
+    CHECK(!WriteFile(fh, payload, 4, &written, nullptr));
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+
+    CHECK(CloseHandle(ev));
+    CHECK(CloseHandle(fh));
+
+    // 3. OpenThread + GetThreadGroupAffinity reflects per-thread affinity mask.
+    const Handle gate = CreateEventW(nullptr, true, false, nullptr);
+    uint32_t tid = 0;
+    const Handle th = CreateThread(
+        nullptr, 0,
+        [](void* p) -> uint32_t {
+            WaitForSingleObject(static_cast<Handle>(reinterpret_cast<uintptr_t>(p)), 5000);
+            return 0;
+        },
+        reinterpret_cast<void*>(static_cast<uintptr_t>(gate)), 0, &tid);
+    CHECK(th != kNullHandle && tid != 0);
+    const Handle opened = pg6_win32_open_thread(0x1FFFFF, 0, tid);
+    CHECK(opened != kNullHandle && opened != kCurrentThreadPseudoHandle);
+    Pg6GroupAffinity want{};
+    want.mask = 0x1ULL;
+    Pg6GroupAffinity prev{};
+    CHECK(pg6_win32_set_thread_group_affinity(opened, &want, &prev) == 1);
+    Pg6GroupAffinity got_aff{};
+    CHECK(pg6_win32_get_thread_group_affinity(opened, &got_aff) == 1);
+    CHECK(got_aff.mask == 0x1ULL);
+    CHECK(SetEvent(gate));
+    CHECK(WaitForSingleObject(opened, 5000) == WAIT_OBJECT_0);
+    CHECK(CloseHandle(opened));
+    CHECK(CloseHandle(th));
+    CHECK(CloseHandle(gate));
+}
+
 int main() {
     test_stall_compensation();
     test_httpfs_size_cache();
     test_httpfs_stat_cache_and_invalidation();
     test_concurrent_handles_and_spin_cs();
     test_concurrent_overlapped_httpfs_reads_and_paths();
+    test_virtual_flags_access_masks_and_overlapped_iocp_bit();
     test_httpfs_sparse_64bit_and_retry();
     test_directories_and_attributes();
     test_find_files();

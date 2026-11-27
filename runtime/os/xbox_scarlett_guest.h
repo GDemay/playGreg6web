@@ -311,6 +311,11 @@ DStorageStats dstorage_stats();
 // array entries still pending with the oldest one's age.
 std::string dstorage_debug_state();
 
+// Optional callback for DirectStorage EnqueueSignal(ID3D12Fence*, value) when the target is not a
+// Win32 event handle. Returns true if the target was recognized and signaled.
+using DStorageFenceSignalHook = bool (*)(uint64_t fence_va, uint64_t value);
+void set_dstorage_fence_signal_hook(DStorageFenceSignalHook hook);
+
 // Worker threads executing submitted requests (default 1, at most 16). Takes effect for workers
 // started afterwards (the pool starts on the first Submit; reset_xbox_scarlett_guest() stops it).
 void set_dstorage_worker_threads(uint32_t count);
