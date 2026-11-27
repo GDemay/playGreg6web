@@ -2065,7 +2065,7 @@ struct NativeExecutor::Impl {
                 if (n >= 48) write_texture(p);
                 else ++stats.op_errors;
                 break;
-            case GpuOpcode::ClearTexture:
+            case kGpuOpcodeClearTexture:
                 if (n >= sizeof(GpuClearTexturePayload)) clear_texture(read_payload<GpuClearTexturePayload>(p).texture_id);
                 else packet_error(op, "ClearTexture: payload too short");
                 break;
@@ -2748,13 +2748,13 @@ struct NativeExecutor::Impl {
         stats.texture_upload_bytes += w.data_len;
     }
 
-    // ---- ClearTexture (opcode 41, clear_model.h) ----
+    // ---- ClearTexture (opcode 63, clear_model.h) ----
 
     static constexpr uint64_t kZeroBufferBytes = 4ull << 20;
 
     // Records the texture as pending: its zero copies go into the next submitted encoder.
     void clear_texture(uint32_t id) {
-        const uint16_t op = static_cast<uint16_t>(GpuOpcode::ClearTexture);
+        const uint16_t op = static_cast<uint16_t>(kGpuOpcodeClearTexture);
         const auto it = textures.find(id);
         if (it == textures.end()) {
             ++stats.clears_missing;  // never created here (a lazy create): it is created zero later

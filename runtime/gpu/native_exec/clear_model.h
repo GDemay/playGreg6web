@@ -1,6 +1,6 @@
 #pragma once
 
-// ClearTexture (opcode 41): the GPU-side zeroing of a reused (pooled) texture, without Dawn.
+// ClearTexture (opcode 63): the GPU-side zeroing of a reused (pooled) texture, without Dawn.
 //
 // The runtime recycles host textures (gpu/small_texture_pool.h) and a reused texture must read as
 // zero exactly like a freshly created one. The executor does not zero it at once: it records the

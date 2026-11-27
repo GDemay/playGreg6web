@@ -2231,7 +2231,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     if (reused_id != 0 && gpu_texture_clear()) {
         GpuClearTexturePayload clear{};
         clear.texture_id = id;
-        enc.emit_packet(GpuOpcode::ClearTexture, &clear, sizeof(clear));
+        enc.emit_packet(kGpuOpcodeClearTexture, &clear, sizeof(clear));
     } else if (reused_id != 0) {
         const std::vector<ZeroWrite> zeros =
             zero_fill_writes(width, safe_height, safe_depth, safe_mips, is3d_tex, effective_layout.block_width,

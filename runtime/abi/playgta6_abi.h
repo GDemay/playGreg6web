@@ -73,11 +73,15 @@ enum class GpuOpcode : uint16_t {
     // map it and write the bytes to runtime memory, then add 1 to the completion counter.
     ReadbackBuffer = 39,
     ReadbackTexture = 40,
-    // Zero every texel of every subresource of a texture on the GPU (GpuClearTexturePayload): a
-    // recycled texture then reads as a freshly created one. Native executor only for now; the
-    // producer emits it only when the consumer has it (gpu/small_texture_pool.h gpu_texture_clear).
-    ClearTexture = 41,
 };
+
+// Native-executor extension opcodes: outside GpuOpcode (the cross-track ABI every consumer mirrors,
+// tools/repo_health.py), numbered down from 63 so they never collide with the next shared opcode.
+// The producer emits them only when the consumer is the native executor.
+//
+// Zero every texel of every subresource of a texture on the GPU (GpuClearTexturePayload): a
+// recycled texture then reads as a freshly created one (gpu/small_texture_pool.h gpu_texture_clear).
+inline constexpr GpuOpcode kGpuOpcodeClearTexture = static_cast<GpuOpcode>(63);
 
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
 namespace GpuBufferUsage {
@@ -931,7 +935,7 @@ struct GpuReadbackTexturePayload {
 };
 static_assert(sizeof(GpuReadbackTexturePayload) == 72, "GpuReadbackTexturePayload layout must stay 72 bytes");
 
-// ClearTexture (41): every mip and layer / slice of `texture_id` becomes zero. Earlier texture
+// ClearTexture (kGpuOpcodeClearTexture, 63): every mip and layer / slice of `texture_id` becomes zero. Earlier texture
 // writes are wiped, later ones land on the zeroed texture; like a write, the clear is not ordered
 // against the frame's passes recorded before it, so the producer clears only textures the frame
 // being recorded has not used. Color, single-sample, COPY_DST textures only.

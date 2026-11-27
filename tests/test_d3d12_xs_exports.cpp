@@ -1956,7 +1956,7 @@ void test_pooled_texture_gpu_clear() {
         for (const Packet& p : ps) {
             CHECK(!(p.opcode == GpuOpcode::WriteTexture && payload_as<GpuWriteTexturePayload>(p).texture_id == id));
             CHECK(!(p.opcode == GpuOpcode::CreateTexture2 && payload_as<GpuCreateTexture2Payload>(p).id == id));
-            if (p.opcode == GpuOpcode::ClearTexture) {
+            if (p.opcode == kGpuOpcodeClearTexture) {
                 CHECK(payload_as<GpuClearTexturePayload>(p).texture_id == id);
                 ++clears;
             }

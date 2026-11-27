@@ -132,7 +132,6 @@ v2 adds explicit bind group / pipeline layouts, full render pipeline keys, expli
 | `38` | `DispatchIndirect` | `16` | `GpuIndirectPayload`: `dispatchWorkgroupsIndirect(buffer, offset)`, a 12-byte `{ x, y, z }` record |
 | `39` | `ReadbackBuffer` | `40` | `{ u32 seq, u32 buffer_id, u64 src_offset, u64 size, u64 dst_addr, u64 done_addr }` (`GpuReadbackBufferPayload`) |
 | `40` | `ReadbackTexture` | `72` | `{ u32 seq, u32 texture_id, u32 mip_level, u32 origin_x, u32 origin_y, u32 origin_z, u32 width, u32 height, u32 depth_or_layers, u32 bytes_per_row, u32 rows_per_image, u32 reserved, u64 dst_addr, u64 done_addr, u64 dst_size }` (`GpuReadbackTexturePayload`) |
-| `41` | `ClearTexture` | `8` | `{ u32 texture_id, u32 reserved }` (`GpuClearTexturePayload`; native executor only, see below) |
 
 ### Ids
 - All ids share the v1 `u32` resource id namespace (`0` = none). `DestroyResource` also destroys bind group layouts, pipeline layouts and v2 bind groups, samplers and pipelines.
@@ -234,7 +233,7 @@ A `GPUTextureDescriptor` for textures the v1 `CreateTexture` cannot describe (D3
 ### Read-back (`ReadbackBuffer`, `ReadbackTexture`)
 GPU -> CPU copies for memory the title reads on the CPU (readback-heap buffers, texture regions copied into a placed footprint). The consumer ends any open pass, copies the source (buffer range, or texture region at `mip_level` / origin with the given size) into a `MAP_READ` staging buffer in stream order, maps it, and writes the bytes to `dst_addr` in the producer's memory (wasm linear-memory offset; texture rows land `bytes_per_row` apart, `rows_per_image` block rows per image, `dst_size` bytes in all). After the bytes are written it does `Atomics.add(u32 at done_addr, 1)`, also when the copy failed. The producer counts issued read-backs and holds every queue fence signal issued after one until the counter has caught up, so the title never sees the fence complete before the data is in its memory. `seq` is the 1-based issue number, for diagnostics only.
 
-### `ClearTexture` (opcode `41`, native executor only so far)
+### `ClearTexture` (opcode `63`, native executor extension: `kGpuOpcodeClearTexture`, not in `GpuOpcode`)
 Payload `{ u32 texture_id, u32 reserved }` (8 bytes, `GpuClearTexturePayload`): every texel of every mip and layer / slice of a single-sample color `COPY_DST` texture becomes zero, so a recycled texture (`runtime/gpu/small_texture_pool.h`) reads exactly like a new one. Earlier `WriteTexture`s of the texture are wiped, later ones land on the zeroed texture; like a write it is not ordered against passes recorded earlier in the frame, so the producer clears only textures the frame being recorded has not used. The native executor encodes copies from a shared zero buffer at the start of the next encoder it submits and lets later writes that cover whole rows / slices shrink the copies (`runtime/gpu/native_exec/clear_model.h`). The producer emits it only when `gpu_texture_clear()` is on (the live native executor without `--gpu-capture`); otherwise it zero-fills with CPU `WriteTexture`s. The browser worker does not implement it yet (a port would do the same: `copyBufferToTexture` from a zero buffer, in a command encoder submitted before the next upload of the texture).
 
 ### Explicit Pass Semantics (v2)

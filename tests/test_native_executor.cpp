@@ -608,7 +608,7 @@ void test_clear_texture(NativeExecutor& ex) {
     write(enc, 120, 0, 0, 0, 4, 4, 0x55);
     write(enc, 120, 1, 0, 0, 2, 2, 0x55);
     GpuClearTexturePayload clear{120, 0};
-    emit(enc, GpuOpcode::ClearTexture, bytes_of(clear));
+    emit(enc, kGpuOpcodeClearTexture, bytes_of(clear));
     write(enc, 120, 0, 0, 0, 4, 1, 0x07);
     readback(enc, 120, 0, 4, 4, 1024, 0);
     readback(enc, 120, 1, 2, 2, 2048, 4);
@@ -629,7 +629,7 @@ void test_clear_texture(NativeExecutor& ex) {
     // A partial-width write onto a pending row needs the clear first (a flush), then lands on zero.
     gpu::CommandEncoder enc2;
     write(enc2, 120, 0, 0, 0, 4, 4, 0x55);
-    emit(enc2, GpuOpcode::ClearTexture, bytes_of(clear));
+    emit(enc2, kGpuOpcodeClearTexture, bytes_of(clear));
     write(enc2, 120, 0, 2, 2, 1, 1, 0x09);
     readback(enc2, 120, 0, 4, 4, 4096, 8);
     CHECK(run(ex, enc2) == 0);
@@ -647,11 +647,11 @@ void test_clear_texture(NativeExecutor& ex) {
     // Every texel written after the clear: no copy at all. A missing texture is counted, not an error.
     const uint64_t copies = ex.stats().clear_copies;
     gpu::CommandEncoder enc3;
-    emit(enc3, GpuOpcode::ClearTexture, bytes_of(clear));
+    emit(enc3, kGpuOpcodeClearTexture, bytes_of(clear));
     write(enc3, 120, 0, 0, 0, 4, 4, 0x11);
     write(enc3, 120, 1, 0, 0, 2, 2, 0x11);
     GpuClearTexturePayload missing{9999, 0};
-    emit(enc3, GpuOpcode::ClearTexture, bytes_of(missing));
+    emit(enc3, kGpuOpcodeClearTexture, bytes_of(missing));
     readback(enc3, 120, 1, 2, 2, 6144, 12);
     CHECK(run(ex, enc3) == 0);
     ex.wait_idle();

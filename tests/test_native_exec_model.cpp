@@ -1201,7 +1201,6 @@ void test_clear_model() {
 }
 
 int main() {
-    test_clear_model();
     test_present_model();
     test_shader_payloads();
     test_pack();
@@ -1226,6 +1225,7 @@ int main() {
     test_remap_bindings_match();
     test_fragment_outputs();
     test_error_scope_model();
+    test_clear_model();
     if (g_failures) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;
