@@ -128,6 +128,26 @@ void test_eviction_lru(const fs::path& root) {
     CHECK(d.stats().entries == 2 && d.stats().total_bytes <= per_file * 2 + 10);
 }
 
+// Replacing a blob with a larger value can require several victims. Size-only probes also
+// refresh recency; the just-written blob must survive even when it is larger than its peers.
+void test_multiple_victims_and_replacement(const fs::path& root) {
+    BlobCache c;
+    const uint64_t per_file = 32 + 5 + 100;
+    CHECK(c.open((root / "multi").string(), per_file * 6));
+    for (int i = 0; i < 6; ++i) put(c, i, bytes(100, static_cast<uint8_t>(i)));
+    const std::string k = key(0);
+    CHECK(c.load(k.data(), k.size(), nullptr, 0) == 100);  // 0 becomes newer than 1..5
+    put(c, 5, bytes(100 + per_file * 3, 9));  // replace 5, evict 1, 2, then 3
+    const auto s = c.stats();
+    CHECK(s.entries == 3 && s.evictions == 3 && s.evicted_bytes == per_file * 3);
+    CHECK(s.total_bytes == s.max_bytes);
+    std::vector<uint8_t> got;
+    for (int i : {1, 2, 3}) CHECK(!get(c, i, &got));
+    CHECK(get(c, 0, &got) && got == bytes(100, 0));
+    CHECK(get(c, 4, &got) && got == bytes(100, 4));
+    CHECK(get(c, 5, &got) && got == bytes(100 + per_file * 3, 9));
+}
+
 void test_recency_survives_reopen(const fs::path& root) {
     const std::string dir = (root / "recent").string();
     const size_t value = 500;
@@ -196,6 +216,7 @@ int main() {
     test_round_trip_and_reopen(root);
     test_corrupt_file(root);
     test_eviction_lru(root);
+    test_multiple_victims_and_replacement(root);
     test_recency_survives_reopen(root);
     test_disabled_and_dirs(root);
     test_threads(root);

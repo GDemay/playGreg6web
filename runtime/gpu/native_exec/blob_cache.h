@@ -311,13 +311,18 @@ private:
         std::vector<Index::iterator> order;
         order.reserve(index_.size());
         for (auto it = index_.begin(); it != index_.end(); ++it) order.push_back(it);
-        std::sort(order.begin(), order.end(), [](const Index::iterator& a, const Index::iterator& b) {
-            return a->second.seq < b->second.seq;
-        });
+        // A store usually needs just one victim. Build a min-heap in linear time rather than
+        // sorting every cached pipeline while Dawn's load/store callbacks share this mutex.
+        const auto newer = [](const Index::iterator& a, const Index::iterator& b) {
+            return a->second.seq > b->second.seq;
+        };
+        std::make_heap(order.begin(), order.end(), newer);
         std::vector<std::string> victims;
         uint64_t total = total_;
-        for (const auto& it : order) {
-            if (total <= max_bytes_) break;
+        while (total > max_bytes_ && !order.empty()) {
+            std::pop_heap(order.begin(), order.end(), newer);
+            const auto it = order.back();
+            order.pop_back();
             if (it->first == keep) continue;
             total -= it->second.size;
             victims.push_back(it->first);

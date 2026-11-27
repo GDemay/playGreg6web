@@ -279,6 +279,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 ---
 
+- [x] **GPU performance — Linear-time Dawn blob-cache eviction selection** — `DONE` (#2050, @GDemay) *(no game files required; scoped to `runtime/gpu/native_exec/blob_cache.h`, its tests and synthetic benchmark)*
+  - Preserve disk format, checksum validation and least-recently-used eviction while avoiding a full-index sort on each capped-cache store.
+
 ## Track 4: Shader Pipeline (`shaders/`, Rust)
 **Goal:** Convert Xbox RDNA2 shaders (`--mesh-compute`, `--wave64-emulate`) → SPIR-V → WGSL packs.
 

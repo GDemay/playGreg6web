@@ -1,0 +1,491 @@
+{
+  "baselineCommit": "2f12b90184e58f1cdd8638ea18cac3cd5832c3b0",
+  "patchCommit": "0ac2b589219efe21d6c09533d1fc2043df59aa02",
+  "measurementLane": "synthetic Linux x86_64 production-path benchmark; not a browser/game run",
+  "executionEnvironment": {
+    "platform": "Linux",
+    "kernel": "6.8.0-1070-azure",
+    "arch": "x86_64",
+    "vcpus": 4,
+    "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "cpu": "AMD EPYC 7763 64-Core Processor"
+  },
+  "results": {
+    "benchmark": "synthetic native blob",
+    "environment": {
+      "platform": "Linux",
+      "kernel": "6.8.0-1070-azure",
+      "arch": "x86_64",
+      "vcpus": 4,
+      "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+      "cpu": "AMD EPYC 7763 64-Core Processor"
+    },
+    "baselineCommit": "2f12b90184e58f1cdd8638ea18cac3cd5832c3b0",
+    "patchCommit": "0ac2b589219efe21d6c09533d1fc2043df59aa02",
+    "sampling": "one untimed run per variant/workload; seven samples each, alternating A/B order; separately built O3 NDEBUG C++20 binaries; no concurrent tests/builds; correctness checked every invocation; freshly populated OS-warm temporary file cache for blob; no physical page commit for vmem",
+    "cases": [
+      {
+        "args": [
+          512,
+          128,
+          4096,
+          1
+        ],
+        "samples": {
+          "before": [
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 15.069444,
+              "us_per_store": 117.730031,
+              "cpu_ms": 15.047,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 14.571627,
+              "us_per_store": 113.840836,
+              "cpu_ms": 14.48,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 14.370962,
+              "us_per_store": 112.273141,
+              "cpu_ms": 14.342,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 14.486507,
+              "us_per_store": 113.175836,
+              "cpu_ms": 14.337,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 15.459311,
+              "us_per_store": 120.775867,
+              "cpu_ms": 15.375,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 14.462853,
+              "us_per_store": 112.991039,
+              "cpu_ms": 14.405,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 14.515081,
+              "us_per_store": 113.39907,
+              "cpu_ms": 14.448,
+              "correct": true
+            }
+          ],
+          "after": [
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 12.570166,
+              "us_per_store": 98.204422,
+              "cpu_ms": 12.499,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 12.499625,
+              "us_per_store": 97.65332,
+              "cpu_ms": 12.459,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 12.686002,
+              "us_per_store": 99.109391,
+              "cpu_ms": 12.632,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 12.58302,
+              "us_per_store": 98.304844,
+              "cpu_ms": 12.478,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 12.590204,
+              "us_per_store": 98.360969,
+              "cpu_ms": 12.535,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 12.610712,
+              "us_per_store": 98.521187,
+              "cpu_ms": 12.593,
+              "correct": true
+            },
+            {
+              "entries": 512,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 12.714245,
+              "us_per_store": 99.330039,
+              "cpu_ms": 12.655,
+              "correct": true
+            }
+          ]
+        }
+      },
+      {
+        "args": [
+          10000,
+          128,
+          4096,
+          1
+        ],
+        "samples": {
+          "before": [
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 101.045462,
+              "us_per_store": 789.417672,
+              "cpu_ms": 100.973,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 103.010785,
+              "us_per_store": 804.771758,
+              "cpu_ms": 102.938,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 100.420357,
+              "us_per_store": 784.534039,
+              "cpu_ms": 100.348,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 102.274022,
+              "us_per_store": 799.015797,
+              "cpu_ms": 102.138,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 99.85333,
+              "us_per_store": 780.104141,
+              "cpu_ms": 99.816,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 101.70415,
+              "us_per_store": 794.563672,
+              "cpu_ms": 101.64,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 114.07267,
+              "us_per_store": 891.192734,
+              "cpu_ms": 113.801,
+              "correct": true
+            }
+          ],
+          "after": [
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 45.825429,
+              "us_per_store": 358.011164,
+              "cpu_ms": 45.804,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 47.49826,
+              "us_per_store": 371.080156,
+              "cpu_ms": 47.427,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 47.909586,
+              "us_per_store": 374.293641,
+              "cpu_ms": 47.773,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 45.512358,
+              "us_per_store": 355.565297,
+              "cpu_ms": 45.476,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 45.465602,
+              "us_per_store": 355.200016,
+              "cpu_ms": 45.401,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 45.460031,
+              "us_per_store": 355.156492,
+              "cpu_ms": 45.418,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": true,
+              "elapsed_ms": 46.887831,
+              "us_per_store": 366.31118,
+              "cpu_ms": 46.846,
+              "correct": true
+            }
+          ]
+        }
+      },
+      {
+        "args": [
+          10000,
+          128,
+          4096,
+          0
+        ],
+        "samples": {
+          "before": [
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.859601,
+              "us_per_store": 69.215633,
+              "cpu_ms": 8.814,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 9.681803,
+              "us_per_store": 75.639086,
+              "cpu_ms": 9.638,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 9.234069,
+              "us_per_store": 72.141164,
+              "cpu_ms": 9.236,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 11.175497,
+              "us_per_store": 87.30857,
+              "cpu_ms": 11.127,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.648608,
+              "us_per_store": 67.56725,
+              "cpu_ms": 8.651,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.806933,
+              "us_per_store": 68.804164,
+              "cpu_ms": 8.809,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.68203,
+              "us_per_store": 67.828359,
+              "cpu_ms": 8.668,
+              "correct": true
+            }
+          ],
+          "after": [
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.904625,
+              "us_per_store": 69.567383,
+              "cpu_ms": 8.894,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 10.785801,
+              "us_per_store": 84.26407,
+              "cpu_ms": 10.746,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.838071,
+              "us_per_store": 69.04743,
+              "cpu_ms": 8.768,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 10.257316,
+              "us_per_store": 80.135281,
+              "cpu_ms": 10.167,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.726513,
+              "us_per_store": 68.175883,
+              "cpu_ms": 8.723,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.736101,
+              "us_per_store": 68.250789,
+              "cpu_ms": 8.728,
+              "correct": true
+            },
+            {
+              "entries": 10000,
+              "stores": 128,
+              "value_bytes": 4096,
+              "capped": false,
+              "elapsed_ms": 8.679345,
+              "us_per_store": 67.807383,
+              "cpu_ms": 8.638,
+              "correct": true
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
