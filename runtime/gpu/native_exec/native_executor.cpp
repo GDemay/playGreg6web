@@ -3443,6 +3443,9 @@ struct NativeExecutor::Impl {
     // (an invalid pipeline in the pass would invalidate the whole command buffer).
     void note_pipeline_failed(uint64_t hash, bool dispatch) {
         ++stats.pipeline_failed_skips;
+        if (hash != 0 && std::find(stats.failed_pipeline_hashes.begin(), stats.failed_pipeline_hashes.end(), hash) ==
+                             stats.failed_pipeline_hashes.end())
+            stats.failed_pipeline_hashes.push_back(hash);
         d3d12_guest::drop_table().record(hash, d3d12_guest::DropTable::Reason::PipelineFailed, dispatch);
     }
 
@@ -5988,6 +5991,14 @@ std::string NativeExecutor::stats_json() const {
     num("quarantine_skips", st.quarantine_skips);
     num("async_pipeline_failures", st.async_pipeline_failures);
     num("pipeline_failed_skips", st.pipeline_failed_skips);
+    j += "\"failed_pipeline_hashes\": [";
+    for (size_t i = 0; i < st.failed_pipeline_hashes.size(); ++i) {
+        char hb[32];
+        std::snprintf(hb, sizeof hb, "%s\"0x%016llx\"", i ? ", " : "",
+                      static_cast<unsigned long long>(st.failed_pipeline_hashes[i]));
+        j += hb;
+    }
+    j += "], ";
     num("write_masks_cleared", st.write_masks_cleared);
     num("unknown_opcodes", st.unknown_opcodes);
     auto table = [&](const char* k, const std::array<uint64_t, kOpcodeSlots>& t) {

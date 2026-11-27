@@ -420,3 +420,5 @@ draw and dispatch (indirect ones too) of the listed shaders, so a program that h
 without a rebuild. Each skip is counted per phase in the boot report's drop table as `quarantined` with the hash; no
 output is substituted. Hair-strand skip-by-name is not possible on the native side: the executor only sees shader
 hashes, not program names (use `tools/program_census.py` to map names to hashes, then list the hash).
+
+`--auto-quarantine <path>` loads `<path>` as a skip list and appends every shader whose pipeline creation failed (`pipeline_failed`, `failed_pipeline_hashes` in the stats) as `<hash> pipeline_failed auto`, written as soon as it happens so a following hang does not lose it; delete the file to reset (keep one per title). `tools/bisect_shader_skip.py init|next|report` halves a suspect list between runs through `--skip-shader-file` to find the shader behind a hang.

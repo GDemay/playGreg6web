@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -100,6 +101,30 @@ public:
         }
         for (auto& e : got) add(e.hash, e.note);
         return true;
+    }
+
+    // Auto-quarantine file (--auto-quarantine <path>): hashes whose pipeline creation failed are appended as
+    // "<hash> pipeline_failed auto" lines. Returns the new file text, or "" when `failed` adds nothing to
+    // `existing`. Existing lines (also hand-written notes) are kept untouched.
+    static std::string merge_auto_file(const std::string& existing, const std::vector<uint64_t>& failed) {
+        ShaderQuarantine have;
+        std::string err;
+        have.add_text(existing, false, "auto", &err);  // unparsable text: treat as empty, never rewrite it blindly
+        if (!err.empty()) return std::string();
+        std::string add;
+        ShaderQuarantine seen;
+        for (uint64_t h : failed) {
+            if (h == 0 || have.contains(h) || seen.contains(h)) continue;
+            seen.add(h, "");
+            char b[48];
+            std::snprintf(b, sizeof b, "0x%016llx pipeline_failed auto\n", static_cast<unsigned long long>(h));
+            add += b;
+        }
+        if (add.empty()) return std::string();
+        std::string out = existing;
+        if (out.empty()) out = "# Auto-quarantine: shaders whose pipeline creation failed on this title (delete the file to reset).\n";
+        else if (out.back() != '\n') out += '\n';
+        return out + add;
     }
 
     void add(uint64_t hash, const std::string& note) {

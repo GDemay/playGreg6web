@@ -263,6 +263,7 @@ struct ExecutorStats {
     uint64_t pipeline_failed_skips = 0;  // draws / dispatches dropped because their async pipeline failed to compile
     uint64_t write_masks_cleared = 0;  // color targets the fragment stage does not write: writeMask forced to 0
     uint64_t async_pipeline_failures = 0;  // creation failed: the pipeline became an error object
+    std::vector<uint64_t> failed_pipeline_hashes;  // unique perf hashes whose pipeline creation failed (auto-quarantine input)
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
 };
