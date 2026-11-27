@@ -462,7 +462,7 @@ private:
     const Reservation* find_reservation_locked(uint64_t addr) const;
     bool pages_allow_locked(uint64_t addr, size_t len, bool need_write) const;
     bool range_overlaps_locked(uint64_t start, uint64_t end) const;
-    uint64_t find_free_va_locked(uint64_t granularity_size) const;
+    uint64_t find_free_va_locked(uint64_t granularity_size);
 
     static bool is_valid_protect(PageProtect protect);
 

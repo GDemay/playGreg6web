@@ -474,15 +474,21 @@ bool VirtualMemoryArena::range_overlaps_locked(uint64_t start, uint64_t end) con
     return false;
 }
 
-uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) const {
+uint64_t VirtualMemoryArena::find_free_va_locked(uint64_t granularity_size) {
     const uint64_t space_end = shared_zone_size_ != 0 ? shared_zone_base_ : space_base_ + space_size_;
     uint64_t candidate = occupied_prefix_end_;
-    for (auto it = reservations_.lower_bound(candidate); it != reservations_.end(); ++it) {
+    // Hinted inserts and placeholder coalesces may cover the cached boundary.
+    auto it = reservations_.upper_bound(candidate);
+    if (it != reservations_.begin()) --it;
+    for (; it != reservations_.end(); ++it) {
         const auto& res = it->second;
         const uint64_t res_end = res.base + res.granularity_size;
         if (res_end <= candidate) {
             continue;
         }
+        // Learn only contiguous occupied prefixes, never skip a hole that a smaller
+        // future request could use. Do this lazily so hinted reservations pay no search.
+        if (res.base <= occupied_prefix_end_) occupied_prefix_end_ = res_end;
         if (candidate <= UINT64_MAX - granularity_size &&
             candidate + granularity_size <= res.base) {
             break;
@@ -561,15 +567,6 @@ uint64_t VirtualMemoryArena::reserve_locked(uint64_t hint_addr,
     res.page_count = page_count;
 
     reservations_.emplace(base, std::move(res));
-    // Only advance across occupied granules, never across a hole that a smaller future
-    // reservation could use. Hinted reservations can join the prefix too.
-    if (base == occupied_prefix_end_) {
-        auto it = reservations_.find(base);
-        while (it != reservations_.end() && it->second.base == occupied_prefix_end_) {
-            occupied_prefix_end_ += it->second.granularity_size;
-            ++it;
-        }
-    }
     reserved_bytes_ += res_size;
     return base;
 }
