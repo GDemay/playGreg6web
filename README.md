@@ -5,7 +5,7 @@
 An experimental, self-hosted project to run **an Xbox Series title** directly inside the **user's browser** via **Wasm64 + WebGPU + HTTP Range streaming** — no server-side video streaming.
 
 > [!IMPORTANT]
-> **No game files are in this repo.** No binaries, keys, `.rpf` archives, or extracted assets. The game data comes from a copy you own. If you play locally, that copy is on your machine. If you self-host the server, the copy lives on the server and your own devices stream from it, so the browser on your laptop, tablet or phone doesn't need its own copy. Don't host it for people who don't own the game. All local data stays in gitignored folders (`local-data/`, `work/`).
+> **No game files are in this repo.** No binaries, keys, `.rpf` archives, or extracted assets. The game data comes from a copy you own. If you play locally, that copy is on your machine. If you self-host the server, the copy lives on the server, which only streams the game files; the game itself always runs in the browser on your laptop, tablet or phone, so those devices don't need their own copy. Don't host it for people who don't own the game. All local data stays in gitignored folders (`local-data/`, `work/`).
 
 ---
 
