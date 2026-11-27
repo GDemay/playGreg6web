@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -15,6 +16,17 @@
 namespace playgta6::os::audio_out {
 
 constexpr uint32_t kSourceRate = 48000;
+
+// An underrun is "guest stalled" when no audio at all arrived for this long before it (a frame
+// stall / the guest not producing); otherwise audio kept trickling in but too slowly or too late
+// for the device ("host starved": mixer or render thread not scheduled, host under load).
+constexpr uint64_t kGuestStallGapUs = 100000;
+
+inline uint64_t steady_now_us() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now().time_since_epoch())
+                                     .count());
+}
 
 // Streaming linear-interpolation resampler for interleaved stereo.
 class Resampler {
@@ -55,7 +67,9 @@ private:
 struct Stats {
     uint64_t frames_in = 0;        // device-rate frames accepted into the buffer
     uint64_t frames_played = 0;    // real frames handed to the device
-    uint64_t underruns = 0;        // times the buffer ran dry while playing
+    uint64_t underruns = 0;        // times the buffer ran dry while playing (= host_starved + guest_stalled)
+    uint64_t underruns_host_starved = 0;  // dry, but audio had been arriving (<100 ms gap): host-side lateness
+    uint64_t underruns_guest_stalled = 0; // dry after >=100 ms with no audio pushed: guest/frame stall
     uint64_t underrun_frames = 0;  // silence frames inserted after playback had started
     uint64_t overrun_frames = 0;   // frames dropped because the buffer was full
 };
@@ -73,10 +87,13 @@ public:
         primed_ = false;
         was_playing_ = false;
         stats_ = Stats{};
+        last_push_us_ = 0;
     }
 
-    void push(const float* stereo, uint32_t frames) {
+    void push(const float* stereo, uint32_t frames) { push(stereo, frames, steady_now_us()); }
+    void push(const float* stereo, uint32_t frames, uint64_t now_us) {
         std::lock_guard<std::mutex> lock(m_);
+        if (frames > 0) last_push_us_ = now_us;
         const uint32_t room = cap_ - count_;
         const uint32_t n = std::min(frames, room);
         for (uint32_t i = 0; i < n; ++i) {
@@ -92,7 +109,8 @@ public:
 
     // Fills `frames` interleaved stereo frames; the part that cannot be served is silence.
     // Returns the number of real frames written.
-    uint32_t pop(float* out, uint32_t frames) {
+    uint32_t pop(float* out, uint32_t frames) { return pop(out, frames, steady_now_us()); }
+    uint32_t pop(float* out, uint32_t frames, uint64_t now_us) {
         std::lock_guard<std::mutex> lock(m_);
         uint32_t n = 0;
         if (primed_) {
@@ -111,7 +129,13 @@ public:
             std::memset(out + 2 * static_cast<size_t>(n), 0, sizeof(float) * 2 * (frames - n));
             // Only a stream that already started counts; the initial priming is not an underrun.
             if (was_playing_) {
-                if (primed_) ++stats_.underruns;
+                if (primed_) {
+                    ++stats_.underruns;
+                    if (last_push_us_ == 0 || now_us - last_push_us_ >= kGuestStallGapUs)
+                        ++stats_.underruns_guest_stalled;
+                    else
+                        ++stats_.underruns_host_starved;
+                }
                 stats_.underrun_frames += frames - n;
                 primed_ = false;  // re-prime before resuming
             }
@@ -133,6 +157,7 @@ private:
     std::vector<float> buf_;
     uint32_t cap_ = 1, prebuffer_ = 0, head_ = 0, count_ = 0;
     bool primed_ = false, was_playing_ = false;
+    uint64_t last_push_us_ = 0;
     Stats stats_;
 };
 
@@ -177,6 +202,8 @@ inline std::string report_json(bool device_open, uint32_t device_rate, const Sta
     o += ", \"frames_in\": " + std::to_string(s.frames_in);
     o += ", \"frames_played\": " + std::to_string(s.frames_played);
     o += ", \"underruns\": " + std::to_string(s.underruns);
+    o += ", \"underruns_host_starved\": " + std::to_string(s.underruns_host_starved);
+    o += ", \"underruns_guest_stalled\": " + std::to_string(s.underruns_guest_stalled);
     o += ", \"underrun_frames\": " + std::to_string(s.underrun_frames);
     o += ", \"overrun_frames\": " + std::to_string(s.overrun_frames);
     std::string esc;

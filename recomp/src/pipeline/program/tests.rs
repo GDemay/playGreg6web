@@ -717,6 +717,7 @@ fn host_modules_cover_the_runtime_registrations() {
                     && lower.len() > 4
                     && !lower.contains(['\\', '/', ' ', '%'])
                     && !host_known(&lower)
+                    && !HOST_ONLY_DEPENDENCIES.contains(&lower.as_str())
                 {
                     missing.push(format!("{} ({})", lower, path.display()));
                 }

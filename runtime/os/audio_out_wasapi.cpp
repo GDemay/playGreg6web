@@ -120,10 +120,29 @@ struct Wasapi::Impl {
         // Request a 100 ms shared-mode buffer; run() writes ahead to at most kWasapiTargetPadMs
         // (40 ms < 60 ms JitterBuffer prebuffer) so post-underrun re-priming never oscillates.
         // AUTOCONVERTPCM lets the engine accept stereo float even on a surround mix format.
-        hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
-                                 AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                                 1000000 /* 100 ms */, 0, &fmt, nullptr);
+        // Event-driven: the engine signals every period, so the render thread wakes on the device
+        // clock instead of a coarse Sleep(5) that a loaded host can stretch by tens of ms.
+        DWORD flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        if (!event_) event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        event_driven_ = event_ != nullptr;
+        if (event_driven_) flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 1000000 /* 100 ms */, 0, &fmt, nullptr);
+        if (FAILED(hr) && event_driven_) {
+            // Some endpoints refuse the callback mode: fall back to polling.
+            client_->Release();
+            client_ = nullptr;
+            event_driven_ = false;
+            hr = dev_->Activate(iid_audio_client(), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client_));
+            if (SUCCEEDED(hr))
+                hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                                         1000000, 0, &fmt, nullptr);
+        }
         if (FAILED(hr)) return fail(err, "IAudioClient::Initialize failed", hr);
+        if (event_driven_ && FAILED(client_->SetEventHandle(event_))) {
+            // Cannot happen after a successful callback-mode Initialize; poll rather than hang.
+            event_driven_ = false;
+        }
         hr = client_->GetBufferSize(&buffer_frames_);
         if (FAILED(hr)) return fail(err, "GetBufferSize failed", hr);
         hr = client_->GetService(iid_render_client(), reinterpret_cast<void**>(&render_));
@@ -158,6 +177,10 @@ struct Wasapi::Impl {
 
     void close_device() {
         release_interfaces();
+        if (event_) {
+            CloseHandle(event_);
+            event_ = nullptr;
+        }
         device_rate_ = 0;
         if (com_inited_ && GetCurrentThreadId() == com_inited_thread_id_) {
             CoUninitialize();
@@ -301,8 +324,44 @@ struct Wasapi::Impl {
         return hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING;
     }
 
+    // Waits for the next device period (event) or at most `max_ms`.
+    void wait_period(DWORD max_ms) {
+        if (event_driven_ && event_) {
+            WaitForSingleObject(event_, max_ms);
+        } else {
+            Sleep(5);
+        }
+    }
+
+    // Scheduling hardening for the render thread: MMCSS "Pro Audio" (resolved at runtime so no
+    // avrt.lib link dependency), falling back to a raised thread priority.
+    void boost_render_thread() {
+        typedef HANDLE(WINAPI * AvSetFn)(LPCWSTR, LPDWORD);
+        avrt_ = LoadLibraryW(L"avrt.dll");
+        if (avrt_) {
+            auto set = reinterpret_cast<AvSetFn>(GetProcAddress(avrt_, "AvSetMmThreadCharacteristicsW"));
+            if (set) {
+                DWORD task = 0;
+                mmcss_ = set(L"Pro Audio", &task);
+            }
+        }
+        if (!mmcss_) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    }
+
+    void unboost_render_thread() {
+        if (mmcss_ && avrt_) {
+            typedef BOOL(WINAPI * AvRevertFn)(HANDLE);
+            auto rev = reinterpret_cast<AvRevertFn>(GetProcAddress(avrt_, "AvRevertMmThreadCharacteristics"));
+            if (rev) rev(mmcss_);
+        }
+        mmcss_ = nullptr;
+        if (avrt_) FreeLibrary(avrt_);
+        avrt_ = nullptr;
+    }
+
     void run() {
         playgta6::os::name_this_thread(L"pg6-audio-out");
+        boost_render_thread();
         const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool thread_com = SUCCEEDED(co);
         uint32_t active_rate = device_rate_ ? device_rate_ : kSourceRate;
@@ -369,8 +428,9 @@ struct Wasapi::Impl {
                     started = false;
                 }
             }
-            Sleep(5);
+            wait_period(20);
         }
+        unboost_render_thread();
         if (client_) {
             client_->Stop();
             client_->Reset();
@@ -384,6 +444,10 @@ struct Wasapi::Impl {
     IAudioClient* client_ = nullptr;
     IAudioRenderClient* render_ = nullptr;
     UINT32 buffer_frames_ = 0;
+    HANDLE event_ = nullptr;
+    bool event_driven_ = false;
+    HMODULE avrt_ = nullptr;
+    HANDLE mmcss_ = nullptr;
     bool com_inited_ = false;
     DWORD com_inited_thread_id_ = 0;
     uint32_t declick_frames_ = 160;
