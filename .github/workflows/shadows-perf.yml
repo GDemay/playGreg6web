@@ -7,6 +7,9 @@ on:
         default: '14d1b86644dbc35fbf32d9522c505972545a7d8a'
       patch_ref:
         required: true
+      case_filter:
+        required: true
+        default: 'all'
 permissions:
   contents: read
 jobs:
@@ -58,7 +61,7 @@ jobs:
       - name: Matched measurements without concurrent builds
         shell: pwsh
         run: |
-          python runner/tools/perf_run_buffer_shadows.py baseline-build/Release/bench_buffer_shadows.exe patch-build/Release/bench_buffer_shadows.exe --output results/windows-shadows.json
+          python runner/tools/perf_run_buffer_shadows.py baseline-build/Release/bench_buffer_shadows.exe patch-build/Release/bench_buffer_shadows.exe --output results/windows-shadows.json --case-filter ${{ inputs.case_filter }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

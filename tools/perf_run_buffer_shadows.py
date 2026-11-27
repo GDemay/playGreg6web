@@ -11,6 +11,7 @@ def main():
     parser.add_argument('before')
     parser.add_argument('after')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--case-filter', choices=('all', 'resident-sparse'), default='all')
     args = parser.parse_args()
     cases = []
     workloads = [
@@ -20,7 +21,10 @@ def main():
         (1024, 1, 1024, 'dense-first'),
         (4096, 1, 4096, 'dense-first'),
         (512, 16, 512, 'dense-resident'),
+        (4096, 64, 80, 'sparse-fully-resident'),
     ]
+    if args.case_filter == 'resident-sparse':
+        workloads = [x for x in workloads if x[3] == 'sparse-fully-resident']
     for workload in workloads:
         print('Measuring', workload, flush=True)
         def run(label):
