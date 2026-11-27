@@ -1,0 +1,57 @@
+name: Matched public Naga optimizer live-local analysis
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: true
+        default: '8ce4bbf99ce8c45a92b24a358f61ff958ee835cd'
+      patch_ref:
+        required: true
+permissions:
+  contents: read
+jobs:
+  linux-optimizer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: PlayGreg6Web/playGreg6web
+          ref: ${{ inputs.base_ref }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.patch_ref }}
+          path: patch
+      - name: Common benchmark source and exact Rust environment
+        run: |
+          mkdir -p baseline/shaders/examples results
+          cp patch/shaders/examples/bench_live_local_analysis.rs baseline/shaders/examples/bench_live_local_analysis.rs
+          python3 runner/tools/perf_run_fragmented_flush.py --environment-only --flags 'cargo build --locked --release -p playgta6-shaders --example bench_live_local_analysis -j4; opt-level=3; thin LTO; codegen-units=1' --output results/environment.json --base "${{ inputs.base_ref }}" --patch "${{ inputs.patch_ref }}"
+          python3 - <<'PY'
+          import json,subprocess
+          p='results/environment.json'
+          d=json.load(open(p));d['compiler']=subprocess.check_output(['rustc','--version'],text=True).strip();d['cargo']=subprocess.check_output(['cargo','--version'],text=True).strip();d.pop('cmake',None)
+          open(p,'w').write(json.dumps(d,indent=2)+'\n')
+          PY
+          rustc -vV > results/rust-toolchain.txt
+          sha256sum baseline/Cargo.lock patch/Cargo.lock baseline/Cargo.toml patch/Cargo.toml baseline/shaders/src/ir_opt.rs patch/shaders/src/ir_opt.rs baseline/shaders/examples/bench_live_local_analysis.rs patch/shaders/examples/bench_live_local_analysis.rs patch/tools/bench_live_local_analysis.py > results/source-hashes.txt
+      - name: Separate release builds and optimizer regression tests
+        run: |
+          for tree in baseline patch; do
+            cargo build --manifest-path "$tree/Cargo.toml" --locked --release -p playgta6-shaders --example bench_live_local_analysis -j4
+            cargo test --manifest-path "$tree/Cargo.toml" --locked --release -p playgta6-shaders --test s76_naga_ir_opt --test s77_ir_opt_cse_forwarding -j4
+          done
+      - name: Alternating seven-pair full optimizer samples after builds
+        run: |
+          python3 patch/tools/bench_live_local_analysis.py baseline/target/release/examples/bench_live_local_analysis patch/target/release/examples/bench_live_local_analysis --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.patch_ref }}" --output results/optimizer.json --samples 7 > results/summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: optimizer-live-local-controls
+          path: results/*
+          if-no-files-found: ignore
