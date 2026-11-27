@@ -1,0 +1,255 @@
+{
+  "baselineCommit": "2f12b90184e58f1cdd8638ea18cac3cd5832c3b0",
+  "patchCommit": "2cb3f06fe6618fcb580177f61d61196e3db16c19",
+  "measurementLane": "synthetic Linux x86_64 production-path benchmark; not a browser/game run",
+  "executionEnvironment": {
+    "platform": "Linux",
+    "kernel": "6.8.0-1070-azure",
+    "arch": "x86_64",
+    "vcpus": 4,
+    "compiler": "c++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+    "cpu": "AMD EPYC 7763 64-Core Processor"
+  },
+  "results": {
+    "benchmark": "synthetic parsePgimLayout, mixed DIR64/HIGHLOW sites in zero-initialized virtual sections",
+    "environment": {
+      "node": "v24.22.2",
+      "platform": "linux",
+      "arch": "x64",
+      "os": "6.8.0-1070-azure",
+      "cpu": "AMD EPYC 7763 64-Core Processor"
+    },
+    "commits": [
+      "2f12b90184e58f1cdd8638ea18cac3cd5832c3b0",
+      "2cb3f06fe6618fcb580177f61d61196e3db16c19"
+    ],
+    "rounds": 9,
+    "warmups": 3,
+    "primaryMetric": "process CPU time (user + system), ms per sample; includes process threads and GC",
+    "loadAverageStart": [
+      1.11,
+      0.91,
+      0.67
+    ],
+    "loadAverageEnd": [
+      1.11,
+      0.91,
+      0.67
+    ],
+    "sampling": "alternating baseline/patch order in one process; fixture creation and correctness comparison outside timing; warm in-memory buffers; wall samples retained; zero-relocation control parses 1000 containers per sample",
+    "cases": [
+      {
+        "control": true,
+        "iterationsPerSample": 1000,
+        "relocations": 0,
+        "sections": 8,
+        "containerBytes": 576,
+        "checksumVerification": false,
+        "correctness": "deep-equal complete parsed layout",
+        "baselineMs": [
+          6.792929000000001,
+          5.279008000000005,
+          5.295359000000005,
+          5.641654000000017,
+          5.540675999999991,
+          8.411988000000008,
+          5.275441999999998,
+          5.3420460000000105,
+          5.363907000000012
+        ],
+        "patchMs": [
+          5.069006999999999,
+          5.416083999999998,
+          5.548891999999995,
+          5.359579000000011,
+          5.170275000000004,
+          5.639028999999994,
+          5.319384000000014,
+          5.056843999999984,
+          5.16767999999999
+        ],
+        "baselineCpuMs": [
+          11.71,
+          6.026,
+          6.425,
+          6.787,
+          6.752,
+          15.808,
+          6.189,
+          6.669,
+          6.679
+        ],
+        "patchCpuMs": [
+          5.697,
+          6.4,
+          6.83,
+          6.226,
+          5.989,
+          12.29,
+          6.536,
+          5.956,
+          6.142
+        ]
+      },
+      {
+        "control": false,
+        "iterationsPerSample": 1,
+        "relocations": 100000,
+        "sections": 8,
+        "containerBytes": 400576,
+        "checksumVerification": false,
+        "correctness": "deep-equal complete parsed layout",
+        "baselineMs": [
+          3.2202909999999747,
+          3.1956749999999943,
+          3.1664109999999823,
+          3.5494040000000098,
+          2.3368350000000078,
+          2.3820890000000077,
+          2.319392999999991,
+          2.3127600000000257,
+          2.322527999999977
+        ],
+        "patchMs": [
+          2.1216940000000193,
+          2.1351789999999937,
+          2.3808070000000043,
+          1.753276999999997,
+          1.7364059999999881,
+          1.7216779999999972,
+          1.7215680000000475,
+          1.7232010000000173,
+          1.7250249999999596
+        ],
+        "baselineCpuMs": [
+          8.781,
+          11.203,
+          9.173,
+          4.91,
+          2.356,
+          2.388,
+          2.323,
+          2.316,
+          2.325
+        ],
+        "patchCpuMs": [
+          6.122,
+          6.145,
+          7.438,
+          3.018,
+          1.742,
+          1.725,
+          1.725,
+          1.726,
+          1.729
+        ]
+      },
+      {
+        "control": false,
+        "iterationsPerSample": 1,
+        "relocations": 1000000,
+        "sections": 8,
+        "containerBytes": 4000576,
+        "checksumVerification": false,
+        "correctness": "deep-equal complete parsed layout",
+        "baselineMs": [
+          22.912892,
+          22.96446800000001,
+          23.088187999999946,
+          23.188474999999926,
+          22.94080299999996,
+          23.177173999999923,
+          22.978252999999995,
+          22.912039999999934,
+          23.061398000000054
+        ],
+        "patchMs": [
+          16.929701000000023,
+          17.372265999999968,
+          20.211167000000046,
+          17.09535900000003,
+          17.569924000000015,
+          17.283450000000016,
+          16.96470599999998,
+          18.056208000000083,
+          17.120285999999965
+        ],
+        "baselineCpuMs": [
+          22.933,
+          22.976,
+          23.098,
+          23.184,
+          22.95,
+          23.187,
+          22.986,
+          22.922,
+          23.072
+        ],
+        "patchCpuMs": [
+          16.94,
+          17.384,
+          33.732,
+          17.105,
+          17.579,
+          17.295,
+          16.971,
+          17.974,
+          17.128
+        ]
+      },
+      {
+        "control": false,
+        "iterationsPerSample": 1,
+        "relocations": 1000000,
+        "sections": 32,
+        "containerBytes": 4002112,
+        "checksumVerification": false,
+        "correctness": "deep-equal complete parsed layout",
+        "baselineMs": [
+          26.09275799999989,
+          26.054476000000022,
+          26.00719799999979,
+          27.7410289999998,
+          28.115937999999915,
+          28.96519000000012,
+          27.638928999999962,
+          26.173326999999972,
+          25.926296999999977
+        ],
+        "patchMs": [
+          15.264787999999953,
+          15.298019999999951,
+          15.310373000000027,
+          15.612866999999824,
+          18.36730999999986,
+          17.326589999999896,
+          19.015327999999954,
+          15.284305000000131,
+          15.292038999999932
+        ],
+        "baselineCpuMs": [
+          26.112,
+          26.063,
+          26.016,
+          27.75,
+          28.126,
+          28.973,
+          27.644,
+          26.182,
+          25.935
+        ],
+        "patchCpuMs": [
+          15.272,
+          15.307,
+          15.317,
+          15.62,
+          18.348,
+          17.334,
+          27.401,
+          15.279,
+          15.283
+        ]
+      }
+    ]
+  }
+}

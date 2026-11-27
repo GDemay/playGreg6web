@@ -934,18 +934,6 @@
 
   const nameDecoder = new TextDecoder('utf-8', { fatal: true });
 
-  function sectionAt(sections, rva) {
-    let lo = 0;
-    let hi = sections.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >>> 1;
-      if (sections[mid].rva <= rva) lo = mid + 1;
-      else hi = mid;
-    }
-    if (lo === 0) return null;
-    const section = sections[lo - 1];
-    return rva < section.rva + section.virtualSize ? section : null;
-  }
 
   /**
    * Parse and validate the header, section table, and relocation table of a complete container
@@ -1097,6 +1085,7 @@
     let j = 0;
     let prevRva = -1;
     let prevEnd = 0;
+    let sectionIndex = 0;
     while (i < dir64.length || j < highlow.length) {
       let rva;
       let width;
@@ -1127,8 +1116,22 @@
           { rva }
         );
       }
-      const first = sectionAt(sections, rva);
-      const last = sectionAt(sections, end - 1);
+      // Relocations arrive in increasing order and sections cannot overlap. Keep
+      // the containing-section cursor rather than searching the same table twice
+      // for every relocation (large images can have millions of sites).
+      while (sectionIndex < sections.length &&
+             sections[sectionIndex].rva + sections[sectionIndex].virtualSize <= rva) {
+        sectionIndex += 1;
+      }
+      const candidate = sections[sectionIndex];
+      const first = candidate && candidate.rva <= rva ? candidate : null;
+      let lastIndex = sectionIndex;
+      while (lastIndex + 1 < sections.length && sections[lastIndex + 1].rva <= end - 1) {
+        lastIndex += 1;
+      }
+      const lastCandidate = sections[lastIndex];
+      const last = lastCandidate && lastCandidate.rva <= end - 1 &&
+        end - 1 < lastCandidate.rva + lastCandidate.virtualSize ? lastCandidate : null;
       const mapped =
         first !== null &&
         last !== null &&

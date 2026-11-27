@@ -424,6 +424,30 @@ test('parsePgimLayout rejects corrupt section and relocation tables', () => {
   assert.throws(() => parsePgimLayout(good.subarray(0, good.byteLength - 1)), (e) => e.field === 'file_size');
 });
 
+test('parsePgimLayout follows merged relocations across adjacent sections and gaps', () => {
+  const sections = [
+    { name: '.first', rva: 0x1000, virtualSize: 0x1000, protection: PGIM_PROT.READ },
+    { name: '.next', rva: 0x2000, virtualSize: 0x1000, protection: PGIM_PROT.READ },
+    { name: '.last', rva: 0x4000, virtualSize: 0x1000, protection: PGIM_PROT.READ },
+  ];
+  const image = (dir64, highlow = [], replacementSections = sections) => buildPgim({
+    flags: 0, sections: replacementSections, sizeOfImage: 0x6000, dir64, highlow,
+  });
+  const layout = parsePgimLayout(image([0x1000, 0x1ffc, 0x4000], [0x2008, 0x4ffc]));
+  assert.deepEqual([...layout.dir64], [0x1000, 0x1ffc, 0x4000]);
+  assert.deepEqual([...layout.highlow], [0x2008, 0x4ffc]);
+  for (const rva of [0, 0x3000, 0x3ffc, 0x5000]) {
+    assert.throws(() => parsePgimLayout(image([rva])), expectCode('RELOC_SITE_UNMAPPED'));
+  }
+  assert.throws(() => parsePgimLayout(image([0x2ffc])), expectCode('RELOC_SITE_UNMAPPED'));
+  // Preserve the existing rule: a relocation may cross one adjacent boundary,
+  // but cannot span several tiny sections, even if all of them are adjacent.
+  const tiny = [0, 1, 2].map((i) => ({
+    name: `.s${i}`, rva: 0x1000 + i * 2, virtualSize: 2, protection: PGIM_PROT.READ,
+  }));
+  assert.throws(() => parsePgimLayout(image([], [0x1001], tiny)), expectCode('RELOC_SITE_UNMAPPED'));
+});
+
 test('parsePgimLayout enforces executable-bytes-omitted rules', () => {
   const omitted = buildPgim({
     flags: PGIM_FLAGS.HEADERS_MAPPED | PGIM_FLAGS.EXECUTABLE_BYTES_OMITTED,
