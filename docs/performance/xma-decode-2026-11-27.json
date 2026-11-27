@@ -11,7 +11,7 @@
     "cmake": "cmake version 4.5.1",
     "baseline": "52918dfa4d41e9f316990b06b713219dd9135aac",
     "patch": "77a373b96a85f9c7cd292383b8374fa375b1cdb9",
-    "gate_configuration": "Release; PLAYGTA6_OPUS=OFF; PLAYGTA6_PERFORMANCE_BENCHMARKS=ON; -j4 builds only"
+    "benchmark_build_command": "c++ -std=c++20 -O3 -DNDEBUG -I<tree>/runtime <common-harness>/tests/test_xma_decoder.cpp <tree>/runtime/os/xma_decoder.cpp <tree>/runtime/os/xapu_opus.cpp -pthread -o <binary>"
   },
   "sampling": "separate prebuilt binaries; alternating A/B order across fresh-process samples; first decode timed separately; three untimed decodes then state reset before warmed batch; fixture encoding, allocation and all PCM hashing outside timing",
   "metrics": "wall_ms/cpu_ms are warmed batch totals; first_decode_us/first_decode_cpu_us include cold production initialization",
