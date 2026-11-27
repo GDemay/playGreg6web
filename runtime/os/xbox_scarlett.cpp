@@ -3135,12 +3135,19 @@ uint64_t guest_hook_routine(size_t index) {
 
 // Calls a guest routine with two integer arguments on this thread's guest state. The state is
 // restored afterwards: the caller may be a shim inside another guest call (D3D12 resource
-// creation allocating through XMemAlloc).
+// creation allocating through XMemAlloc). Except while a guest exception (or longjmp) raised by
+// the routine propagates to an enclosing guest frame: the state then holds the restored context
+// with `unwind_pending` set, and restoring the saved state would silently drop the exception
+// (docs/LIFTER_STATE_CONTRACT.md). It is kept as it is and the result is 0; the import thunk
+// sees `unwind_pending` and returns straight into the unwind.
 uint64_t call_guest_routine(uint64_t routine, uint64_t a0, uint64_t a1) {
     namespace gcom = playgta6::guest::com;
     GuestState& state = gcom::current_guest_state();
     const GuestState saved = state;
     const uint64_t result = gcom::GuestFunction<uint64_t(uint64_t, uint64_t)>(routine).call(state, a0, a1);
+    if (state.unwind_pending != 0) {
+        return 0;
+    }
     state = saved;
     return result;
 }

@@ -169,6 +169,8 @@ pub const SEAM_GPR_OFFSET: u64 = crate::lift::STATE_GPR_OFFSET;
 pub const SEAM_XMM_OFFSET: u64 = crate::lift::STATE_XMM_OFFSET;
 /// Distance between two XMM registers in the default seam's guest state.
 pub const SEAM_XMM_STRIDE: u64 = crate::lift::STATE_XMM_STRIDE;
+/// Byte offset of the `unwind_pending` flag in the default seam's guest state (lifter layout).
+pub const SEAM_UNWIND_PENDING_OFFSET: u64 = crate::lift::STATE_UNWIND_PENDING_OFFSET;
 /// Offset of the fifth argument from `rsp` at callee entry: return address + shadow space.
 pub const STACK_ARG_OFFSET: u64 = crate::lift::CALLEE_STACK_ARG_OFFSET;
 
@@ -1973,6 +1975,7 @@ static_assert(sizeof(void*) == 8, \"guest addresses are 64-bit\");
 inline constexpr uint64_t kPg6SeamGprOffset = {gpr};
 inline constexpr uint64_t kPg6SeamXmmOffset = {xmm};
 inline constexpr uint64_t kPg6SeamXmmStride = {stride};
+inline constexpr uint64_t kPg6SeamUnwindPendingOffset = {unwind};
 // Fifth argument relative to rsp at callee entry: return address + 32-byte shadow space.
 inline constexpr uint64_t kPg6SeamStackArgOffset = {stack};
 
@@ -2005,6 +2008,13 @@ inline uint64_t pg6_seam_load_u64(uint64_t guest_va) {{
     return value;
 }}
 
+// Nonzero while a guest context restore (exception unwind, longjmp) propagates: a nested guest
+// call made by the shim raised, and the registers hold the restored context. The thunk must then
+// leave `rax`, `xmm0` and `rsp` alone and return straight into the unwind path.
+inline bool pg6_seam_unwind_pending(void* state) {{
+    return static_cast<unsigned char*>(state)[kPg6SeamUnwindPendingOffset] != 0;
+}}
+
 // Leave the thunk like `ret`: pop the return address the guest caller pushed.
 inline void pg6_seam_return(void* state) {{
     pg6_seam_set_gpr(state, 4, pg6_seam_get_gpr(state, 4) + 8);
@@ -2022,6 +2032,7 @@ inline void pg6_seam_log(const char* message) {{
         gpr = SEAM_GPR_OFFSET,
         xmm = SEAM_XMM_OFFSET,
         stride = SEAM_XMM_STRIDE,
+        unwind = SEAM_UNWIND_PENDING_OFFSET,
         stack = STACK_ARG_OFFSET,
         translation = if translated_window {
             SEAM_WINDOW_TRANSLATION
@@ -2439,14 +2450,22 @@ fn render_bound_thunk(out: &mut String, thunk: &str, shim: &ShimDecl, window: bo
     } else {
         ""
     };
+    // A guest exception raised by a nested guest call inside the shim leaves the restored
+    // context in the state: no result store and no `ret` pop (docs/LIFTER_STATE_CONTRACT.md).
+    let unwind_check = "    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
+";
     match shim.ret.kind {
         TypeKind::Void => {
             let _ = writeln!(out, "    {call};");
             out.push_str(finish);
+            out.push_str(unwind_check);
         }
         kind => {
             let _ = writeln!(out, "    const auto result = {call};");
             out.push_str(finish);
+            out.push_str(unwind_check);
             let store = match kind {
                 TypeKind::F32 => {
                     "pg6_seam_set_xmm_lo(state, 0, pg6_bits_from_f32(result))".to_string()
@@ -3522,6 +3541,14 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
         );
         assert!(t.contains("pg6_seam_return(state);"), "{t}");
         assert!(!t.contains("rsp"), "{t}");
+        // A guest exception raised inside the shim returns before the result store and the pop.
+        let check = t
+            .find("if (pg6_seam_unwind_pending(state)) {
+        return;
+    }")
+            .unwrap_or_else(|| panic!("unwind check in
+{t}"));
+        assert!(check < t.find("pg6_seam_set_gpr(state, 0").unwrap(), "{t}");
 
         // 1 arg, void result leaves rax alone.
         let t = thunk(&format!("{api}!Sleep"));
@@ -3532,6 +3559,11 @@ extern "C" uint32_t pg6_gdk_single_decl(uint8_t x = 0) noexcept;
             "{t}"
         );
         assert!(!t.contains("set_gpr(state, 0"), "{t}");
+        assert!(
+            t.find("pg6_seam_unwind_pending(state)").unwrap()
+                < t.find("pg6_seam_return(state)").unwrap(),
+            "{t}"
+        );
 
         // 4 integer args: rcx rdx r8 r9.
         let t = thunk("KERNEL32.dll!VirtualAlloc");
@@ -4450,7 +4482,8 @@ int g_failures = 0;
         }                                                                             \
     } while (0)
 
-alignas(16) unsigned char g_state[416];
+alignas(16) unsigned char g_state[704];
+bool g_raise = false;
 uint64_t g_stack[32];
 const char g_text[] = "hi";
 const char16_t g_wide[] = u"ok";
@@ -4490,7 +4523,15 @@ extern "C" uint64_t pg6_win32_virtual_alloc(uint64_t address, uint64_t size, uin
     g_alloc[3] = protect;
     return 0x7000000u;
 }
-extern "C" uint32_t pg6_win32_get_tick_count(void) { return 0xFFFFFFF0u; }
+extern "C" uint32_t pg6_win32_get_tick_count(void) {
+    if (g_raise) {
+        // A nested guest call raised: the state holds the restored context.
+        pg6_seam_set_gpr(g_state, 0, 0xC0FFEEu);
+        pg6_seam_set_gpr(g_state, 4, 0x5000u);
+        g_state[kPg6SeamUnwindPendingOffset] = 1;
+    }
+    return 0xFFFFFFF0u;
+}
 extern "C" void pg6_win32_sleep(uint32_t milliseconds) { g_slept = milliseconds; }
 extern "C" double pg6_win32_mix_args(int32_t a, double b, const char* c, float d, uint64_t e,
                                      float f, int8_t g, Pg6OpaqueHandle h) {
@@ -4565,6 +4606,21 @@ int main(int argc, char** argv) {
     pg6_seam_set_gpr(g_state, 0, 0x1234u);
     call_slot(SLOT_GET_TICK_COUNT);
     CHECK(rax() == 0xFFFFFFF0u);
+
+    // A guest exception raised inside the shim: no result store, no `ret` pop.
+    reset();
+    g_raise = true;
+    {
+        const Pg6ImportThunk* thunk = pg6_find_import_thunk(SLOT_GET_TICK_COUNT);
+        CHECK(thunk != nullptr);
+        if (thunk != nullptr) {
+            thunk->thunk(g_state);
+        }
+    }
+    g_raise = false;
+    CHECK(rax() == 0xC0FFEEu);
+    CHECK(pg6_seam_get_gpr(g_state, 4) == 0x5000u);
+    CHECK(pg6_seam_unwind_pending(g_state));
 
     // 1 arg, void result: rax untouched.
     reset();

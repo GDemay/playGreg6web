@@ -53,9 +53,9 @@ holds in an alloca. A **reader** observes a stale value if the field was not sto
 
 | Site | Writes | Reached from lifted code via |
 |---|---|---|
-| Generated import thunks (`recomp/src/stubs.rs`), bridge thunks (`guest/com_bridge.h`, `store_result`), `sret_thunk` (`gpu/d3d12_guest_objects.h`), COM QI/AddRef/Release | `rax`, or `xmm0` (generated thunks write the low lane only; bridge thunks zero the high lane), and `rsp += 8` | indirect call (ALL) |
+| Generated import thunks (`recomp/src/stubs.rs`), bridge thunks (`guest/com_bridge.h`, `store_result`), `sret_thunk` (`gpu/d3d12_guest_objects.h`), COM QI/AddRef/Release | `rax`, or `xmm0` (generated thunks write the low lane only; bridge thunks zero the high lane), and `rsp += 8`. Generated and bridge thunks write neither while `unwind_pending` is set | indirect call (ALL) |
 | Nested host-to-guest calls: `call_guest_tagged` (`guest/guest_runtime.cpp`), `call_guest_raw` (`guest/com_bridge.cpp`) on the **caller's** state (innermost `GuestStateScope`) | `rcx rdx r8 r9 rsp` and float args in `xmm0-3`. Restores only `rsp`, so `rax r10 r11 xmm0-5 ymm_hi flags DF mxcsr` keep whatever the callback left | indirect call (ALL). Thunks that call back this way: `qsort` (void: `rax` = last comparator result), `bsearch`, `_initterm(_e)`, `InitOnceExecuteOnce`, `FlsFree` destructors, `_callnewh`, `_execute_onexit_table`, `_cexit` / `exit`, `UnhandledExceptionFilter`, GameInput device callbacks, XGameSave enumerate, the XAsync provider, `XAsyncRun`, and task-queue and XAsync completions when they run synchronously |
-| `call_guest_routine` (XMem alloc/free hooks, `os/xbox_scarlett.cpp`) | Saves the whole state and restores it afterwards (`state = saved`) | indirect call (ALL) |
+| `call_guest_routine` (XMem alloc/free hooks, `os/xbox_scarlett.cpp`) | Saves the whole state and restores it afterwards (`state = saved`), except while an unwind is pending: then the restored context stays | indirect call (ALL) |
 | Exception / context thunks (`guest/guest_exceptions.cpp`): `RaiseException`, `RtlRaiseException` (continue-execution), `RtlUnwind(Ex)`, `RtlRestoreContext`, consolidate, `longjmp` | **all 16 GPRs including the non-volatiles**, `flags[0..6]`, `mxcsr`, `xmm0-15`, `rip`, `resume_rip`, `unwind_pending`. `longjmp` writes `rbx rsp rbp rsi rdi r12-r15 mxcsr xmm6-15`. `ymm_hi` is never restored | indirect call (ALL), then the unwind protocol |
 | `RtlCaptureContext`, lookup, VirtualUnwind and filter setters | `rax`, `rsp += 8` | indirect call (ALL) |
 | `cpuid` / `rdtsc` / `rdtscp` / `xgetbv` (`guest/cpu_helpers.cpp`) | `rax rbx rcx rdx` / `rax rdx` / `+rcx` / `rax rdx` | helper (ALL, full sync) |
@@ -77,7 +77,7 @@ state and end the run on a fault.
 | Import / bridge thunks | `rcx rdx r8 r9`, `xmm0-3` (low lanes), stack args at `rsp+40+8k` | inside an indirect call (after a full sync) |
 | `capture_caller_context` (RtlCaptureContext / RaiseException / setjmp) | all GPRs, `flags`, `mxcsr`, `xmm0-15`, `[rsp]` | inside an indirect call |
 | `boot_dispatch_observer` (`guest/boot.cpp`) | `rcx rdx r8 r9 rsp` | inside an indirect call |
-| `__playgta6_probe_hit` (`--probe-functions`, inserted at function entry **after** lifting) | `rcx rdx r8 r9` | at callee entry, **during a direct call**: arguments the callee does not read may be stale. Logging only |
+| `__playgta6_probe_hit` (`--probe-functions`, inserted at function entry **after** lifting) | `rcx rdx r8 r9` | at callee entry, **during a direct call**. A probed build's summaries (`FlagSummaries::compute_with_probes`) count the probed function as reading all four, so callers sync them first. Logging only |
 | Fault capture / backtrace / thread dump (`guest/boot.cpp`, `guest_runtime.cpp format_fault`) | everything (on copies). The thread dump reads another running thread's state without synchronisation | on fatal faults or a dump. Values can be stale or torn, but nothing is written |
 | `__playgta6_trap` / `unimplemented` / `divide_error` | `unwind_pending`, `resume_rip`, `rsp` | after a full sync, then the run ends |
 
@@ -124,11 +124,14 @@ Before #2033, rules 1-4 already held. Nothing found here shows #2033 broke one o
 
 ## Incidental findings (pre-existing, independent of #2033)
 
-- **Generated import thunks never check `unwind_pending`** (`recomp/src/stubs.rs`). If a shim
-  runs a nested guest call that throws, the thunk still writes `rax` and moves the restored `rsp`
-  by 8. `call_guest_tagged` also returns without restoring `rsp` while an unwind is pending.
-- **`call_guest_routine` (XMem hooks) restores the whole state**, which also clears
-  `unwind_pending` / `resume_rip`. An exception thrown by the guest allocator is silently dropped.
+- **Fixed: generated import thunks ignored `unwind_pending`** (`recomp/src/stubs.rs`). If a shim
+  ran a nested guest call that threw, the thunk still wrote `rax` and moved the restored `rsp`
+  by 8. They now check `pg6_seam_unwind_pending` after the shim and return without touching the
+  state. (`call_guest_tagged` returns without restoring `rsp` while an unwind is pending, which
+  is what the unwind needs.)
+- **Fixed: `call_guest_routine` (XMem hooks) restored the whole state**, which also cleared
+  `unwind_pending` / `resume_rip`, so an exception thrown by the guest allocator was silently
+  dropped. A pending unwind now keeps the restored state (`tests/test_xmem_hooks.cpp`).
 - **The main thread has no `GuestStateScope`.** Synchronous callbacks from generated imports on
   the boot thread run on a separate lazy state; on worker threads they run on the caller's
   state. Behaviour differs by thread.
@@ -136,4 +139,5 @@ Before #2033, rules 1-4 already held. Nothing found here shows #2033 broke one o
   callee `touched_flags` / `written_flags`, so a discovery change that only widened a callee's
   written flags reused stale caller IR with `--lift-cache`. Fixed: all six summary fields are
   hashed (`SHARD_CACHE_VERSION` 2) and `function_key_covers_every_callee_summary_field` pins it.
-- **`probe_hit` logs can show stale arguments** for callees that do not read them (see Readers).
+- **Fixed: `probe_hit` logs could show stale arguments** for callees that do not read them. A
+  probed build now treats `rcx rdx r8 r9` as read at the probed entry (see Readers).

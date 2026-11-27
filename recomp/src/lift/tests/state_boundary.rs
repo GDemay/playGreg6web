@@ -258,3 +258,60 @@ fn precise_summaries_exist_only_for_code_the_runtime_never_enters() {
         assert_eq!(written(va), ALL, "{va:#x} must count as writing everything");
     }
 }
+
+/// The entry probe logs `rcx rdx r8 r9`. A callee that does not read `r8`/`r9` would otherwise
+/// let its callers skip storing them before a direct call, and the probe would log a stale copy:
+/// a probed build counts the probed function as reading all four at entry, transitively.
+#[test]
+fn probed_functions_get_their_arguments_synced_before_direct_calls() {
+    let r8_r9 = (1u64 << 8) | (1u64 << 9);
+    let functions = program().discover();
+    let plain = FlagSummaries::compute(functions.values());
+    // PURE reads only rcx and rdx, so without a probe nobody syncs r8/r9 for it.
+    let synced = |s: &FlagSummaries, va: u64| {
+        s.touched(va).expect("analysed") & s.live_in_state(va).expect("analysed")
+    };
+    assert_eq!(synced(&plain, PURE) & r8_r9, 0);
+    let probes = [PURE].into_iter().collect();
+    let probed = FlagSummaries::compute_with_probes(functions.values(), &probes);
+    let args = 0b11_0000_0110u64;
+    assert_eq!(synced(&probed, PURE) & args, args);
+    // Callers that reach PURE without setting r8/r9 pass the requirement on to their callers.
+    assert_eq!(synced(&probed, PURE_CALLER) & r8_r9, r8_r9);
+    assert_eq!(synced(&probed, NESTED) & r8_r9, r8_r9);
+    // Written summaries are unchanged: the probe only reads.
+    for &va in functions.keys() {
+        assert_eq!(probed.written(va), plain.written(va), "{va:#x}");
+    }
+    // A caller that sets r8 itself must store it to the slot before the direct call, or the
+    // probe reads the value from before the caller ran.
+    const PROBED: u64 = CODE_BASE;
+    const SETS_R8: u64 = CODE_BASE + 0x100;
+    let functions = Program::new()
+        .asm(PROBED, |a| {
+            a.lea(rax, qword_ptr(rcx + rdx))?;
+            a.ret()
+        })
+        .asm(SETS_R8, |a| {
+            a.mov(r8, 5u64)?;
+            a.call(PROBED)?;
+            a.add(rax, r8)?;
+            a.ret()
+        })
+        .discover();
+    let plain = FlagSummaries::compute(functions.values());
+    let probed = FlagSummaries::compute_with_probes(functions.values(), &[PROBED].into());
+    let call = format!("@{}(", function_symbol(PROBED));
+    let stores_r8_before_call = |summaries: &FlagSummaries| {
+        let ir = crate::lift::lift_function_in(
+            &functions[&SETS_R8],
+            crate::lift::GuestBase::default(),
+            summaries,
+        )
+        .expect("lifts")
+        .ir;
+        ir[..ir.find(&call).expect("direct call")].contains("ptr %state.gpr8")
+    };
+    assert!(!stores_r8_before_call(&plain));
+    assert!(stores_r8_before_call(&probed));
+}

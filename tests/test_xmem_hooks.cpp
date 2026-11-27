@@ -43,6 +43,9 @@ constexpr uint64_t kFreeHook = 0x140030100ULL;      // void free(void*, uint64_t
 constexpr uint64_t kOtherAlloc = 0x140030200ULL;    // XMemSetAllocationHooks routine
 constexpr uint64_t kWindowAlloc = 0x140030300ULL;   // hands out translated-window addresses
 constexpr uint64_t kWindowFree = 0x140030400ULL;    // records the address it is given
+constexpr uint64_t kRaiseAlloc = 0x140030500ULL;    // raises a guest exception to its caller's caller
+constexpr uint64_t kOuterFrame = 0x140030600ULL;    // guest code whose shim allocates through kRaiseAlloc
+constexpr uint64_t kResumeRip = 0x140030680ULL;     // where kOuterFrame's handler would continue
 constexpr uint64_t kWindowBlock = playgta6::os::guest_window::kWindowBase + 0x10040;
 constexpr uint64_t kArenaId = 0x80;                 // allocator id served by the arena
 constexpr uint64_t kArenaAttributes = (kArenaId << 16) | (2u << 14);
@@ -124,12 +127,44 @@ void sub_window_free(GuestState* s) {
     ret(s);
 }
 
+// The outer frame's entry rsp: the owner of the context the raising routine restores.
+uint64_t g_outer_rsp = 0;
+bool g_outer_checked = false;
+
+// A title allocator that throws (a guest exception caught by kOuterFrame): restores kOuterFrame's
+// context and starts the unwind, as RtlUnwindEx does.
+void sub_raise_alloc(GuestState* s) {
+    s->gpr[GuestReg::Rax] = 0xC0FFEE;
+    s->gpr[GuestReg::Rsp] = g_outer_rsp;
+    s->resume_rip = kResumeRip;
+    s->unwind_pending = 1;
+}
+
+// Guest code calling an XMemAlloc import (the shim runs on this frame's state): the pending
+// exception must reach it with the restored context intact, not be dropped by the hook.
+void sub_outer_frame(GuestState* s) {
+    g_outer_rsp = s->gpr[GuestReg::Rsp];
+    s->gpr[GuestReg::Rax] = 0x1111;
+    void* p = pg6_xbox_XMemAlloc(64, 0);
+    CHECK(p == nullptr);
+    CHECK(s->unwind_pending == 1);
+    CHECK(s->resume_rip == kResumeRip);
+    CHECK(s->gpr[GuestReg::Rsp] == g_outer_rsp);
+    CHECK(s->gpr[GuestReg::Rax] == 0xC0FFEE);
+    g_outer_checked = true;
+    // The owner's unwind block: take over the restored context and return normally.
+    s->unwind_pending = 0;
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kAllocHook, sub_alloc_hook},
     {kFreeHook, sub_free_hook},
     {kOtherAlloc, sub_other_alloc},
     {kWindowAlloc, sub_window_alloc},
     {kWindowFree, sub_window_free},
+    {kRaiseAlloc, sub_raise_alloc},
+    {kOuterFrame, sub_outer_frame},
 };
 
 // O31: a title allocator that hands out translated-window addresses. The import thunks of a
@@ -150,6 +185,16 @@ void test_window_addresses() {
     CHECK(g_window_freed == kWindowBlock);
     pg6_xbox_XMemSetAllocationHooks(0, 0);
     gw::reset_for_testing();
+}
+
+// A guest exception raised by the allocator routine propagates to the enclosing guest frame:
+// call_guest_routine keeps the restored state instead of restoring the saved one.
+void test_exception_from_hook() {
+    pg6_xbox_XMemSetAllocationHooks(kRaiseAlloc, kFreeHook);
+    playgta6::guest::com::GuestFunction<void()>{kOuterFrame}();
+    CHECK(g_outer_checked);
+    CHECK(playgta6::guest::com::current_guest_state().unwind_pending == 0);
+    pg6_xbox_XMemSetAllocationHooks(0, 0);
 }
 
 void test_hooks() {
@@ -237,6 +282,7 @@ int main() {
     CHECK(register_lifted_functions(kFunctions));
     test_hooks();
     test_window_addresses();
+    test_exception_from_hook();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xmem_hooks failed with %d failure(s)\n", g_failures);
         return 1;

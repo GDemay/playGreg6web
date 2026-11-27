@@ -86,6 +86,9 @@ void pg6_export_crt_pow(void* state) {
     const auto result = pg6_crt_pow(
         pg6_f64_from_bits(pg6_seam_get_xmm_lo(state, 0)),
         pg6_f64_from_bits(pg6_seam_get_xmm_lo(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_xmm_lo(state, 0, pg6_bits_from_f64(result));
     pg6_seam_return(state);
 }
@@ -94,6 +97,9 @@ void pg6_export_crt_pow(void* state) {
 void pg6_export_crt_sinf(void* state) {
     const auto result = pg6_crt_sinf(
         pg6_f32_from_bits(pg6_seam_get_xmm_lo(state, 0)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_xmm_lo(state, 0, pg6_bits_from_f32(result));
     pg6_seam_return(state);
 }
@@ -102,6 +108,9 @@ void pg6_export_crt_sinf(void* state) {
 void pg6_export_crt_strlen(void* state) {
     const auto result = pg6_crt_strlen(
         pg6_arg_ptr<const char*>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -110,12 +119,18 @@ void pg6_export_crt_strlen(void* state) {
 void pg6_export_win32_enter_critical_section(void* state) {
     pg6_win32_enter_critical_section(
         pg6_arg_ptr<Pg6CriticalSection*>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_return(state);
 }
 
 // -> pg6_win32_get_last_error
 void pg6_export_win32_get_last_error(void* state) {
     const auto result = pg6_win32_get_last_error();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -123,6 +138,9 @@ void pg6_export_win32_get_last_error(void* state) {
 // -> pg6_win32_get_tick_count64
 void pg6_export_win32_get_tick_count64(void* state) {
     const auto result = pg6_win32_get_tick_count64();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -131,6 +149,9 @@ void pg6_export_win32_get_tick_count64(void* state) {
 void pg6_export_win32_initialize_condition_variable(void* state) {
     pg6_win32_initialize_condition_variable(
         pg6_arg_ptr<Pg6ConditionVariable*>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_return(state);
 }
 
@@ -138,6 +159,9 @@ void pg6_export_win32_initialize_condition_variable(void* state) {
 void pg6_export_win32_initialize_critical_section(void* state) {
     pg6_win32_initialize_critical_section(
         pg6_arg_ptr<Pg6CriticalSection*>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_return(state);
 }
 
@@ -145,6 +169,9 @@ void pg6_export_win32_initialize_critical_section(void* state) {
 void pg6_export_win32_leave_critical_section(void* state) {
     pg6_win32_leave_critical_section(
         pg6_arg_ptr<Pg6CriticalSection*>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_return(state);
 }
 
@@ -158,6 +185,9 @@ void pg6_export_win32_multi_byte_to_wide_char(void* state) {
         pg6_arg_int<int32_t>(pg6_seam_get_gpr(state, 9)),
         pg6_arg_ptr<char16_t*>(pg6_seam_load_u64(rsp + kPg6SeamStackArgOffset + 0)),
         pg6_arg_int<int32_t>(pg6_seam_load_u64(rsp + kPg6SeamStackArgOffset + 8)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -166,6 +196,9 @@ void pg6_export_win32_multi_byte_to_wide_char(void* state) {
 void pg6_export_win32_set_last_error(void* state) {
     pg6_win32_set_last_error(
         pg6_arg_int<uint32_t>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_return(state);
 }
 
@@ -175,6 +208,9 @@ void pg6_export_win32_sleep_condition_variable_cs(void* state) {
         pg6_arg_ptr<Pg6ConditionVariable*>(pg6_seam_get_gpr(state, 1)),
         pg6_arg_ptr<Pg6CriticalSection*>(pg6_seam_get_gpr(state, 2)),
         pg6_arg_int<uint32_t>(pg6_seam_get_gpr(state, 8)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -183,6 +219,9 @@ void pg6_export_win32_sleep_condition_variable_cs(void* state) {
 void pg6_export_win32_wake_all_condition_variable(void* state) {
     pg6_win32_wake_all_condition_variable(
         pg6_arg_ptr<Pg6ConditionVariable*>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_return(state);
 }
 
@@ -190,6 +229,9 @@ void pg6_export_win32_wake_all_condition_variable(void* state) {
 void pg6_export_ws2_closesocket(void* state) {
     const auto result = pg6_ws2_closesocket(
         pg6_arg_int<Pg6Socket>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
