@@ -638,6 +638,7 @@ PresentPlaneColorPlan classify_present_plane_color(uint32_t dxgi_format, uint32_
     bool is_float_hdr = false;
     bool is_hdr10_capable = false;
     bool is_srgb_resource = false;
+    bool format_opaque_alpha = false;
 
     switch (d) {
     case D::R8G8B8A8_UNORM:
@@ -661,12 +662,12 @@ PresentPlaneColorPlan classify_present_plane_color(uint32_t dxgi_format, uint32_
     case D::B8G8R8X8_UNORM:
     case D::B8G8R8X8_TYPELESS:
         plan.canvas_format = static_cast<uint8_t>(F::Bgra8Unorm);
-        plan.opaque_alpha = true;
+        format_opaque_alpha = true;
         break;
     case D::B8G8R8X8_UNORM_SRGB:
         plan.canvas_format = static_cast<uint8_t>(F::Bgra8Unorm);
         plan.sample_view_format = static_cast<uint8_t>(F::Bgra8Unorm);
-        plan.opaque_alpha = true;
+        format_opaque_alpha = true;
         is_srgb_resource = true;
         break;
     case D::R10G10B10A2_UNORM:
@@ -729,8 +730,12 @@ PresentPlaneColorPlan classify_present_plane_color(uint32_t dxgi_format, uint32_
         break;
     }
 
+    // Bottom-most base planes (!is_overlay_plane) are always composited opaque onto the swapchain
+    // canvas: 3D scene/post-process targets in RGBA16F / R10G10B10A2 / RGBA8 commonly leave
+    // alpha == 0.0, which would otherwise black out the screen in non-passthrough transfer shaders.
+    plan.opaque_alpha = format_opaque_alpha || !is_overlay_plane;
     plan.needs_color_compositor =
-        is_srgb_resource || is_float_hdr || non_default_cs || has_sub_rect || (plan.opaque_alpha && is_overlay_plane);
+        is_srgb_resource || is_float_hdr || non_default_cs || has_sub_rect || (format_opaque_alpha && is_overlay_plane);
     return plan;
 }
 
@@ -2455,8 +2460,12 @@ uint32_t emit_color_managed_present_planes(Device* device, std::span<const Prepa
         if (plane.has_sub_rect) {
             ensure_rect_resources();
         }
-        const uint32_t pipeline =
-            pipeline_for(plane.plan.transfer, plane.plan.opaque_alpha, /*blended=*/k > 0, plane.has_sub_rect);
+        const bool blended = (k > 0);
+        // Always treat the bottom-most base plane (k == 0, !blended) as opaque alpha 1.0 even if
+        // its DXGI format has an alpha channel or a lower guest plane was skipped; blended overlay
+        // planes (k > 0) keep honoring their alpha channel unless their format is XRGB.
+        const bool opaque_alpha = plane.plan.opaque_alpha || !blended;
+        const uint32_t pipeline = pipeline_for(plane.plan.transfer, opaque_alpha, blended, plane.has_sub_rect);
         draws.emplace_back(pipeline, group_for(plane, k));
     }
 
