@@ -6,6 +6,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -233,11 +234,9 @@ inline size_t match_word(std::string_view s, size_t i, std::string_view kw) {
 
 // findWgslStageEntryPoints: every `@<stage> (@attr(...))* fn name`, in order, without duplicates.
 // stage: "vertex" | "fragment" | "compute".
-inline std::vector<std::string> find_wgsl_stage_entry_points(std::string_view code, std::string_view stage) {
+inline std::vector<std::string> find_wgsl_stage_entry_points_cleaned(std::string_view s, std::string_view stage) {
     std::vector<std::string> found;
-    if (code.empty() || (stage != "vertex" && stage != "fragment" && stage != "compute")) return found;
-    const std::string cleaned = strip_wgsl_comments(code);
-    const std::string_view s = cleaned;
+    if (s.empty() || (stage != "vertex" && stage != "fragment" && stage != "compute")) return found;
     for (size_t at = s.find('@'); at != std::string_view::npos; at = s.find('@', at + 1)) {
         size_t i = match_word(s, at + 1, stage);
         if (i == std::string_view::npos) continue;
@@ -269,6 +268,10 @@ inline std::vector<std::string> find_wgsl_stage_entry_points(std::string_view co
         if (std::find(found.begin(), found.end(), name) == found.end()) found.push_back(std::move(name));
     }
     return found;
+}
+
+inline std::vector<std::string> find_wgsl_stage_entry_points(std::string_view code, std::string_view stage) {
+    return find_wgsl_stage_entry_points_cleaned(strip_wgsl_comments(code), stage);
 }
 
 // wgpu_worker.js extractWgslEntryPoint: the first `@<stage>` followed (anywhere, lazily) by
@@ -303,10 +306,10 @@ inline std::optional<std::string> extract_wgsl_entry_point(std::string_view code
 
 // resolveShaderEntryPoint(shaderEntry, stage): `explicit_ep` is the entry's recorded entryPoint
 // (extract_wgsl_entry_point of the shader's own stage), `stage` the stage it is used as.
-inline std::string resolve_shader_entry_point(std::string_view code, const std::optional<std::string>& explicit_ep,
-                                              std::string_view stage) {
+inline std::string resolve_shader_entry_point_cleaned(std::string_view cleaned, const std::optional<std::string>& explicit_ep,
+                                                      std::string_view stage) {
     const char* def = stage == "fragment" ? "fs_main" : stage == "compute" ? "cs_main" : "vs_main";
-    const auto declared = find_wgsl_stage_entry_points(code, stage);
+    const auto declared = find_wgsl_stage_entry_points_cleaned(cleaned, stage);
     auto valid_ident = [](const std::string& s) {
         if (s.empty() || !is_ident_start(s[0])) return false;
         return std::all_of(s.begin(), s.end(), [](char c) { return is_ident_char(c); });
@@ -319,6 +322,20 @@ inline std::string resolve_shader_entry_point(std::string_view code, const std::
         return declared.front();
     }
     return ex.empty() ? std::string(def) : ex;
+}
+
+inline std::string resolve_shader_entry_point(std::string_view code, const std::optional<std::string>& explicit_ep,
+                                              std::string_view stage) {
+    return resolve_shader_entry_point_cleaned(strip_wgsl_comments(code), explicit_ep, stage);
+}
+
+// Preserve alternate-stage decisions with one comment-stripping pass before dropping pack text.
+inline std::array<std::string, 3> resolve_all_shader_entry_points(
+    std::string_view code, const std::optional<std::string>& explicit_ep) {
+    const std::string cleaned = strip_wgsl_comments(code);
+    return {resolve_shader_entry_point_cleaned(cleaned, explicit_ep, "vertex"),
+            resolve_shader_entry_point_cleaned(cleaned, explicit_ep, "fragment"),
+            resolve_shader_entry_point_cleaned(cleaned, explicit_ep, "compute")};
 }
 
 // WGSL_GROUP0_RE: /@group\(\s*0\s*\)/

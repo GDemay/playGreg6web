@@ -3434,8 +3434,15 @@ struct NativeExecutor::Impl {
         const uint64_t t1 = now_ns();
         e.worker_ns = t1 - t0;
         e.worker_private_mb = host_private_mb();
-        // The scans the pipeline builders need (memoized: entry_point_of / group0_of / ... find them).
-        if (*stage_name) {
+        // Keep WGSL-derived entry points and fragment-output decisions tied to the source used
+        // to create this module, even if its pack is later replaced or changed in place.
+        static const bool keep_text = std::getenv("PG6_KEEP_WGSL") != nullptr;
+        const bool drop_text = !keep_text && shader_text_droppable(e.hash, e.worker_miss);
+        if (drop_text) {
+            auto entries = resolve_all_shader_entry_points(e.code, e.explicit_ep);
+            for (size_t i = 0; i < entries.size(); ++i) e.ep_cache[i] = std::move(entries[i]);
+            e.worker_scans += 3;
+        } else if (*stage_name) {
             e.ep_cache[stage_slot(stage_name)] = resolve_shader_entry_point(e.code, e.explicit_ep, stage_name);
             ++e.worker_scans;
         }
@@ -3444,17 +3451,15 @@ struct NativeExecutor::Impl {
         e.declares_group0_cache = wgsl_declares_group0(e.code);
         e.access_cache = std::make_shared<const ShaderBindingAccess>(scan_binding_access(e.code));
         e.worker_scans += 4;
-        if (e.stage == 1) {
+        if (drop_text || e.stage == 1) {
             e.frag_mask_ep = e.ep_cache[1];
-            e.frag_mask_cache = wgsl_fragment_output_mask(e.code, e.frag_mask_ep);
+            // The outer optional records that a nullopt result was computed, too.
+            e.frag_mask_cache.emplace(wgsl_fragment_output_mask(e.code, e.frag_mask_ep));
             ++e.worker_scans;
         }
         e.worker_scan_ns = now_ns() - t1;
         e.worker_code_bytes = e.code.size();
-        // The module and every scan the builders memoize are done: a pack-backed text (~3 MB each, ~2 GB over
-        // a std-pack boot) is not kept; code_of() re-reads it from the pack on the rare rescan.
-        static const bool keep_text = std::getenv("PG6_KEEP_WGSL") != nullptr;  // diagnosis: the old behaviour
-        if (!keep_text && shader_text_droppable(e.hash, e.worker_miss)) {
+        if (drop_text) {
             std::string().swap(e.code);
             e.code_dropped = true;
         }

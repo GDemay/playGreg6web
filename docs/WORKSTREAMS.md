@@ -285,6 +285,9 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 ---
 
+- [x] **GPU correctness — Preserve native shader metadata after pack changes** — `DONE` (#2087, @GDemay) *(synthetic data; no shared ABI changes)*
+  - Preserve WGSL-derived entry-point and fragment-output decisions when a shader's pack changes, without retaining the full text.
+
 - [x] **GPU performance — Linear-time Dawn blob-cache eviction selection** — `DONE` (#2050, @GDemay) *(no game files required; scoped to `runtime/gpu/native_exec/blob_cache.h`, its tests and synthetic benchmark)*
   - Preserve disk format, checksum validation and least-recently-used eviction while avoiding a full-index sort on each capped-cache store.
 
