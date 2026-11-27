@@ -4719,7 +4719,7 @@ class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
 class FaultRecordLineTests(unittest.TestCase):
     """The wasm runtime logs `[fault-record] {json}` after the chunked report; the runner names the fault from it."""
 
-    SLOT = {"interface": "xgameruntime.XSystem", "guid": "g", "slot": 5, "name": "XSystemGetAppSpecificDeviceId"}
+    SLOT = {"interface": "xgameruntime.XUser", "guid": "g", "slot": 25, "name": "XUserGetTokenAndSignatureResult"}
     LINE = "[23:07:45][wasm] [fault-record] " + json.dumps(
         {"kind": "unimplemented_slot", "va": "0x5047000000000040", "function": None, "import": None,
          "unimplemented_slot": SLOT, "callers": []})
@@ -4734,11 +4734,11 @@ class FaultRecordLineTests(unittest.TestCase):
     def test_unimplemented_slot_is_named_with_hard_stop(self):
         rep = self._report(["[boot-report 205/206] x", self.LINE, "[boot] off-thread guest fault captured"])
         self.assertEqual(rep["fault"]["kind"], "unimplemented_slot")
-        self.assertIn("XSystemGetAppSpecificDeviceId", rep["fault"]["detail"])
+        self.assertIn("XUserGetTokenAndSignatureResult", rep["fault"]["detail"])
         slot = rep["fault_record"]["unimplemented_slot"]
-        self.assertEqual(slot["slot"], 5)
+        self.assertEqual(slot["slot"], 25)
         self.assertIn("Trapping stub", slot.get("hard_stop", ""))
-        self.assertEqual(rbb.guest_symbols.find_unimplemented(rep)["name"], "XSystemGetAppSpecificDeviceId")
+        self.assertEqual(rbb.guest_symbols.find_unimplemented(rep)["name"], "XUserGetTokenAndSignatureResult")
 
     @staticmethod
     def _line(kind, **rec):
