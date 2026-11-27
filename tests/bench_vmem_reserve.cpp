@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <ctime>
 #include <vector>
 using namespace playgta6::os;
 int main(int argc, char** argv) {
@@ -12,13 +13,15 @@ int main(int argc, char** argv) {
     VirtualMemoryArena arena(kDefaultArenaBase, (count + 1) * kAllocationGranularity);
     if (!arena.valid()) return 1;
     std::vector<uint64_t> addresses(count);
+    const auto cpu_start = std::clock();
     const auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < count; ++i) {
         addresses[i] = arena.reserve(hinted ? kDefaultArenaBase + i * kAllocationGranularity : 0, kPageSize);
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const double cpu_ms = 1000.0 * (std::clock() - cpu_start) / CLOCKS_PER_SEC;
     for (size_t i = 0; i < count; ++i)
         if (addresses[i] != kDefaultArenaBase + i * kAllocationGranularity) return 2;
     if (arena.reserved_bytes() != count * kPageSize) return 3;
-    std::printf("{\"count\":%zu,\"hinted\":%s,\"milliseconds\":%.6f,\"correct\":true}\n", count, hinted ? "true" : "false", ms);
+    std::printf("{\"count\":%zu,\"hinted\":%s,\"milliseconds\":%.6f,\"cpu_ms\":%.6f,\"correct\":true}\n", count, hinted ? "true" : "false", ms, cpu_ms);
 }
