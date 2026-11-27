@@ -13,8 +13,9 @@ if (roots.length !== 2) throw new Error('Provide baseline and patch checkout dir
 const implementations = roots.map((root) => require(resolve(root, 'web/runtime/pgim_preloader.js')).parsePgimLayout);
 const rounds = 9;
 const warmups = 3;
+const loadAverageStart = os.loadavg();
 function fixture(count, sectionCount) {
-  const sectionSize = 16 * Math.ceil(count / sectionCount);
+  const sectionSize = Math.max(4096, 16 * Math.ceil(count / sectionCount));
   const size = 64 + sectionCount * 64 + count * 4;
   const bytes = new Uint8Array(size);
   const view = new DataView(bytes.buffer);
@@ -36,22 +37,32 @@ function fixture(count, sectionCount) {
   return bytes;
 }
 const cases = [];
-for (const [count, sections] of [[100000, 8], [1000000, 8], [1000000, 32]]) {
+for (const [count, sections] of [[0, 8], [100000, 8], [1000000, 8], [1000000, 32]]) {
   const bytes = fixture(count, sections);
   const before = implementations[0](bytes);
   const after = implementations[1](bytes);
   assert.deepEqual(after, before);
+  const iterationsPerSample = count === 0 ? 1000 : 1;
+  const run = (fn) => {
+    let result;
+    for (let iteration = 0; iteration < iterationsPerSample; iteration++) result = fn(bytes);
+    return result;
+  };
   const samplesMs = [[], []];
-  for (const fn of implementations) for (let i = 0; i < warmups; i++) fn(bytes);
+  const cpuMs = [[], []];
+  for (const fn of implementations) for (let i = 0; i < warmups; i++) run(fn);
   for (let round = 0; round < rounds; round++) {
     for (const index of round % 2 ? [1, 0] : [0, 1]) {
+      const cpuStart = process.cpuUsage();
       const start = performance.now();
-      const result = implementations[index](bytes);
+      const result = run(implementations[index]);
       const elapsed = performance.now() - start;
+      const cpuElapsed = process.cpuUsage(cpuStart);
       assert.equal(result.dir64.length + result.highlow.length, count);
       samplesMs[index].push(elapsed);
+      cpuMs[index].push((cpuElapsed.user + cpuElapsed.system) / 1000);
     }
   }
-  cases.push({ relocations: count, sections, containerBytes: bytes.length, checksumVerification: false, correctness: 'deep-equal complete parsed layout', baselineMs: samplesMs[0], patchMs: samplesMs[1] });
+  cases.push({ control: count === 0, iterationsPerSample, relocations: count, sections, containerBytes: bytes.length, checksumVerification: false, correctness: 'deep-equal complete parsed layout', baselineMs: samplesMs[0], patchMs: samplesMs[1], baselineCpuMs: cpuMs[0], patchCpuMs: cpuMs[1] });
 }
-console.log(JSON.stringify({ benchmark: 'synthetic parsePgimLayout, mixed DIR64/HIGHLOW sites in zero-initialized virtual sections', environment: { node: process.version, platform: process.platform, arch: process.arch, os: os.release(), cpu: os.cpus()[0].model }, commits: roots.map((root) => execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()), rounds, warmups, sampling: 'alternating baseline/patch order in one process; fixture creation and correctness comparison outside timing; warm in-memory buffers', cases }, null, 2));
+console.log(JSON.stringify({ benchmark: 'synthetic parsePgimLayout, mixed DIR64/HIGHLOW sites in zero-initialized virtual sections', environment: { node: process.version, platform: process.platform, arch: process.arch, os: os.release(), cpu: os.cpus()[0].model }, commits: roots.map((root) => execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()), rounds, warmups, primaryMetric: 'process CPU time (user + system), ms per sample; includes process threads and GC', loadAverageStart, loadAverageEnd: os.loadavg(), sampling: 'alternating baseline/patch order in one process; fixture creation and correctness comparison outside timing; warm in-memory buffers; wall samples retained; zero-relocation control parses 1000 containers per sample', cases }, null, 2));
