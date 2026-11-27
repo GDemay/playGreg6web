@@ -46,6 +46,29 @@ const OPCODES = Object.freeze({
   READBACK_TEXTURE: 40,
 });
 
+// Native-executor extension opcode outside GpuOpcode (runtime/abi/playgta6_abi.h kGpuOpcodeClearTexture).
+// Kept separate from OPCODES so tools/repo_health.py GpuOpcode enum parity stays exact.
+const OPCODE_CLEAR_TEXTURE = 63;
+const CLEAR_TEXTURE_PAYLOAD_BYTES = 8;
+const CLEAR_TEXTURE_ROW_ALIGN = 256;
+const CLEAR_TEXTURE_ZERO_BUFFER_MIN_BYTES = 64 * 1024;
+const CLEAR_TEXTURE_ZERO_BUFFER_BYTES = 4 * 1024 * 1024;
+const CLEAR_TEXTURE_ZERO_SCRATCH_MAX_BYTES = 4 * 1024 * 1024;
+const CLEAR_TEXTURE_ZERO_COLOR = Object.freeze({ r: 0, g: 0, b: 0, a: 0 });
+const CLEAR_TEXTURE_DEPTH_STENCIL_FORMATS = Object.freeze(
+  new Set([
+    'stencil8',
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+  ])
+);
+const CLEAR_TEXTURE_NON_RENDERABLE_FORMATS = Object.freeze(
+  new Set(['r8snorm', 'rg8snorm', 'rgba8snorm', 'rgb9e5ufloat'])
+);
+
 const SHADER_STAGE = Object.freeze({
   VERTEX: 0,
   FRAGMENT: 1,
@@ -444,6 +467,9 @@ const OPCODE_NAMES = Object.freeze({
   [OPCODES.DRAW_INDIRECT]: 'DrawIndirect',
   [OPCODES.DRAW_INDEXED_INDIRECT]: 'DrawIndexedIndirect',
   [OPCODES.DISPATCH_INDIRECT]: 'DispatchIndirect',
+  [OPCODES.READBACK_BUFFER]: 'ReadbackBuffer',
+  [OPCODES.READBACK_TEXTURE]: 'ReadbackTexture',
+  [OPCODE_CLEAR_TEXTURE]: 'ClearTexture',
 });
 
 function wgslDeclaresGroup0(code) {
@@ -1266,6 +1292,89 @@ const TEXTURE_BLOCK_FORMAT_BYTES = Object.freeze({
   'bc7-rgba-unorm': 16,
   'bc7-rgba-unorm-srgb': 16,
 });
+
+function planClearTextureCopies(geom, maxChunkBytes = CLEAR_TEXTURE_ZERO_BUFFER_BYTES) {
+  const width = Math.max(1, Math.floor(Number(geom && geom.width) || 1));
+  const dimension = geom && typeof geom.dimension === 'string' ? geom.dimension : '2d';
+  const is1D = dimension === '1d';
+  const is3D = dimension === '3d';
+  const height = is1D ? 1 : Math.max(1, Math.floor(Number(geom && geom.height) || 1));
+  const depthOrLayers = is1D
+    ? 1
+    : Math.max(1, Math.floor(Number(geom && geom.depthOrArrayLayers) || 1));
+  const mips = is1D ? 1 : Math.max(1, Math.floor(Number(geom && geom.mipLevelCount) || 1));
+  const blockW = Math.max(1, Math.floor(Number(geom && geom.blockW) || 1));
+  const blockH = Math.max(1, Math.floor(Number(geom && geom.blockH) || 1));
+  const blockBytes = Math.max(1, Math.floor(Number(geom && geom.blockBytes) || 4));
+  const roundUp = (v, a) => Math.ceil(v / a) * a;
+  const level = (base, m) => (m >= 31 ? 1 : Math.max(1, base >>> m));
+
+  const widestBlocksX = roundUp(width, blockW) / blockW;
+  const widestRow = roundUp(widestBlocksX * blockBytes, CLEAR_TEXTURE_ROW_ALIGN);
+  const cap = Math.max(
+    widestRow,
+    Math.floor(Number(maxChunkBytes) || CLEAR_TEXTURE_ZERO_BUFFER_BYTES)
+  );
+
+  const copies = [];
+  let maxRequiredBytes = 0;
+  for (let m = 0; m < mips; m += 1) {
+    const mw = roundUp(level(width, m), blockW);
+    const mh = is1D ? 1 : roundUp(level(height, m), blockH);
+    const md = is3D ? level(depthOrLayers, m) : depthOrLayers;
+    const blocksX = mw / blockW;
+    const rowsFull = mh / blockH;
+    const tightRow = blocksX * blockBytes;
+    const bytesPerRow = roundUp(tightRow, CLEAR_TEXTURE_ROW_ALIGN);
+    const sliceBytes = rowsFull * bytesPerRow;
+    if (sliceBytes <= cap) {
+      const per = Math.max(1, Math.min(md, Math.floor(cap / sliceBytes)));
+      for (let s = 0; s < md; s += per) {
+        const n = Math.min(per, md - s);
+        const copyBytes = sliceBytes * n;
+        if (copyBytes > maxRequiredBytes) {
+          maxRequiredBytes = copyBytes;
+        }
+        copies.push({
+          mip: m,
+          y: 0,
+          z: s,
+          width: mw,
+          height: mh,
+          depth: n,
+          bytesPerRow,
+          rowsPerImage: rowsFull,
+          copyBytes,
+          tightBytes: tightRow * rowsFull * n,
+        });
+      }
+    } else {
+      const perRows = Math.max(1, Math.floor(cap / bytesPerRow));
+      for (let s = 0; s < md; s += 1) {
+        for (let r = 0; r < rowsFull; r += perRows) {
+          const nRows = Math.min(perRows, rowsFull - r);
+          const copyBytes = nRows * bytesPerRow;
+          if (copyBytes > maxRequiredBytes) {
+            maxRequiredBytes = copyBytes;
+          }
+          copies.push({
+            mip: m,
+            y: r * blockH,
+            z: s,
+            width: mw,
+            height: nRows * blockH,
+            depth: 1,
+            bytesPerRow,
+            rowsPerImage: nRows,
+            copyBytes,
+            tightBytes: tightRow * nRows,
+          });
+        }
+      }
+    }
+  }
+  return { copies, maxRequiredBytes, widestRow };
+}
 
 function fnv1a64Hex(text) {
   const bytes = new TextEncoder().encode(String(text));
@@ -3632,6 +3741,18 @@ class WgpuCommandProcessor {
     this._peakTextureBytes = 0;
     this._textureMeta = new Map();
     this._directWriteScratch = null;
+    this._clearZeroBuffer = null;
+    this._clearZeroBufferBytes = 0;
+    this._clearZeroScratch = null;
+    this._clearTextureStats = {
+      cleared: 0,
+      missing: 0,
+      invalid: 0,
+      renderPassClears: 0,
+      copyClears: 0,
+      writeTextureClears: 0,
+      copies: 0,
+    };
     this._promote1DTo2D = options.promote1DTo2D !== false;
     this._promoted1DTo2DCount = 0;
 
@@ -8641,6 +8762,13 @@ class WgpuCommandProcessor {
       this._recordedReadbacks = [];
     }
 
+    if (this._clearZeroBuffer) {
+      safeDestroy(this._clearZeroBuffer);
+      this._clearZeroBuffer = null;
+      this._clearZeroBufferBytes = 0;
+    }
+    this._clearZeroScratch = null;
+
     this.buffers.clear();
     this._bufferMeta.clear();
     this.textures.clear();
@@ -12053,6 +12181,7 @@ class WgpuCommandProcessor {
       sampleCount,
       format: effectiveDescriptor.format || 'rgba8unorm',
       dimension: effectiveDescriptor.dimension || '2d',
+      usage: typeof effectiveDescriptor.usage === 'number' ? effectiveDescriptor.usage : 0,
     });
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       this.resourceRegistry.register('texture', id, texture, {
@@ -12090,6 +12219,7 @@ class WgpuCommandProcessor {
       sampleCount: meta.sampleCount || 1,
       format: meta.format || 'rgba8unorm',
       dimension: meta.dimension || '2d',
+      usage: typeof meta.usage === 'number' ? meta.usage : 0,
     });
     this._liveTextureBytes += safeBytes;
     if (this._liveTextureBytes > this._peakTextureBytes) {
@@ -12168,6 +12298,14 @@ class WgpuCommandProcessor {
       (texDesc && typeof texDesc.dimension === 'string' && texDesc.dimension.length > 0
         ? texDesc.dimension
         : null);
+    let usage =
+      rsMeta && typeof rsMeta.usage === 'number'
+        ? rsMeta.usage
+        : typeof texture.usage === 'number'
+          ? texture.usage
+          : texDesc && typeof texDesc.usage === 'number'
+            ? texDesc.usage
+            : null;
 
     if (view && typeof payloadOffset === 'number') {
       if (isV2 && payloadOffset + 32 <= view.byteLength) {
@@ -12178,6 +12316,7 @@ class WgpuCommandProcessor {
         }
         if (!mipLevelCount) mipLevelCount = Math.max(1, view.getUint32(payloadOffset + 16, true));
         if (!sampleCount) sampleCount = Math.max(1, view.getUint32(payloadOffset + 20, true));
+        if (usage === null) usage = view.getUint32(payloadOffset + 24, true);
         if (!dimension) {
           dimension = TEXTURE_DIMENSION_NAMES[view.getUint8(payloadOffset + 28)] || '2d';
         }
@@ -12195,6 +12334,7 @@ class WgpuCommandProcessor {
         if (!format) {
           format = TEXTURE_FORMAT_NAMES[view.getUint32(payloadOffset + 20, true)] || 'rgba8unorm';
         }
+        if (usage === null) usage = view.getUint32(payloadOffset + 24, true);
         if (!dimension) {
           dimension = TEXTURE_DIMENSION_NAMES[view.getUint32(payloadOffset + 28, true)] || '2d';
         }
@@ -12208,6 +12348,7 @@ class WgpuCommandProcessor {
     sampleCount = Math.max(1, sampleCount || 1);
     format = format || 'rgba8unorm';
     dimension = dimension || '2d';
+    usage = typeof usage === 'number' ? usage : 0;
 
     const byteSize = estimateTextureBytes(
       width,
@@ -12227,6 +12368,7 @@ class WgpuCommandProcessor {
       sampleCount,
       format,
       dimension,
+      usage,
     });
   }
 
@@ -12412,6 +12554,453 @@ class WgpuCommandProcessor {
       this.device.queue.writeTexture(dst, uploadData, dataLayout, size);
     } finally {
       dst.texture = null;
+    }
+  }
+
+  _acquireClearZeroBuffer(requiredBytes, minChunkBytes = CLEAR_TEXTURE_ROW_ALIGN) {
+    if (!this.device || typeof this.device.createBuffer !== 'function') {
+      return null;
+    }
+    const maxCap = Math.max(CLEAR_TEXTURE_ZERO_BUFFER_BYTES, minChunkBytes);
+    const alignedReq = Math.max(
+      CLEAR_TEXTURE_ZERO_BUFFER_MIN_BYTES,
+      Math.ceil(Math.min(Math.max(CLEAR_TEXTURE_ROW_ALIGN, requiredBytes), maxCap) / CLEAR_TEXTURE_ROW_ALIGN) *
+        CLEAR_TEXTURE_ROW_ALIGN
+    );
+    if (this._clearZeroBuffer && this._clearZeroBufferBytes >= alignedReq) {
+      return this._clearZeroBuffer;
+    }
+    const prev = this._clearZeroBuffer;
+    const prevBytes = this._clearZeroBufferBytes;
+    const nextSize = prev
+      ? Math.min(maxCap, Math.max(alignedReq, prevBytes * 2))
+      : Math.min(maxCap, alignedReq);
+    const usage =
+      typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.COPY_SRC === 'number'
+        ? GPUBufferUsage.COPY_SRC
+        : BUFFER_USAGE.COPY_SRC;
+    const buffer = this.device.createBuffer({
+      size: nextSize,
+      usage,
+    });
+    this._clearZeroBuffer = buffer;
+    this._clearZeroBufferBytes = nextSize;
+    if (prev) {
+      this._retireOrDestroyGpuResource(prev, prevBytes);
+    }
+    return buffer;
+  }
+
+  _acquireClearZeroScratch(requiredBytes, minChunkBytes = CLEAR_TEXTURE_ROW_ALIGN) {
+    const maxCap = Math.max(CLEAR_TEXTURE_ZERO_SCRATCH_MAX_BYTES, minChunkBytes);
+    const targetBytes = Math.min(
+      maxCap,
+      Math.max(CLEAR_TEXTURE_ROW_ALIGN, Math.ceil(requiredBytes / CLEAR_TEXTURE_ROW_ALIGN) * CLEAR_TEXTURE_ROW_ALIGN)
+    );
+    if (this._clearZeroScratch && this._clearZeroScratch.byteLength >= targetBytes) {
+      return this._clearZeroScratch;
+    }
+    const nextSize = this._clearZeroScratch
+      ? Math.min(maxCap, Math.max(targetBytes, this._clearZeroScratch.byteLength * 2))
+      : targetBytes;
+    this._clearZeroScratch = new Uint8Array(nextSize);
+    return this._clearZeroScratch;
+  }
+
+  _resolveClearTextureInfo(textureId, extMeta = null) {
+    const texture = this.textures.get(textureId);
+    if (!texture || texture.destroyed === true) {
+      return null;
+    }
+    const renderStateExt = this._getRenderStateExtension();
+    const rsMeta =
+      extMeta ||
+      (renderStateExt &&
+      renderStateExt.textureMeta &&
+      typeof renderStateExt.textureMeta.get === 'function'
+        ? renderStateExt.textureMeta.get(textureId) || null
+        : null);
+    const meta = this._textureMeta.get(textureId) || null;
+    const desc = texture && typeof texture.desc === 'object' ? texture.desc : null;
+    const descSize = desc && typeof desc.size === 'object' ? desc.size : null;
+
+    const dimension =
+      (typeof texture.dimension === 'string' && texture.dimension.length > 0 ? texture.dimension : null) ||
+      (rsMeta && typeof rsMeta.dimension === 'string' && rsMeta.dimension.length > 0 ? rsMeta.dimension : null) ||
+      (meta && typeof meta.dimension === 'string' && meta.dimension.length > 0 ? meta.dimension : null) ||
+      (desc && typeof desc.dimension === 'string' && desc.dimension.length > 0 ? desc.dimension : null) ||
+      '2d';
+    const is1D = dimension === '1d';
+
+    const width = Math.max(
+      1,
+      Math.floor(
+        Number(
+          (typeof texture.width === 'number' && texture.width > 0 ? texture.width : 0) ||
+            (rsMeta && rsMeta.width > 0 ? rsMeta.width : 0) ||
+            (meta && meta.width > 0 ? meta.width : 0) ||
+            (descSize && descSize.width > 0 ? descSize.width : 0) ||
+            (Array.isArray(descSize) && descSize[0] > 0 ? descSize[0] : 0) ||
+            1
+        )
+      )
+    );
+    const height = is1D
+      ? 1
+      : Math.max(
+          1,
+          Math.floor(
+            Number(
+              (typeof texture.height === 'number' && texture.height > 0 ? texture.height : 0) ||
+                (rsMeta && rsMeta.height > 0 ? rsMeta.height : 0) ||
+                (meta && meta.height > 0 ? meta.height : 0) ||
+                (descSize && descSize.height > 0 ? descSize.height : 0) ||
+                (Array.isArray(descSize) && descSize[1] > 0 ? descSize[1] : 0) ||
+                1
+            )
+          )
+        );
+    const depthOrArrayLayers = is1D
+      ? 1
+      : Math.max(
+          1,
+          Math.floor(
+            Number(
+              (typeof texture.depthOrArrayLayers === 'number' && texture.depthOrArrayLayers > 0
+                ? texture.depthOrArrayLayers
+                : 0) ||
+                (rsMeta && rsMeta.depthOrArrayLayers > 0 ? rsMeta.depthOrArrayLayers : 0) ||
+                (meta && meta.depthOrArrayLayers > 0 ? meta.depthOrArrayLayers : 0) ||
+                (descSize && descSize.depthOrArrayLayers > 0 ? descSize.depthOrArrayLayers : 0) ||
+                (Array.isArray(descSize) && descSize[2] > 0 ? descSize[2] : 0) ||
+                1
+            )
+          )
+        );
+    const mipLevelCount = is1D
+      ? 1
+      : Math.max(
+          1,
+          Math.floor(
+            Number(
+              (typeof texture.mipLevelCount === 'number' && texture.mipLevelCount > 0
+                ? texture.mipLevelCount
+                : 0) ||
+                (rsMeta && rsMeta.mipLevelCount > 0 ? rsMeta.mipLevelCount : 0) ||
+                (meta && meta.mipLevelCount > 0 ? meta.mipLevelCount : 0) ||
+                (desc && desc.mipLevelCount > 0 ? desc.mipLevelCount : 0) ||
+                1
+            )
+          )
+        );
+    const sampleCount = Math.max(
+      1,
+      Math.floor(
+        Number(
+          (typeof texture.sampleCount === 'number' && texture.sampleCount > 0
+            ? texture.sampleCount
+            : 0) ||
+            (rsMeta && rsMeta.sampleCount > 0 ? rsMeta.sampleCount : 0) ||
+            (meta && meta.sampleCount > 0 ? meta.sampleCount : 0) ||
+            (desc && desc.sampleCount > 0 ? desc.sampleCount : 0) ||
+            1
+        )
+      )
+    );
+    const rawFormat =
+      (rsMeta && typeof rsMeta.format === 'string' && rsMeta.format.length > 0 ? rsMeta.format : null) ||
+      (typeof texture.format === 'string' && texture.format.length > 0 ? texture.format : null) ||
+      (meta && typeof meta.format === 'string' && meta.format.length > 0 ? meta.format : null) ||
+      (desc && typeof desc.format === 'string' && desc.format.length > 0 ? desc.format : null) ||
+      'rgba8unorm';
+    const format = rawFormat.trim().toLowerCase();
+    const usage =
+      typeof texture.usage === 'number'
+        ? texture.usage
+        : rsMeta && typeof rsMeta.usage === 'number'
+          ? rsMeta.usage
+          : meta && typeof meta.usage === 'number'
+            ? meta.usage
+            : desc && typeof desc.usage === 'number'
+              ? desc.usage
+              : 0;
+
+    return {
+      texture,
+      width,
+      height,
+      depthOrArrayLayers,
+      mipLevelCount,
+      sampleCount,
+      format,
+      dimension,
+      usage,
+    };
+  }
+
+  /**
+   * ClearTexture (opcode 63, kGpuOpcodeClearTexture): zero every mip level and layer/slice
+   * of `textureId` so recycled pooled textures read identically to freshly created ones.
+   */
+  _clearTextureById(textureId, extMeta = null) {
+    const info = this._resolveClearTextureInfo(textureId, extMeta);
+    if (!info) {
+      this._clearTextureStats.missing += 1;
+      return { status: 'missing' };
+    }
+    const {
+      texture,
+      width,
+      height,
+      depthOrArrayLayers,
+      mipLevelCount,
+      sampleCount,
+      format,
+      dimension,
+      usage,
+    } = info;
+
+    if (CLEAR_TEXTURE_DEPTH_STENCIL_FORMATS.has(format)) {
+      this._clearTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: `ClearTexture ${textureId}: depth/stencil format '${format}' is not supported`,
+      };
+    }
+    if (sampleCount > 1) {
+      this._clearTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: `ClearTexture ${textureId}: multisampled texture (sampleCount=${sampleCount}) is not supported`,
+      };
+    }
+
+    const bcBlockBytes = TEXTURE_BLOCK_FORMAT_BYTES[format] || 0;
+    const isCompressed = bcBlockBytes > 0;
+    const blockW = isCompressed ? 4 : 1;
+    const blockH = isCompressed ? 4 : 1;
+    const blockBytes = isCompressed ? bcBlockBytes : TEXTURE_FORMAT_BPP[format] || 0;
+    if (blockBytes <= 0) {
+      this._clearTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: `ClearTexture ${textureId}: unsupported texture format '${format}'`,
+      };
+    }
+
+    const hasRenderAttachment = (usage & TEXTURE_USAGE.RENDER_ATTACHMENT) !== 0;
+    const hasCopyDst = (usage & TEXTURE_USAGE.COPY_DST) !== 0;
+    const canRenderPassClear =
+      hasRenderAttachment &&
+      !isCompressed &&
+      dimension === '2d' &&
+      !CLEAR_TEXTURE_NON_RENDERABLE_FORMATS.has(format) &&
+      typeof texture.createView === 'function' &&
+      this.device &&
+      typeof this.device.createCommandEncoder === 'function' &&
+      this.device.queue &&
+      typeof this.device.queue.submit === 'function';
+
+    if (!canRenderPassClear && !hasCopyDst) {
+      this._clearTextureStats.invalid += 1;
+      return {
+        status: 'invalid',
+        error: `ClearTexture ${textureId}: not a single-sample color COPY_DST or RENDER_ATTACHMENT texture`,
+      };
+    }
+
+    // Flush any earlier staged texture/buffer uploads before clearing so earlier writes are wiped
+    // and subsequent writes land cleanly on top of the zeroed texture.
+    if (this._pendingEncoder && this._hasPendingUploadCommands) {
+      this._flushPendingUploads(false);
+    }
+
+    if (canRenderPassClear) {
+      try {
+        const encoder = this.device.createCommandEncoder();
+        if (
+          encoder &&
+          typeof encoder.beginRenderPass === 'function' &&
+          typeof encoder.finish === 'function'
+        ) {
+          for (let mip = 0; mip < mipLevelCount; mip += 1) {
+            for (let layer = 0; layer < depthOrArrayLayers; layer += 1) {
+              const view = texture.createView({
+                dimension: '2d',
+                baseMipLevel: mip,
+                mipLevelCount: 1,
+                baseArrayLayer: layer,
+                arrayLayerCount: 1,
+              });
+              const pass = encoder.beginRenderPass({
+                colorAttachments: [
+                  {
+                    view,
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                    clearValue: CLEAR_TEXTURE_ZERO_COLOR,
+                  },
+                ],
+              });
+              pass.end();
+            }
+          }
+          this.device.queue.submit([encoder.finish()]);
+          this._clearTextureStats.cleared += 1;
+          this._clearTextureStats.renderPassClears += 1;
+          this._clearTextureStats.copies += mipLevelCount * depthOrArrayLayers;
+          return {
+            status: 'cleared',
+            mode: 'renderPass',
+            subresources: mipLevelCount * depthOrArrayLayers,
+          };
+        }
+      } catch (err) {
+        if (!hasCopyDst) {
+          this._clearTextureStats.invalid += 1;
+          return {
+            status: 'invalid',
+            error: `ClearTexture ${textureId}: ${String(err && err.message ? err.message : err)}`,
+          };
+        }
+      }
+    }
+
+    const plan = planClearTextureCopies(
+      {
+        width,
+        height,
+        depthOrArrayLayers,
+        mipLevelCount,
+        dimension,
+        blockW,
+        blockH,
+        blockBytes,
+      },
+      CLEAR_TEXTURE_ZERO_BUFFER_BYTES
+    );
+    if (plan.copies.length === 0) {
+      this._clearTextureStats.cleared += 1;
+      return { status: 'cleared', mode: 'noop', copies: 0 };
+    }
+
+    // Prefer GPU-side copyBufferToTexture from a reusable zero-initialized GPUBuffer (no CPU upload).
+    if (
+      this.device &&
+      typeof this.device.createBuffer === 'function' &&
+      typeof this.device.createCommandEncoder === 'function' &&
+      this.device.queue &&
+      typeof this.device.queue.submit === 'function'
+    ) {
+      let encoder = null;
+      try {
+        encoder = this.device.createCommandEncoder();
+      } catch (_) {
+        encoder = null;
+      }
+      if (
+        encoder &&
+        typeof encoder.copyBufferToTexture === 'function' &&
+        typeof encoder.finish === 'function'
+      ) {
+        try {
+          const zeroBuffer = this._acquireClearZeroBuffer(plan.maxRequiredBytes, plan.widestRow);
+          if (zeroBuffer) {
+            for (let i = 0; i < plan.copies.length; i += 1) {
+              const c = plan.copies[i];
+              encoder.copyBufferToTexture(
+                {
+                  buffer: zeroBuffer,
+                  offset: 0,
+                  bytesPerRow: c.bytesPerRow,
+                  rowsPerImage: c.rowsPerImage,
+                },
+                {
+                  texture,
+                  mipLevel: c.mip,
+                  origin: { x: 0, y: c.y, z: c.z },
+                  aspect: 'all',
+                },
+                {
+                  width: c.width,
+                  height: c.height,
+                  depthOrArrayLayers: c.depth,
+                }
+              );
+            }
+            this.device.queue.submit([encoder.finish()]);
+            this._clearTextureStats.cleared += 1;
+            this._clearTextureStats.copyClears += 1;
+            this._clearTextureStats.copies += plan.copies.length;
+            return { status: 'cleared', mode: 'copyBufferToTexture', copies: plan.copies.length };
+          }
+        } catch (err) {
+          if (!this.device.queue || typeof this.device.queue.writeTexture !== 'function') {
+            this._clearTextureStats.invalid += 1;
+            return {
+              status: 'invalid',
+              error: `ClearTexture ${textureId}: ${String(err && err.message ? err.message : err)}`,
+            };
+          }
+        }
+      }
+    }
+
+    // Fallback when copyBufferToTexture is unavailable: writeTexture with a bounded reusable zero Uint8Array.
+    if (this.device && this.device.queue && typeof this.device.queue.writeTexture === 'function') {
+      try {
+        const zeroScratch = this._acquireClearZeroScratch(plan.maxRequiredBytes, plan.widestRow);
+        for (let i = 0; i < plan.copies.length; i += 1) {
+          const c = plan.copies[i];
+          const data =
+            zeroScratch.byteLength === c.copyBytes
+              ? zeroScratch
+              : zeroScratch.subarray(0, c.copyBytes);
+          this.device.queue.writeTexture(
+            {
+              texture,
+              mipLevel: c.mip,
+              origin: { x: 0, y: c.y, z: c.z },
+              aspect: 'all',
+            },
+            data,
+            {
+              offset: 0,
+              bytesPerRow: c.bytesPerRow,
+              rowsPerImage: c.rowsPerImage,
+            },
+            {
+              width: c.width,
+              height: c.height,
+              depthOrArrayLayers: c.depth,
+            }
+          );
+        }
+        this._clearTextureStats.cleared += 1;
+        this._clearTextureStats.writeTextureClears += 1;
+        this._clearTextureStats.copies += plan.copies.length;
+        return { status: 'cleared', mode: 'writeTexture', copies: plan.copies.length };
+      } catch (err) {
+        this._clearTextureStats.invalid += 1;
+        return {
+          status: 'invalid',
+          error: `ClearTexture ${textureId}: ${String(err && err.message ? err.message : err)}`,
+        };
+      }
+    }
+
+    this._clearTextureStats.invalid += 1;
+    return {
+      status: 'invalid',
+      error: `ClearTexture ${textureId}: device lacks copyBufferToTexture and queue.writeTexture`,
+    };
+  }
+
+  _handleClearTexture(view, payloadOffset) {
+    const textureId = view.getUint32(payloadOffset, true);
+    const result = this._clearTextureById(textureId);
+    if (result.status === 'invalid' && result.error) {
+      this._recordOpValidationError('ClearTexture', result.error);
     }
   }
 
@@ -12773,7 +13362,7 @@ class WgpuCommandProcessor {
       if (!pendingRangedPipeline) {
         this._recordOpValidationError(opcodeLabel(opcode), err);
       }
-      return;
+      return true;
     }
 
     if (
@@ -12788,7 +13377,7 @@ class WgpuCommandProcessor {
           renderStateExt.lastError || 'malformed or invalid ABI v2 packet'
         );
       }
-      return;
+      return true;
     }
 
     if (
@@ -12803,11 +13392,11 @@ class WgpuCommandProcessor {
           this.extension.lastError || 'malformed or invalid extension packet'
         );
       }
-      return;
+      return true;
     }
 
     if (!handled) {
-      return;
+      return false;
     }
 
     switch (opcode) {
@@ -12987,6 +13576,7 @@ class WgpuCommandProcessor {
       default:
         break;
     }
+    return true;
   }
 
   _handleDestroyResource(id) {
@@ -14743,6 +15333,23 @@ class WgpuCommandProcessor {
           this._recordOpValidationError('WriteTexture', `truncated payload (${payloadBytes}B < 48B)`);
         }
         break;
+      case OPCODE_CLEAR_TEXTURE:
+        if (payloadBytes >= CLEAR_TEXTURE_PAYLOAD_BYTES) {
+          if (this.extension) {
+            const handled = this._dispatchExtensionPacket(opcode, view, payloadOffset, payloadBytes);
+            if (!handled) {
+              this._handleClearTexture(view, payloadOffset);
+            }
+          } else {
+            this._handleClearTexture(view, payloadOffset);
+          }
+        } else {
+          this._recordOpValidationError(
+            'ClearTexture',
+            `truncated payload (${payloadBytes}B < ${CLEAR_TEXTURE_PAYLOAD_BYTES}B)`
+          );
+        }
+        break;
       case OPCODES.CREATE_SAMPLER:
         if (payloadBytes >= 32) {
           this._handleCreateSampler(view, payloadOffset);
@@ -15261,6 +15868,7 @@ class WgpuCommandProcessor {
       replayLogEntries: this._replayLog.size,
       replayBindGroupEvictions: this._replayBindGroupEvictions,
       replayLogOverflowCount: this._replayLogOverflowCount,
+      clearTextureStats: { ...this._clearTextureStats },
     };
   }
 
@@ -15347,6 +15955,19 @@ class WgpuCommandProcessor {
       this._recordedReadbacks = [];
     }
     this._flushAllDeferredGpuDestroysImmediate(destroyedByRegistry);
+
+    if (this._clearZeroBuffer) {
+      if (typeof this._clearZeroBuffer.destroy === 'function') {
+        try {
+          this._clearZeroBuffer.destroy();
+        } catch (_) {
+          // Ignore teardown errors on clear zero buffer.
+        }
+      }
+      this._clearZeroBuffer = null;
+      this._clearZeroBufferBytes = 0;
+    }
+    this._clearZeroScratch = null;
 
     this.buffers.clear();
     this._bufferMeta.clear();
@@ -19050,12 +19671,15 @@ const exportedApi = {
   parseHashOnlyShaderPayload,
   resolveGpuRingBuffer,
   estimateTextureBytes,
+  planClearTextureCopies,
   decodeReadbackPayload,
   readbackStagingLayout,
   readbackPieces,
   deliverReadback,
   fnv1a64Hex,
   OPCODES,
+  OPCODE_CLEAR_TEXTURE,
+  CLEAR_TEXTURE_PAYLOAD_BYTES,
   SHADER_STAGE,
   PRIMITIVE_TOPOLOGY,
   BUFFER_USAGE,
