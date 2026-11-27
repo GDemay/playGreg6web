@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <type_traits>
 
 #include "guest/com_bridge.h"
@@ -306,6 +307,9 @@ struct DStorageStats {
 };
 
 DStorageStats dstorage_stats();
+// One line for stall reports: the worker (idle / busy for how long), queues holding work and status
+// array entries still pending with the oldest one's age.
+std::string dstorage_debug_state();
 
 // Worker threads executing submitted requests (default 1, at most 16). Takes effect for workers
 // started afterwards (the pool starts on the first Submit; reset_xbox_scarlett_guest() stops it).

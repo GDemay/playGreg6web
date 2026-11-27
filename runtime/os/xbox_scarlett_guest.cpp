@@ -13,6 +13,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <utility>
@@ -168,6 +169,22 @@ Counters& counters() {
     static Counters c;
     return c;
 }
+
+// Live status arrays and queues, for dstorage_debug_state() (what a stalled load waits on).
+class DStorageStatusArray;
+class DStorageQueue;
+struct Registry {
+    std::mutex mutex;
+    std::set<DStorageStatusArray*> arrays;
+    std::set<DStorageQueue*> queues;
+};
+Registry& registry() {
+    static Registry* r = new Registry;  // never destroyed: objects may outlive static teardown
+    return *r;
+}
+// Worker heartbeat: when the current batch started (0 = idle) and how many batches ran.
+std::atomic<int64_t> g_worker_busy_since_ms{0};
+std::atomic<uint64_t> g_worker_batches{0};
 
 // ---------------------------------------------------------------------------
 // Inflate (RFC 1950 / RFC 1951)
@@ -656,7 +673,14 @@ class DStorageStatusArray final : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "XCRDAPI.IDStorageStatusArray";
 
-    explicit DStorageStatusArray(uint32_t capacity) : capacity_(capacity), entries_(new Entry[capacity]) {}
+    explicit DStorageStatusArray(uint32_t capacity) : capacity_(capacity), entries_(new Entry[capacity]) {
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        registry().arrays.insert(this);
+    }
+    ~DStorageStatusArray() override {
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        registry().arrays.erase(this);
+    }
 
     // slot 3
     bool IsComplete(uint32_t index) {
@@ -683,20 +707,41 @@ public:
         if (index < capacity_) {
             entries_[index].done.store(false, std::memory_order_relaxed);
             entries_[index].hr.store(kHrPending, std::memory_order_relaxed);
+            entries_[index].pending_since_ms.store(trace_now_ms(), std::memory_order_relaxed);
         }
     }
 
     void complete(uint32_t index, HResult hr) {
         if (index < capacity_) {
             entries_[index].hr.store(hr, std::memory_order_relaxed);
+            entries_[index].pending_since_ms.store(0, std::memory_order_relaxed);
             entries_[index].done.store(true, std::memory_order_release);
         }
+    }
+
+    // Entries enqueued (EnqueueStatus) and not completed yet, with the oldest one's index and age.
+    uint32_t pending_entries(int64_t now_ms, uint32_t* oldest_index, int64_t* oldest_age_ms) const {
+        uint32_t n = 0;
+        *oldest_age_ms = -1;
+        for (uint32_t i = 0; i < capacity_; ++i) {
+            const int64_t since = entries_[i].pending_since_ms.load(std::memory_order_relaxed);
+            if (since == 0 || entries_[i].done.load(std::memory_order_acquire)) {
+                continue;
+            }
+            ++n;
+            if (now_ms - since > *oldest_age_ms) {
+                *oldest_age_ms = now_ms - since;
+                *oldest_index = i;
+            }
+        }
+        return n;
     }
 
 private:
     struct Entry {
         std::atomic<HResult> hr{kHrPending};
         std::atomic<bool> done{false};
+        std::atomic<int64_t> pending_since_ms{0};  // EnqueueStatus time while pending (diagnostics)
     };
     uint32_t capacity_;
     std::unique_ptr<Entry[]> entries_;
@@ -785,9 +830,15 @@ public:
     DStorageQueue(const DStorageQueueDesc& desc, std::string name) : desc_(desc), name_(std::move(name)) {
         capacity_ = desc.capacity;
         counters().live_queues.fetch_add(1, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(registry().mutex);
+        registry().queues.insert(this);
     }
 
     ~DStorageQueue() override {
+        {
+            std::lock_guard<std::mutex> lock(registry().mutex);
+            registry().queues.erase(this);
+        }
         // Unsubmitted entries never run: their status entries must not stay pending forever.
         for (Item& item : pending_) {
             abort_item(item);
@@ -927,6 +978,17 @@ public:
     // Worker side: runs the submitted entries up to and including the next fence. Returns true
     // when more submitted work remains.
     bool run_batch(HostReader& reader);
+
+    // "'name' pending P submitted S in flight F scheduled 0|1" (or "busy" if its lock is held).
+    std::string debug_state() {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) {
+            return "'" + name_ + "' busy";
+        }
+        return "'" + name_ + "' pending " + std::to_string(pending_.size()) + " submitted " +
+               std::to_string(submitted_.size()) + " in flight " + std::to_string(in_flight_) + " scheduled " +
+               (scheduled_ ? "1" : "0") + (closed_ ? " closed" : "");
+    }
 
 private:
     struct Item {
@@ -1111,6 +1173,8 @@ bool DStorageQueue::run_batch(HostReader& reader) {
     }
 
     const size_t batch_count = batch.size();
+    g_worker_busy_since_ms.store(trace_now_ms(), std::memory_order_relaxed);
+    g_worker_batches.fetch_add(1, std::memory_order_relaxed);
     std::vector<HResult>& results = reader.results;
     results.assign(batch_count, kOk);
     execute(reader, batch, results);
@@ -1142,6 +1206,7 @@ bool DStorageQueue::run_batch(HostReader& reader) {
     }
     batch.clear();  // drop file / status references before reporting the room
     reader.trim_buffers();
+    g_worker_busy_since_ms.store(0, std::memory_order_relaxed);
 
     std::lock_guard<std::mutex> lock(mutex_);
     in_flight_ -= batch_count;
@@ -1676,6 +1741,33 @@ DStorageStats dstorage_stats() {
     s.bcpack_requests = c.bcpack_requests.load();
     s.bcpack_decoded = c.bcpack_decoded.load();
     return s;
+}
+
+std::string dstorage_debug_state() {
+    const int64_t now = trace_now_ms();
+    const int64_t busy = g_worker_busy_since_ms.load(std::memory_order_relaxed);
+    std::string o = "worker " + (busy == 0 ? std::string("idle") : "busy " + std::to_string(now - busy) + " ms") +
+                    " after " + std::to_string(g_worker_batches.load(std::memory_order_relaxed)) + " batches";
+    std::unique_lock<std::mutex> lock(registry().mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return o + "; registry busy";
+    }
+    for (DStorageQueue* q : registry().queues) {
+        const std::string st = q->debug_state();
+        if (st.find(" pending 0 submitted 0 in flight 0 ") == std::string::npos) {
+            o += "; queue " + st;
+        }
+    }
+    for (DStorageStatusArray* a : registry().arrays) {
+        uint32_t index = 0;
+        int64_t age = -1;
+        const uint32_t n = a->pending_entries(now, &index, &age);
+        if (n != 0) {
+            o += "; status array " + hex64(reinterpret_cast<uintptr_t>(a)) + ": " + std::to_string(n) +
+                 " pending, oldest index " + std::to_string(index) + " for " + std::to_string(age) + " ms";
+        }
+    }
+    return o;
 }
 
 void set_dstorage_worker_threads(uint32_t count) {
