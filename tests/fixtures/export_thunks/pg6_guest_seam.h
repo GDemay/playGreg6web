@@ -22,6 +22,7 @@ static_assert(sizeof(void*) == 8, "guest addresses are 64-bit");
 inline constexpr uint64_t kPg6SeamGprOffset = 0;
 inline constexpr uint64_t kPg6SeamXmmOffset = 160;
 inline constexpr uint64_t kPg6SeamXmmStride = 16;
+inline constexpr uint64_t kPg6SeamUnwindPendingOffset = 696;
 // Fifth argument relative to rsp at callee entry: return address + 32-byte shadow space.
 inline constexpr uint64_t kPg6SeamStackArgOffset = 40;
 
@@ -64,6 +65,13 @@ inline uint64_t pg6_seam_load_u64(uint64_t guest_va) {
     uint64_t value;
     std::memcpy(&value, pg6_seam_host_ptr(guest_va), 8);
     return value;
+}
+
+// Nonzero while a guest context restore (exception unwind, longjmp) propagates: a nested guest
+// call made by the shim raised, and the registers hold the restored context. The thunk must then
+// leave `rax`, `xmm0` and `rsp` alone and return straight into the unwind path.
+inline bool pg6_seam_unwind_pending(void* state) {
+    return static_cast<unsigned char*>(state)[kPg6SeamUnwindPendingOffset] != 0;
 }
 
 // Leave the thunk like `ret`: pop the return address the guest caller pushed.

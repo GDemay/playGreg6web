@@ -89,6 +89,8 @@ pub(super) const OTHER_STATE: StateMask = 1u64 << 48;
 
 /// Everything a call may touch (bits `0..=48`).
 pub(super) const ALL_STATE: StateMask = (OTHER_STATE << 1) - 1;
+/// The Win64 integer argument registers `rcx rdx r8 r9`, which the entry probe reads.
+pub(super) const PROBE_ARG_STATE: StateMask = (1 << 1) | (1 << 2) | (1 << 8) | (1 << 9);
 
 /// Bit in [`StateMask`] for `xmm{idx}` (`idx < 16`).
 pub(super) const fn xmm_state_bit(idx: usize) -> StateMask {
@@ -116,9 +118,21 @@ impl FlagSummaries {
     /// Analyses `functions` together: calls between them use each other's summaries, calls to
     /// anything else count as reading every flag.
     pub fn compute<'a>(functions: impl IntoIterator<Item = &'a cfg::Function>) -> Self {
+        Self::compute_with_probes(functions, &BTreeSet::new())
+    }
+
+    /// [`Self::compute`] for a build that inserts the entry probe
+    /// ([`super::LiftedFunction::insert_entry_probe`]) into every function in `probes`. The probe
+    /// logs `rcx rdx r8 r9`, so each probed function counts as reading them at entry: callers
+    /// then store them before a direct call and the probe sees the synced arguments, not a stale
+    /// copy (docs/LIFTER_STATE_CONTRACT.md).
+    pub fn compute_with_probes<'a>(
+        functions: impl IntoIterator<Item = &'a cfg::Function>,
+        probes: &BTreeSet<u64>,
+    ) -> Self {
         let functions: Vec<&cfg::Function> = functions.into_iter().collect();
-        let (touched, written) = state_effects(&functions);
-        let live_in_state = state_live_in(&functions, &touched);
+        let (touched, written) = state_effects(&functions, probes);
+        let live_in_state = state_live_in(&functions, &touched, probes);
         let (touched_flags, written_flags) = flag_effects(&functions);
         let functions: BTreeMap<u64, Model> = functions
             .into_iter()
@@ -1179,11 +1193,18 @@ pub(super) fn own_written_state_and_flags(func: &cfg::Function) -> (StateMask, F
 /// of "own effects plus the effects of every direct callee and tail-jump target".
 fn state_effects(
     functions: &[&cfg::Function],
+    probes: &BTreeSet<u64>,
 ) -> (BTreeMap<u64, StateMask>, BTreeMap<u64, StateMask>) {
     let mut factory = InstructionInfoFactory::new();
     let own: BTreeMap<u64, (StateMask, StateMask, BTreeSet<u64>)> = functions
         .iter()
-        .map(|f| (f.entry, own_effects(f, &mut factory)))
+        .map(|f| {
+            let (mut t, w, callees) = own_effects(f, &mut factory);
+            if probes.contains(&f.entry) {
+                t |= PROBE_ARG_STATE;
+            }
+            (f.entry, (t, w, callees))
+        })
         .collect();
     let mut touched: BTreeMap<u64, StateMask> = own.keys().map(|&entry| (entry, 0)).collect();
     let mut written: BTreeMap<u64, StateMask> = own.keys().map(|&entry| (entry, 0)).collect();
@@ -1530,6 +1551,7 @@ fn state_block_model(
 fn state_live_in(
     functions: &[&cfg::Function],
     touched: &BTreeMap<u64, StateMask>,
+    probes: &BTreeSet<u64>,
 ) -> BTreeMap<u64, StateMask> {
     let mut factory = InstructionInfoFactory::new();
     let models: BTreeMap<u64, StateModel> = functions
@@ -1550,7 +1572,12 @@ fn state_live_in(
     while let Some(entry) = work.pop_front() {
         queued.remove(&entry);
         let old = live_in[&entry];
-        let mask = old | models[&entry].entry_live(&live_in, touched);
+        let probe = if probes.contains(&entry) {
+            PROBE_ARG_STATE
+        } else {
+            0
+        };
+        let mask = old | probe | models[&entry].entry_live(&live_in, touched);
         live_in.insert(entry, mask);
         if mask != old {
             for &caller in callers.get(&entry).into_iter().flatten() {

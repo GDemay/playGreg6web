@@ -87,6 +87,9 @@ void pg6_export_crt_memcpy(void* state) {
         pg6_seam_elements<const void*>(pg6_buffers, pg6_seam_get_gpr(state, 2), static_cast<uint64_t>(pg6_arg_int<size_t>(pg6_seam_get_gpr(state, 8)))),
         pg6_arg_int<size_t>(pg6_seam_get_gpr(state, 8)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_buffers.guest_address(result));
     pg6_seam_return(state);
 }
@@ -99,6 +102,9 @@ void pg6_export_crt_memset(void* state) {
         pg6_arg_int<int32_t>(pg6_seam_get_gpr(state, 2)),
         pg6_arg_int<size_t>(pg6_seam_get_gpr(state, 8)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_buffers.guest_address(result));
     pg6_seam_return(state);
 }
@@ -110,6 +116,9 @@ void pg6_export_crt_strcat(void* state) {
         pg6_seam_string_out<char*>(pg6_buffers, pg6_seam_get_gpr(state, 1), pg6_seam_get_gpr(state, 2)),
         pg6_seam_string<const char*>(pg6_buffers, pg6_seam_get_gpr(state, 2)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_buffers.guest_address(result));
     pg6_seam_return(state);
 }
@@ -121,6 +130,9 @@ void pg6_export_crt_strcpy(void* state) {
         pg6_seam_string_out<char*>(pg6_buffers, pg6_seam_get_gpr(state, 1), pg6_seam_get_gpr(state, 2)),
         pg6_seam_string<const char*>(pg6_buffers, pg6_seam_get_gpr(state, 2)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_buffers.guest_address(result));
     pg6_seam_return(state);
 }
@@ -131,6 +143,9 @@ void pg6_export_crt_strlen(void* state) {
     const auto result = pg6_crt_strlen(
         pg6_seam_string<const char*>(pg6_buffers, pg6_seam_get_gpr(state, 1)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -143,6 +158,9 @@ void pg6_export_crt_strncpy(void* state) {
         pg6_seam_elements<const char*>(pg6_buffers, pg6_seam_get_gpr(state, 2), static_cast<uint64_t>(pg6_arg_int<size_t>(pg6_seam_get_gpr(state, 8)))),
         pg6_arg_int<size_t>(pg6_seam_get_gpr(state, 8)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_buffers.guest_address(result));
     pg6_seam_return(state);
 }
@@ -151,6 +169,9 @@ void pg6_export_crt_strncpy(void* state) {
 void pg6_export_win32_close_handle(void* state) {
     const auto result = pg6_win32_close_handle(
         pg6_arg_int<Pg6Handle>(pg6_seam_get_gpr(state, 1)));
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -168,6 +189,9 @@ void pg6_export_win32_create_file_w(void* state) {
         pg6_arg_int<uint32_t>(pg6_seam_load_u64(rsp + kPg6SeamStackArgOffset + 8)),
         pg6_arg_int<Pg6Handle>(pg6_seam_load_u64(rsp + kPg6SeamStackArgOffset + 16)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -183,6 +207,9 @@ void pg6_export_win32_read_file(void* state) {
         pg6_seam_range<uint32_t*>(pg6_buffers, pg6_seam_get_gpr(state, 9), pg6_seam_elem<uint32_t*>()),
         pg6_seam_range<void*>(pg6_buffers, pg6_seam_load_u64(rsp + kPg6SeamStackArgOffset + 0), pg6_seam_elem<void*>()));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }
@@ -196,6 +223,9 @@ void pg6_export_xbox_XMemTransferMemory(void* state) {
         pg6_arg_int<size_t>(pg6_seam_get_gpr(state, 8)),
         pg6_arg_int<uint32_t>(pg6_seam_get_gpr(state, 9)));
     pg6_buffers.finish();
+    if (pg6_seam_unwind_pending(state)) {
+        return;
+    }
     pg6_seam_set_gpr(state, 0, pg6_ret_int(result));
     pg6_seam_return(state);
 }

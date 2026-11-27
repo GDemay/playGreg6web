@@ -844,7 +844,9 @@ pub fn lift_shards_cached(
         IndirectDispatch::Shard => Some(compute_cross_shard_callees(functions, shards)),
     };
     // Whole-program flag summaries: direct calls across shards link to the same functions.
-    let flag_summaries = lift::FlagSummaries::compute(functions.iter().copied());
+    // Probed functions read their arguments at entry, so callers sync them before direct calls.
+    let flag_summaries =
+        lift::FlagSummaries::compute_with_probes(functions.iter().copied(), probes);
     let lift_dir = out_dir.join(LIFT_DIR);
     let next = AtomicUsize::new(0);
     let failed = AtomicBool::new(false);
