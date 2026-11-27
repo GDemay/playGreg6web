@@ -1,0 +1,53 @@
+name: Matched synthetic WMA Pro decoder variants
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        required: true
+      twiddle_ref:
+        required: true
+      byte_ref:
+        required: true
+permissions:
+  contents: read
+jobs:
+  linux-audio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: runner
+      - uses: actions/checkout@v4
+        with:
+          repository: PlayGreg6Web/playGreg6web
+          ref: ${{ inputs.base_ref }}
+          path: baseline
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.twiddle_ref }}
+          path: twiddle
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.byte_ref }}
+          path: byte
+      - name: Build identical harness with each production decoder and run full regressions
+        run: |
+          mkdir -p results
+          python3 runner/tools/perf_run_fragmented_flush.py --environment-only --output results/environment.json --base "${{ inputs.base_ref }}" --patch "${{ inputs.byte_ref }}"
+          for tree in baseline twiddle byte; do
+            c++ -std=c++20 -O3 -DNDEBUG -I"$tree/runtime" byte/tests/test_xma_decoder.cpp "$tree/runtime/os/xma_decoder.cpp" "$tree/runtime/os/xapu_opus.cpp" -pthread -o "$tree-bin"
+            "./$tree-bin"
+          done
+      - name: Separate alternating seven-pair measurements
+        run: |
+          python3 byte/tools/bench_xma_decoder.py ./baseline-bin ./twiddle-bin --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.twiddle_ref }}" --samples 7 > results/twiddle.json
+          python3 byte/tools/bench_xma_decoder.py ./baseline-bin ./byte-bin --baseline-commit "${{ inputs.base_ref }}" --patch-commit "${{ inputs.byte_ref }}" --samples 7 > results/byte.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wmapro-decoder-controls
+          path: results/*.json
+          if-no-files-found: ignore
