@@ -3421,7 +3421,7 @@ fn collect_live_locals(
     transitively_pure: &[bool],
 ) -> HashSet<Handle<LocalVariable>> {
     let mut live_locals: HashSet<Handle<LocalVariable>> = HashSet::new();
-    let mut visited_exprs: HashSet<Handle<Expression>> = HashSet::new();
+    let mut visited_exprs = vec![false; func.expressions.len()];
 
     // Walk an expression used in a non-store-target position: any local pointer reached here
     // escapes or is read -> mark its origin local live!
@@ -3429,7 +3429,7 @@ fn collect_live_locals(
         root: Handle<Expression>,
         func: &Function,
         local_origins: &[Option<Handle<LocalVariable>>],
-        visited: &mut HashSet<Handle<Expression>>,
+        visited: &mut [bool],
         live_locals: &mut HashSet<Handle<LocalVariable>>,
     ) {
         let mut stack = vec![root];
@@ -3437,7 +3437,7 @@ fn collect_live_locals(
             if let Some(lv) = local_origins[h.index()] {
                 live_locals.insert(lv);
             }
-            if !visited.insert(h) {
+            if std::mem::replace(&mut visited[h.index()], true) {
                 continue;
             }
             if let Ok(expr) = func.expressions.try_get(h) {
@@ -3454,7 +3454,7 @@ fn collect_live_locals(
         func: &Function,
         local_origins: &[Option<Handle<LocalVariable>>],
         transitively_pure: &[bool],
-        visited: &mut HashSet<Handle<Expression>>,
+        visited: &mut [bool],
         live_locals: &mut HashSet<Handle<LocalVariable>>,
     ) -> bool {
         let mut all_indices_pure = true;
@@ -3484,7 +3484,7 @@ fn collect_live_locals(
         func: &Function,
         local_origins: &[Option<Handle<LocalVariable>>],
         transitively_pure: &[bool],
-        visited: &mut HashSet<Handle<Expression>>,
+        visited: &mut [bool],
         live_locals: &mut HashSet<Handle<LocalVariable>>,
     ) {
         for stmt in block.iter() {
