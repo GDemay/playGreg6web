@@ -62,6 +62,12 @@ void write_positions(uint64_t* view_clock, uint64_t* watch_epoch);
 // range skip their own GetWriteWatch call until precollect_end. Takes of other ranges are unchanged.
 void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>* ranges);
 void precollect_end();
+// Inside a precollect: serves the takes of the sorted `ranges` that need no GetWriteWatch of their
+// own (no shared page view, wholly inside a collected range) in one pass, under each lock once.
+// handled[i] = 1: range i's pages stamped after `watch_epoch` were appended to `pages` (host
+// addresses), exactly what take_written_pages would report for it; 0: take it as usual.
+void take_precollected_pages(const std::vector<std::pair<uintptr_t, uintptr_t>>& ranges, uint64_t watch_epoch,
+                             std::vector<uint8_t>* handled, std::vector<uintptr_t>* pages);
 // Whether later reserve() calls ask for write tracking (where the platform has it).
 void set_write_watch(bool on);
 // R40: writes caught on armed shared page views (Windows; 0 elsewhere).

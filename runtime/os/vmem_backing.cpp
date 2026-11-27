@@ -1331,13 +1331,11 @@ bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, ui
 // GetWriteWatch call of its own (a write after the collect is reported by the next one).
 thread_local std::vector<std::pair<uintptr_t, uintptr_t>> t_precollected;
 
+// (Sorted and disjoint: precollect_begin builds them in address order.)
 bool precollected_covers(uintptr_t lo, uintptr_t hi) {
-    for (const auto& r : t_precollected) {
-        if (lo >= r.first && hi <= r.second) {
-            return true;
-        }
-    }
-    return false;
+    auto it = std::upper_bound(t_precollected.begin(), t_precollected.end(), lo,
+                               [](uintptr_t v, const std::pair<uintptr_t, uintptr_t>& r) { return v < r.first; });
+    return it != t_precollected.begin() && hi <= std::prev(it)->second;
 }
 
 // Peek mode: GetWriteWatch without RESET over the range (no page protection change, no TLB
@@ -1568,6 +1566,83 @@ void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>* ranges) {
 
 void precollect_end() {
     t_precollected.clear();
+}
+
+void take_precollected_pages(const std::vector<std::pair<uintptr_t, uintptr_t>>& ranges, uint64_t watch_epoch,
+                             std::vector<uint8_t>* handled, std::vector<uintptr_t>* pages) {
+    handled->assign(ranges.size(), 0);
+    if (t_precollected.empty() || ranges.empty()) {
+        return;
+    }
+    // Pass 1: the ranges a take would serve from the precollected bits alone (no shared page view
+    // in them, inside one watched reservation and one collected hull). The same checks a single
+    // take makes, each lock taken once for the batch instead of once per range.
+    size_t eligible = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(g_track_mutex);
+        for (size_t i = 0; i < ranges.size(); ++i) {
+            const uintptr_t start = ranges[i].first & ~(uintptr_t{kWrittenPageSize} - 1);
+            const uintptr_t end = ranges[i].second;
+            if (end <= start || !precollected_covers(start, end)) {
+                continue;
+            }
+            auto it = g_views.upper_bound(start);
+            if (it != g_views.begin() && std::prev(it)->first + std::prev(it)->second.size > start) {
+                continue;
+            }
+            if (it != g_views.end() && it->first < end) {
+                continue;
+            }
+            (*handled)[i] = 1;
+            ++eligible;
+        }
+    }
+    if (eligible == 0) {
+        return;
+    }
+    {
+        std::shared_lock<std::shared_mutex> lock(g_watched_mutex);
+        for (size_t i = 0; i < ranges.size(); ++i) {
+            if ((*handled)[i] == 0) {
+                continue;
+            }
+            const uintptr_t start = ranges[i].first & ~(uintptr_t{kWrittenPageSize} - 1);
+            auto it = g_watched.upper_bound(start);
+            if (it == g_watched.begin() || ranges[i].second > std::prev(it)->second) {
+                (*handled)[i] = 0;
+            }
+        }
+    }
+    // Pass 2: the pages stamped after `watch_epoch` in each, under one stamp lock (what
+    // written_pages_by_watch reports for a range it need not collect again).
+    std::lock_guard<std::mutex> lock(g_stamp_mutex);
+    if (g_watch_epoch >= 0xFFFFFFF0u) {
+        handled->assign(ranges.size(), 0);  // out of epochs: the single takes report "unknown"
+        return;
+    }
+    const uint64_t seen = watch_epoch;
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        if ((*handled)[i] == 0) {
+            continue;
+        }
+        const uintptr_t start = ranges[i].first & ~(uintptr_t{kWrittenPageSize} - 1);
+        const uintptr_t end = ranges[i].second;
+        for (auto it = g_stamp_chunks.lower_bound(start >> kStampChunkShift);
+             it != g_stamp_chunks.end() && (it->first << kStampChunkShift) < end; ++it) {
+            const StampChunk& chunk = *it->second;
+            if (chunk.newest <= seen) {
+                continue;
+            }
+            const uintptr_t chunk_base = it->first << kStampChunkShift;
+            const uintptr_t lo = std::max<uintptr_t>(chunk_base, start);
+            const uintptr_t hi = std::min<uintptr_t>(chunk_base + (uintptr_t{1} << kStampChunkShift), end);
+            for (uintptr_t a = lo; a < hi; a += kWrittenPageSize) {
+                if (chunk.stamp[(a >> 12) & (kStampChunkPages - 1)] > seen) {
+                    pages->push_back(a);
+                }
+            }
+        }
+    }
 }
 
 namespace {
@@ -1841,6 +1916,10 @@ uint64_t shared_view_size(const uint8_t*) { return 0; }
 
 void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>*) {}
 void precollect_end() {}
+void take_precollected_pages(const std::vector<std::pair<uintptr_t, uintptr_t>>& ranges, uint64_t, std::vector<uint8_t>* handled,
+                             std::vector<uintptr_t>*) {
+    handled->assign(ranges.size(), 0);
+}
 
 bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, bool, std::vector<uint64_t>*) {
     return false;  // no write tracking in linear memory
@@ -1970,6 +2049,10 @@ uint64_t shared_view_size(const uint8_t*) { return 0; }
 
 void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>*) {}
 void precollect_end() {}
+void take_precollected_pages(const std::vector<std::pair<uintptr_t, uintptr_t>>& ranges, uint64_t, std::vector<uint8_t>* handled,
+                             std::vector<uintptr_t>*) {
+    handled->assign(ranges.size(), 0);
+}
 
 bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, bool, std::vector<uint64_t>*) {
     return false;  // not tracked on POSIX hosts

@@ -1,6 +1,7 @@
-// VirtualMemoryArena on one contiguous guest address space (runtime/os/vmem.h): translation,
+﻿// VirtualMemoryArena on one contiguous guest address space (runtime/os/vmem.h): translation,
 // contiguity across page runs and reservations, zero-fill on (re)commit, protections, the image
 // base hint, exhaustion, many reservations and concurrent use.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -692,6 +693,33 @@ void test_write_batch() {
     }
     CHECK(take_written_pages(p, 64 * 1024, &x, &pages));
     CHECK(pages == (std::vector<uint64_t>{5 * kWrittenPageSize}));
+
+    // A ranges take inside a batch (served in one pass) reports the same pages per range, and the
+    // other cursor still sees them afterwards.
+    const uintptr_t base = reinterpret_cast<uintptr_t>(p);
+    p[1 * kWrittenPageSize] = 1;
+    p[9 * kWrittenPageSize] = 1;
+    p[12 * kWrittenPageSize] = 1;  // between the two ranges: not reported to this take
+    {
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges{{base, base + 4 * kWrittenPageSize},
+                                                            {base + 8 * kWrittenPageSize, base + 11 * kWrittenPageSize}};
+        std::vector<std::pair<uintptr_t, uintptr_t>> collect = ranges;
+        const WriteBatch batch(&collect);
+        std::vector<uintptr_t> taken;
+        std::vector<uint8_t> ok;
+        take_written_pages_ranges(ranges, &x, &taken, &ok);
+        CHECK(ok == (std::vector<uint8_t>{1, 1}));
+        std::sort(taken.begin(), taken.end());
+        CHECK(taken == (std::vector<uintptr_t>{base + 1 * kWrittenPageSize, base + 9 * kWrittenPageSize}));
+        taken.clear();
+        take_written_pages_ranges(ranges, &x, &taken, &ok);
+        CHECK(ok == (std::vector<uint8_t>{1, 1}) && taken.empty());
+    }
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &y, &pages));
+    for (uint64_t off : {uint64_t{1}, uint64_t{9}, uint64_t{12}}) {
+        CHECK(std::find(pages.begin(), pages.end(), off * kWrittenPageSize) != pages.end());
+    }
 }
 
 void test_mem_reset_and_reclaim_telemetry() {
