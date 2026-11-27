@@ -9,7 +9,6 @@
 
 use std::collections::BTreeMap;
 
-#[cfg(test)]
 use crate::cfg::BasicBlock;
 use crate::cfg::Edge;
 
@@ -53,6 +52,36 @@ impl PredIndex {
             }
         }
         Self { map }
+    }
+
+    /// [`Self::from_blocks`] in one pass: the edges are collected in parallel in block order and
+    /// grouped by target with a stable sort, which keeps the source order the incremental
+    /// updates keep.
+    pub fn build(threads: usize, blocks: &BTreeMap<u64, BasicBlock>) -> Self {
+        let blocks: Vec<(&u64, &BasicBlock)> = blocks.iter().collect();
+        let mut edges: Vec<(u64, u64, Edge)> =
+            super::par_flat_map(threads, &blocks, |&(&from, block), out| {
+                for &edge in &block.successors {
+                    if let Some(target) = edge.intra_target() {
+                        out.push((target, from, edge));
+                    }
+                }
+            });
+        drop(blocks);
+        edges.sort_by_key(|&(target, ..)| target);
+        let mut edges = edges.into_iter().peekable();
+        let mut grouped: Vec<(u64, Vec<(u64, Edge)>)> = Vec::new();
+        while let Some((target, from, edge)) = edges.next() {
+            let mut list = vec![(from, edge)];
+            while let Some((_, from, edge)) = edges.next_if(|&(t, ..)| t == target) {
+                list.push((from, edge));
+            }
+            grouped.push((target, list));
+        }
+        // Sorted input: a bulk build.
+        Self {
+            map: grouped.into_iter().collect(),
+        }
     }
 
     /// Incoming edges of `target`, `None` when it has none.
