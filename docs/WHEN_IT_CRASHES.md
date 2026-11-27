@@ -1,4 +1,4 @@
-# When it crashes
+﻿# When it crashes
 
 Short guide for players and developers: where the report is, how to read it, what the usual endings mean, and
 what to send. Reports hold hashes, addresses and counts only, never game bytes.
@@ -48,6 +48,8 @@ inside the faulting process, so a dump cannot freeze the run (#663). A run that 
 `host-fault-host_watchdog_timeout-<pid>.dmp` before it builds the report, and if the fault or stop report
 path itself does not finish within 30 s, it prints the stacks again and terminates with the fault/watchdog
 exit code. `python tools\minidump_stack.py <dump> --all-threads --exe-dir <bin dir>` names every thread's frames.
+
+The `bink` block of the report lists Bink export lookups that returned null (`lookup_null`, with the first distinct names) and the `BinkOpenWithOptions` stream creates (`open_log`: path, flags, result); read it when a video or the loading screen stops. `guest_sleep` shows how long guest `Sleep` calls really took.
 
 ## Common endings today
 

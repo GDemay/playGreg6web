@@ -1,4 +1,4 @@
-# Status: how to play, how far it gets, what to use when it stops
+﻿# Status: how to play, how far it gets, what to use when it stops
 
 Short and kept current: update the numbers below whenever a PR changes them. Details live in the linked
 docs. No game files are in this repo; the executable and package stay outside (see [PLAY_LOCALLY.md](PLAY_LOCALLY.md)).
@@ -125,6 +125,8 @@ for a stuck report path (#1969), dstorage stall line (#1960) and `streaming_drai
 driven GPU buffer flush cut it from about 9.0 to about 4.5 ms/frame (#1970, `--flush-crosscheck` verifies it).
 Latest soak: 12/12 boots end at the `XSystemGetAppSpecificDeviceId` owner-decision stop, 0 host AVs, 0 title traps,
 0 hangs, fps p50 58.8.
+
+Since #1972 (merged, #1973-#1982): the GPU buffer flush also page-indexes relocated uniform ranges outside every tracked buffer and the report counts `gpu_work.flush_buffer_ns` / `flush_uniform_ns` (#1973); the boot report has a `guest_sleep` block (requested vs actual wall time of every guest `Sleep`, overshoot histogram) and `--timer-resolution 1ms|default` for A/B (#1975) - the histogram shows guest `Sleep` is not tick-bound; the `bink` block counts null `Bink*` export lookups (`lookup_null`, first distinct names) and logs `BinkOpenWithOptions` stream creates (`open_log`: path, flags, result) (#1982); `com_bridge` test flake fixed (#1981). Marc: GPU descriptor heap / command ring / readback gate hardening (#1977), web loading splash and HUD telemetry (#1979).
 
 ## Ray tracing
 
