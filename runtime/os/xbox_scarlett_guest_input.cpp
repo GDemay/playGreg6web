@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -1310,25 +1311,22 @@ private:
         if (row_pitch < row_bytes || (d > 1 && slice_pitch < uint64_t{row_pitch} * rows)) {
             return com::E_INVALIDARG_HR;
         }
-        std::vector<uint8_t> linear(size_t{row_bytes} * rows * d);
-        // Tight images are one contiguous guest-memory read instead of one bridge call per
-        // row. Staging still snapshots the source before any surface writes (including aliases).
-        // A failed bulk read falls back to the original row validation/copy order.
-        const bool tight = row_pitch == row_bytes && (d == 1 || slice_pitch == uint64_t{row_bytes} * rows);
-        if (!tight || !com::read_guest(src, linear.data(), linear.size())) {
-            for (uint32_t z = 0; z < d; ++z) {
-                for (uint32_t y = 0; y < rows; ++y) {
-                    const uint64_t from = src + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
-                    if (!com::read_guest(from, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
-                        return com::E_INVALIDARG_HR;
-                    }
+        // Every staging byte is filled before use. Avoid value-initializing large private
+        // byte buffers that the guest read overwrites immediately. Keep original row ordering.
+        const size_t linear_bytes = size_t{row_bytes} * rows * d;
+        std::unique_ptr<uint8_t[]> linear(new uint8_t[linear_bytes]);
+        for (uint32_t z = 0; z < d; ++z) {
+            for (uint32_t y = 0; y < rows; ++y) {
+                const uint64_t from = src + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
+                if (!com::read_guest(from, linear.get() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
+                    return com::E_INVALIDARG_HR;
                 }
             }
         }
-        std::vector<uint8_t> surface(chain_bytes);
-        if (!com::read_guest(dst, surface.data(), surface.size()) ||
-            !gfx10::tile_into_surface(td, mip, linear.data(), linear.size(), surface.data(), surface.size()) ||
-            !com::write_guest(dst, surface.data(), surface.size())) {
+        std::unique_ptr<uint8_t[]> surface(new uint8_t[chain_bytes]);
+        if (!com::read_guest(dst, surface.get(), chain_bytes) ||
+            !gfx10::tile_into_surface(td, mip, linear.get(), linear_bytes, surface.get(), chain_bytes) ||
+            !com::write_guest(dst, surface.get(), chain_bytes)) {
             return com::E_INVALIDARG_HR;
         }
         return kOk;
@@ -1359,27 +1357,19 @@ private:
         if (row_pitch < row_bytes || (d > 1 && slice_pitch < uint64_t{row_pitch} * rows)) {
             return com::E_INVALIDARG_HR;
         }
-        std::vector<uint8_t> surface(chain_bytes);
+        // read_guest fills the complete surface before the detiler can observe it.
+        std::unique_ptr<uint8_t[]> surface(new uint8_t[chain_bytes]);
         std::vector<uint8_t> linear;
-        if (!com::read_guest(src, surface.data(), surface.size()) ||
-            !gfx10::detile_from_surface(td, mip, surface.data(), surface.size(), linear).ok ||
+        if (!com::read_guest(src, surface.get(), chain_bytes) ||
+            !gfx10::detile_from_surface(td, mip, surface.get(), chain_bytes, linear).ok ||
             linear.size() < size_t{row_bytes} * rows * d) {
             return com::E_INVALIDARG_HR;
         }
-        // The detiler owns `linear`, so overlapping guest source/destination ranges remain
-        // safe. Translated writes retain row granularity: even a failed write marks its whole
-        // requested range dirty, so a failed bulk attempt would mark slots beyond the failure.
-        // Padded rows/slices and failed arena writes also retain the original row path.
-        const bool tight = !guest_window::translated(dst) && row_pitch == row_bytes &&
-                           (d == 1 || slice_pitch == uint64_t{row_bytes} * rows);
-        const size_t linear_bytes = size_t{row_bytes} * rows * d;
-        if (!tight || !com::write_guest(dst, linear.data(), linear_bytes)) {
-            for (uint32_t z = 0; z < d; ++z) {
-                for (uint32_t y = 0; y < rows; ++y) {
-                    const uint64_t to = dst + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
-                    if (!com::write_guest(to, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
-                        return com::E_INVALIDARG_HR;
-                    }
+        for (uint32_t z = 0; z < d; ++z) {
+            for (uint32_t y = 0; y < rows; ++y) {
+                const uint64_t to = dst + uint64_t{z} * slice_pitch + uint64_t{y} * row_pitch;
+                if (!com::write_guest(to, linear.data() + (size_t{z} * rows + y) * row_bytes, row_bytes)) {
+                    return com::E_INVALIDARG_HR;
                 }
             }
         }
