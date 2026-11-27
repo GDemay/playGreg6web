@@ -593,7 +593,16 @@ fn s70_fragment_interpolation_qualifiers_perspective_centroid_linear_and_flat() 
     words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [10, 11, 12, 13]));
     words.push(enc_sopp(0x01, 0));
 
-    let out = translate_stage(&words, Rdna2StageOverride::Pixel);
+    // Opt in to preserving RDNA2 `v_interp_*` interpolation qualifiers on FragIn for
+    // interpolation-mode classification verification (default translates FragIn as
+    // `perspective, center` to guarantee WebGPU VS↔PS CreateRenderPipeline compatibility).
+    let opts = Rdna2TranslateOptions {
+        stage: Rdna2StageOverride::Pixel,
+        preserve_fragment_interpolation: true,
+        ..Rdna2TranslateOptions::default()
+    };
+    let out = translate_rdna2_to_wgsl(&words_to_bytes(&words), &opts)
+        .expect("pixel shader with explicit interpolation modes must translate cleanly");
     assert_eq!(out.binding_summary.fragment_input_locations, vec![0, 1, 2, 3, 4]);
 
     // Re-parse with Naga and verify exact Interpolation + Sampling on every FragIn member!

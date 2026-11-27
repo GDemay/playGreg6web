@@ -979,8 +979,9 @@ fn s67_negative_untraceable_dynamic_table_r128_isolation_and_conflicting_branche
         );
     }
 
-    // 4. Conflicting if/else loading two DIFFERENT table slots (`s4+0x20` vs `s4+0x40`) into
-    //    `s[40:47]` MUST stay `source == None` (no arbitrary branch picking!).
+    // 4a. 2-way if/else loading two static table slots from the SAME table (`s4+0x20` vs `s4+0x40`)
+    //     into `s[40:47]` must lower to a runtime-predicated 2-way store declaring BOTH bindings
+    //     with exact `Table` provenance (never collapsing to one arbitrary branch!).
     {
         let mut words = Vec::new();
         words.push(enc_sop1(0x03, 32, 4));
@@ -1002,6 +1003,61 @@ fn s67_negative_untraceable_dynamic_table_r128_isolation_and_conflicting_branche
         let out = translate_as(&words, Rdna2StageOverride::Compute);
         assert!(out.naga_validated);
         assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let stexes: Vec<_> = out
+            .bindings
+            .iter()
+            .filter(|b| b.kind == "storage-texture")
+            .collect();
+        assert_eq!(
+            stexes.len(),
+            2,
+            "2-way static table diamond must declare both storage-texture bindings: {:?}",
+            out.bindings
+        );
+        let sources: Vec<_> = stexes.iter().map(|b| b.source).collect();
+        assert!(
+            sources.contains(&Some(WgslBindingSource::Table {
+                user_sgpr: 4,
+                table_byte_offset: 0x20,
+            })) && sources.contains(&Some(WgslBindingSource::Table {
+                user_sgpr: 4,
+                table_byte_offset: 0x40,
+            })),
+            "both Table(s4, 0x20) and Table(s4, 0x40) must be preserved: {sources:?}"
+        );
+        assert!(
+            out.wgsl.contains("_pg6_desc_sel0"),
+            "predicated 2-way store must emit runtime descriptor selector:\n{}",
+            out.wgsl
+        );
+    }
+
+    // 4b. Cross-table conflicting if/else (`s4+0x20` vs `s5+0x40`) MUST stay `source == None`
+    //     (no arbitrary branch picking!).
+    {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 32, 4));
+        words.push(enc_sop1(0x03, 33, 0x80));
+        words.push(enc_sop1(0x03, 34, 5));
+        words.push(enc_sop1(0x03, 35, 0x80));
+        words.push(enc_sopc(0x06, 0, 128));
+        let cb_idx = words.len();
+        words.push(0); // s_cbranch_scc0 ELSE
+        words.extend_from_slice(&enc_smem(0x03, 40, 16, 0x7D, 0x20, false, false)); // s4+0x20
+        let sb_idx = words.len();
+        words.push(0); // s_branch MERGE
+        let else_off = words.len() * 4;
+        words.extend_from_slice(&enc_smem(0x03, 40, 17, 0x7D, 0x40, false, false)); // s5+0x40
+        let merge_off = words.len() * 4;
+        words[cb_idx] = enc_sopp(0x04, branch_simm(cb_idx * 4, else_off));
+        words[sb_idx] = enc_sopp(0x02, branch_simm(sb_idx * 4, merge_off));
+        words.extend_from_slice(&enc_mimg_full(0x08, 0xF, 1, false, 0, 4, 10, 0));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
         let stex = out
             .bindings
             .iter()
@@ -1009,7 +1065,298 @@ fn s67_negative_untraceable_dynamic_table_r128_isolation_and_conflicting_branche
             .unwrap();
         assert_eq!(
             stex.source, None,
-            "conflicting if/else table slots must remain source=None: {:?}",
+            "cross-table conflicting if/else must remain source=None: {:?}",
+            out.bindings
+        );
+    }
+}
+
+#[test]
+fn s67_vopc_sdwab_vcc_preservation_lane_add_va_pack_spack_and_37_compute_uav_patterns() {
+    // 1. VOPC VOP_SDWAB (`src0 == 0xF9`, `w1[15] == 1`, `sdst = s64`) must NOT clobber `vcc`
+    //    holding a 64-bit descriptor table pointer!
+    {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 106, 4)); // s_mov_b32 vcc_lo, s4 (UserTable s4)
+        words.push(enc_sop1(0x03, 107, 0x80)); // s_mov_b32 vcc_hi, 0
+        // VOPC v_cmp_class_f32 (op=0x88, bit4=0) with src0=0xF9 (SDWA) + w1(sd=1, sdst=64)
+        words.push(enc_vopc(0x88, 0xF9, 1));
+        words.push((1u32 << 15) | (64u32 << 8)); // sd=1, sdst=s64
+        // Subsequent s_load_dwordx4 using sbase=vcc (pair 53 = s[106:107]) at offset 0x400
+        words.extend_from_slice(&enc_smem(0x02, 40, 53, 0x7D, 0x400, false, false));
+        words.extend_from_slice(&enc_mubuf_full(0x0C, 0, true, false, 0, 1, 10, 0x7D));
+        words.push(enc_sopp(0x01, 0));
+
+        // Verify disassembler also prints `s64`, not `vcc`.
+        let decoded = playgta6_shaders::rdna2::decode_program(&words_to_bytes(&words));
+        assert!(
+            decoded[2].operands.starts_with("s64,"),
+            "VOP_SDWAB must decode sdst=s64: {:?}",
+            decoded[2]
+        );
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let sbuf = out
+            .bindings
+            .iter()
+            .find(|b| b.kind == "read-only-storage")
+            .unwrap();
+        assert_eq!(
+            sbuf.source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 4,
+                table_byte_offset: 0x400,
+            }),
+            "VOP_SDWAB targeting s64 must preserve vcc table provenance: {:?}",
+            out.bindings
+        );
+    }
+
+    // 2. `s_add_u32` combining `UserTable(s4, 0) + LaneIndex(window_base: None)` from
+    //    `v_readfirstlane_b32` -> `LaneIndexedResourceHeap` (parity with SMEM soffset).
+    {
+        let mut words = Vec::new();
+        // v_readfirstlane_b32 (VOP1 op=0x02) s30, v0
+        words.push(enc_vop1(0x02, 30, 256));
+        // s_add_u32 s32, s4, s30; s_mov_b32 s33, 0
+        words.push(enc_sop2(0x00, 32, 4, 30));
+        words.push(enc_sop1(0x03, 33, 0x80));
+        // s_load_dwordx4 s[40:43], s[32:33], 0
+        words.extend_from_slice(&enc_smem(0x02, 40, 16, 0x7D, 0, false, false));
+        words.extend_from_slice(&enc_mubuf_full(0x0C, 0, true, false, 0, 1, 10, 0x7D));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let sbuf = out
+            .bindings
+            .iter()
+            .find(|b| b.kind == "read-only-storage")
+            .unwrap();
+        assert!(
+            matches!(sbuf.source, Some(WgslBindingSource::LaneIndexedResourceHeap(_))),
+            "UserTable + LaneIndex(window_base: None) via s_add_u32 must resolve to LaneIndexedResourceHeap: {:?}",
+            out.bindings
+        );
+    }
+
+    // 3. 48-bit aligned CBV VA pack/unpack (`s_lshr_b64 8` -> `v_mov_b32` -> `v_readlane_b32` ->
+    //    `s_lshl_b64 8` -> `s_or_b32 48` -> `s_load_dword`) preserves `Table` CBV source.
+    {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 32, 4)); // s32 = UserTable s4
+        words.push(enc_sop1(0x03, 33, 0x80)); // s33 = 0
+        // s_load_dwordx4 s[40:43], s[32:33], 0x60 -> TableDesc(s4, 0x60)
+        words.extend_from_slice(&enc_smem(0x02, 40, 16, 0x7D, 0x60, false, false));
+        // s_mov_b32 s44, s40; s_and_b32 s45, s41, 0x0000ffff
+        words.push(enc_sop1(0x03, 44, 40));
+        words.push(enc_sop2(0x0E, 45, 41, 0xFF));
+        words.push(0x0000_FFFF);
+        // s_lshr_b64 (SOP2 0x21) s[46:47], s[44:45], 8 (inline 136)
+        words.push(enc_sop2(0x21, 46, 44, 136));
+        // Uniform VGPR spill round-trip: v_mov_b32 v5, s46; v_readlane_b32 (VOP3 0x360) s48, v5, s0
+        words.push(enc_vop1(0x01, 5, 46));
+        words.extend_from_slice(&enc_vop3(0x360, 48, 256 + 5, 0, 0, false, 0, 0, 0));
+        // s_mov_b32 s49, 0; s_lshl_b64 (SOP2 0x1F) s[50:51], s[48:49], 8
+        words.push(enc_sop1(0x03, 49, 0x80));
+        words.push(enc_sop2(0x1F, 50, 48, 136));
+        // s_or_b32 s50, s50, 48 (inline 176)
+        words.push(enc_sop2(0x10, 50, 50, 176));
+        // s_load_dword s52, s[50:51], 0x0 (scalar CBV read!)
+        words.extend_from_slice(&enc_smem(0x00, 52, 25, 0x7D, 0, false, false));
+        words.push(enc_vop1(0x01, 2, 52));
+        words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 2, 10, 0x7D));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let cbv = out.bindings.iter().find(|b| b.kind == "uniform").unwrap();
+        assert_eq!(
+            cbv.source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 4,
+                table_byte_offset: 0x60,
+            }),
+            "48-bit VA s_lshr_b64/s_lshl_b64 round-trip must preserve Table CBV source: {:?}",
+            out.bindings
+        );
+    }
+
+    // 4. Non-constant `s_pack_ll_b32_b16` / `s_pack_hh_b32_b16` with zero upper half extracts
+    //    16-bit CBV heap index cleanly (`CbvIndexedResourceHeap`).
+    {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 32, 4)); // Table s4
+        words.push(enc_sop1(0x03, 33, 0x80));
+        words.extend_from_slice(&enc_smem(0x02, 40, 16, 0x7D, 0x20, false, false)); // CBV V#
+        words.extend_from_slice(&enc_smem(0x08, 44, 20, 0x7D, 0x10, false, false)); // s_buffer_load_dword s44
+        // s_pack_hh_b32_b16 (SOP2 0x34) s45, s44, 0 -> (s44 >> 16)
+        words.push(enc_sop2(0x34, 45, 44, 0x80));
+        // s_lshl_b32 s45, s45, 5 (* 32B T#)
+        words.push(enc_sop2(0x1E, 45, 45, 133));
+        words.push(enc_sop1(0x03, 34, 6)); // ResourceHeap UserTable s6
+        words.push(enc_sop1(0x03, 35, 0x80));
+        words.extend_from_slice(&enc_smem(0x03, 48, 17, 45, 0, false, false)); // s_load_dwordx8 T#
+        words.extend_from_slice(&enc_mimg_full(0x00, 0xF, 1, false, 0, 4, 12, 0)); // image_load
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let tex = out.bindings.iter().find(|b| b.kind == "texture_2d").unwrap();
+        assert_eq!(
+            tex.source,
+            Some(WgslBindingSource::CbvIndexedResourceHeap(
+                CbvIndexedHeapSource {
+                    cbv: CbvRefSource::Table {
+                        user_sgpr: 4,
+                        table_byte_offset: 0x20,
+                    },
+                    byte_offset: 0x10,
+                    shift: 5,
+                    bit_offset: 16,
+                    mask: 0xFFFF,
+                    stride: 32,
+                }
+            )),
+            "s_pack_hh_b32_b16 dst, cbv_dword, 0 must resolve CbvIndexedResourceHeap: {:?}",
+            out.bindings
+        );
+    }
+
+    // 5. 2-way CFG diamond selecting between 2 static `TableDesc` slots for writable `buffer_store_dword`
+    //    (`s4+0x300` vs `s4+0x320`) declares BOTH `storage` bindings with runtime selector dispatch.
+    {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 32, 4));
+        words.push(enc_sop1(0x03, 33, 0x80));
+        words.push(enc_sopc(0x06, 0, 128));
+        let cb_idx = words.len();
+        words.push(0); // s_cbranch_scc0 ELSE
+        words.extend_from_slice(&enc_smem(0x02, 40, 16, 0x7D, 0x300, false, false));
+        let sb_idx = words.len();
+        words.push(0); // s_branch MERGE
+        let else_off = words.len() * 4;
+        words.extend_from_slice(&enc_smem(0x02, 40, 16, 0x7D, 0x320, false, false));
+        let merge_off = words.len() * 4;
+        words[cb_idx] = enc_sopp(0x04, branch_simm(cb_idx * 4, else_off));
+        words[sb_idx] = enc_sopp(0x02, branch_simm(sb_idx * 4, merge_off));
+        words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 1, 10, 0x7D));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let uavs: Vec<_> = out.bindings.iter().filter(|b| b.kind == "storage").collect();
+        assert_eq!(uavs.len(), 2, "expected 2 storage UAV bindings: {:?}", out.bindings);
+        assert!(uavs.iter().all(|b| b.source.is_some()));
+        assert!(out.wgsl.contains("_pg6_desc_sel0"), "WGSL:\n{}", out.wgsl);
+    }
+
+    // 6. Bounded dynamic-`soffset` CBV index array (`s_cmp_lt_u32 s0, 6` -> `s_lshl_b32 s_off, s0, 2`
+    //    -> `s_buffer_load_dword` -> `s_lshl_b32 5` -> `s_load_dwordx8` -> `image_store`) expands
+    //    into 6 `CbvIndexedResourceHeap` storage-texture bindings + `switch (_pg6_desc_sel0)`.
+    {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 32, 4)); // Table s4
+        words.push(enc_sop1(0x03, 33, 0x80));
+        words.push(enc_sop1(0x03, 34, 6)); // ResourceHeap s6
+        words.push(enc_sop1(0x03, 35, 0x80));
+        words.extend_from_slice(&enc_smem(0x02, 40, 16, 0x7D, 0x20, false, false)); // CBV V#
+        // s_cmp_lt_u32 (SOPC 0x0A) s0, 6 (inline 134)
+        words.push(enc_sopc(0x0A, 0, 134));
+        let guard_idx = words.len();
+        words.push(0); // s_cbranch_scc0 EXIT
+        // In-bounds path (s0 < 6):
+        words.push(enc_sop2(0x1E, 44, 0, 130)); // s_lshl_b32 s44, s0, 2
+        words.extend_from_slice(&enc_smem(0x08, 45, 20, 44, 0, false, false)); // s_buffer_load_dword s45, s[40:43], s44
+        words.push(enc_sop2(0x1E, 45, 45, 133)); // s_lshl_b32 s45, s45, 5
+        words.extend_from_slice(&enc_smem(0x03, 48, 17, 45, 0, false, false)); // s_load_dwordx8 s[48:55], s[34:35], s45
+        words.extend_from_slice(&enc_mimg_full(0x08, 0xF, 1, false, 0, 4, 12, 0)); // image_store
+        let exit_off = words.len() * 4;
+        words[guard_idx] = enc_sopp(0x04, branch_simm(guard_idx * 4, exit_off));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let stexes: Vec<_> = out
+            .bindings
+            .iter()
+            .filter(|b| b.kind == "storage-texture")
+            .collect();
+        assert_eq!(
+            stexes.len(),
+            6,
+            "bounded idx < 6 CBV index array must emit 6 CbvIndexedResourceHeap UAVs: {:?}",
+            out.bindings
+        );
+        for (k, b) in stexes.iter().enumerate() {
+            assert_eq!(
+                b.source,
+                Some(WgslBindingSource::CbvIndexedResourceHeap(
+                    CbvIndexedHeapSource {
+                        cbv: CbvRefSource::Table {
+                            user_sgpr: 4,
+                            table_byte_offset: 0x20,
+                        },
+                        byte_offset: (k as u32) * 4,
+                        shift: 5,
+                        bit_offset: 0,
+                        mask: u32::MAX,
+                        stride: 32,
+                    }
+                ))
+            );
+        }
+        assert!(
+            out.wgsl.contains("_pg6_desc_sel0") && out.wgsl.contains("switch "),
+            "WGSL:\n{}",
+            out.wgsl
+        );
+    }
+
+    // 7. Guarded `s_load_dwordx4` merged with stale `Unknown` scratch across `s_cbranch_execz`
+    //    bypass resolves `Table(s5, 0x80)` for `buffer_atomic_add` cleanly.
+    {
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 32, 0)); // s32 = s0 (Unknown stale scratch)
+        words.push(enc_sop1(0x03, 33, 0)); // s33 = s0 (Unknown stale scratch)
+        words.push(enc_sop1(0x03, 76, 5)); // s76 = UserTable s5
+        words.push(enc_sop1(0x03, 77, 0x80)); // s77 = 0
+        // s_cbranch_execz (SOPP 0x08) MERGE
+        let cb_idx = words.len();
+        words.push(0);
+        // Active path: s_load_dwordx4 s[32:35], s[76:77], 0x80
+        words.extend_from_slice(&enc_smem(0x02, 32, 38, 0x7D, 0x80, false, false));
+        let merge_off = words.len() * 4;
+        words[cb_idx] = enc_sopp(0x08, branch_simm(cb_idx * 4, merge_off));
+        // buffer_atomic_add (op=0x32, glc=true) on s[32:35] (srsrc=8)
+        words.extend_from_slice(&enc_mubuf_full(0x32, 0, true, false, 0, 4, 8, 0x7D));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_naga_wgsl_valid(&out.wgsl);
+        assert_sidecar_schema_valid(&out.bindings);
+        let uav = out.bindings.iter().find(|b| b.kind == "storage").unwrap();
+        assert_eq!(
+            uav.source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 5,
+                table_byte_offset: 0x80,
+            }),
+            "s_cbranch_execz bypass carrying stale Unknown scratch must not erase TableDesc: {:?}",
             out.bindings
         );
     }

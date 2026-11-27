@@ -1804,6 +1804,7 @@ fn translate_blob_task(
         min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
         workgroup_size: options.translate.workgroup_size,
         workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
+        preserve_fragment_interpolation: options.translate.preserve_fragment_interpolation,
     };
 
     match translate_rdna2_to_wgsl(task.bytes, &translate_opts) {
@@ -2238,6 +2239,7 @@ fn translate_manifest_stage(
         min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
         workgroup_size: options.translate.workgroup_size,
         workgroup_id_sgpr_base: options.translate.workgroup_id_sgpr_base,
+        preserve_fragment_interpolation: options.translate.preserve_fragment_interpolation,
     };
 
     match translate_rdna2_to_wgsl(&bytes, &translate_opts) {

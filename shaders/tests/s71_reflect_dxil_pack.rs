@@ -622,7 +622,10 @@ fn reflect_v3_cross_stage_collision_detection_and_offset_remapping() {
         .expect("MS(Compute)+PS merge must succeed");
     assert_eq!(ms_report.remaps.len(), 1);
     assert_eq!(ms_report.remaps[0].stage, ShaderStage::Fragment);
-    assert_eq!(ms_report.remaps[0].new_binding, 64);
+    assert_eq!(
+        ms_report.remaps[0].new_binding,
+        playgta6_shaders::reflect::DEFAULT_SECONDARY_STAGE_BINDING_OFFSET
+    );
     let ms_g0 = &ms_report.layout.bind_group_layouts[0];
     assert_eq!(ms_g0.entries.len(), 2);
     assert_eq!(ms_g0.entries[0].visibility, VISIBILITY_COMPUTE);

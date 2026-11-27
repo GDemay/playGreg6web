@@ -445,3 +445,147 @@ fn s68_multi_cbv_texture_sampler_uav_compute_and_fragment_unique_bindings() {
     assert_eq!(ps_cbvs.len(), 2, "expected 2 fragment CBVs: {:?}", ps_out.bindings);
     assert!(ps_out.bindings.len() >= 9, "expected all fragment resources: {:?}", ps_out.bindings);
 }
+
+#[test]
+fn s68_post_loop_nonuniform_lowers_texture_sample_and_suppresses_workgroup_barrier() {
+    // 1. Fragment shader with a structured loop followed by top-level `image_sample` and
+    //    `image_sample_b`: WGSL §16.4 marks `CF_after` of a non-uniformly exited loop as
+    //    non-uniform, so implicit-derivative `textureSample` / `textureSampleBias` MUST lower to
+    //    `textureSampleLevel`.
+    let mut ps_words = Vec::new();
+    ps_words.push(enc_vintrp(0, 2, 0, 0, 0));
+    ps_words.push(enc_vintrp(1, 2, 0, 0, 1));
+    ps_words.push(enc_vintrp(0, 3, 0, 1, 0));
+    ps_words.push(enc_vintrp(1, 3, 0, 1, 1));
+    // Loop header: v_cmp_gt_f32 vcc, v2, v3; s_cbranch_vccnz loop_header (back-edge loop)
+    let loop_hdr_idx = ps_words.len();
+    ps_words.push(enc_vop2(0x03, 2, 256 + 2, 2)); // v2 += v2
+    ps_words.push(enc_vopc(0x04, 256 + 2, 3)); // v_cmp_gt_f32 vcc, v2, v3
+    let back_idx = ps_words.len();
+    let rel_words = (loop_hdr_idx as i32) - (back_idx as i32) - 1;
+    ps_words.push(enc_sopp(0x07, (rel_words as i16) as u16)); // s_cbranch_vccnz loop_hdr
+    // Top-level after loop: image_sample (0x20) + image_sample_b (0x25)
+    ps_words.extend_from_slice(&enc_mimg_d16(0x20, 0xF, 1, false, 2, 4, 1, 1));
+    ps_words.extend_from_slice(&enc_mimg_d16(0x25, 0xF, 1, false, 2, 8, 1, 1));
+    ps_words.push(enc_vop2(0x03, 4, 256 + 8, 4));
+    ps_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+    ps_words.push(enc_sopp(0x01, 0));
+
+    let ps_out = translate_and_validate(&ps_words, Rdna2StageOverride::Pixel);
+    assert!(
+        ps_out.wgsl.contains("loop {"),
+        "expected structured loop in WGSL:\n{}",
+        ps_out.wgsl
+    );
+    assert!(
+        !ps_out.wgsl.contains("textureSample(") && !ps_out.wgsl.contains("textureSampleBias("),
+        "post-loop implicit-derivative sampling violates WGSL §16.4 uniformity:\n{}",
+        ps_out.wgsl
+    );
+    assert!(
+        ps_out.wgsl.contains("textureSampleLevel("),
+        "post-loop sampling must lower to textureSampleLevel:\n{}",
+        ps_out.wgsl
+    );
+
+    // 2. Compute shader with a structured loop followed by `s_barrier` (SOPP 0x0A):
+    //    `workgroupBarrier()` MUST NOT be emitted in non-uniform post-loop control flow.
+    let mut cs_words = Vec::new();
+    let cs_loop_idx = cs_words.len();
+    cs_words.push(enc_vop2(0x03, 1, 256 + 1, 0)); // v1 += v0
+    cs_words.push(enc_vopc(0x04, 256 + 1, 0)); // v_cmp_gt_f32 vcc, v1, v0
+    let cs_back_idx = cs_words.len();
+    let cs_rel = (cs_loop_idx as i32) - (cs_back_idx as i32) - 1;
+    cs_words.push(enc_sopp(0x07, (cs_rel as i16) as u16)); // s_cbranch_vccnz cs_loop
+    cs_words.push(enc_sopp(0x0A, 0)); // s_barrier after loop!
+    cs_words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 1, 10, 0x80));
+    cs_words.push(enc_sopp(0x01, 0));
+
+    let cs_out = translate_and_validate(&cs_words, Rdna2StageOverride::Compute);
+    assert!(
+        cs_out.wgsl.contains("loop {"),
+        "expected structured loop in compute WGSL:\n{}",
+        cs_out.wgsl
+    );
+    assert!(
+        !cs_out.wgsl.contains("workgroupBarrier()"),
+        "post-loop s_barrier must not emit workgroupBarrier() in non-uniform CF:\n{}",
+        cs_out.wgsl
+    );
+}
+
+#[test]
+fn s68_default_vs_ps_interstage_interpolation_matches_even_with_v_interp_mov_and_centroid() {
+    // Vertex shader exporting params 0..=4 (always `perspective, center` in `VsOut`).
+    let mut vs_words = Vec::new();
+    vs_words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [0, 0, 0, 0])); // pos0
+    for param in 0..5u8 {
+        vs_words.extend_from_slice(&enc_exp(32 + param, 0xF, false, param == 4, false, [0, 0, 0, 0]));
+    }
+    vs_words.push(enc_sopp(0x01, 0));
+    let vs_out = translate_and_validate(&vs_words, Rdna2StageOverride::Vertex);
+
+    // Fragment shader using PERSP_CENTER (v0/v1), PERSP_CENTROID (v2/v3), LINEAR_CENTER (v4/v5),
+    // LINEAR_CENTROID (v6/v7), and FLAT (`v_interp_mov_f32`, op=2) across attrs 0..=4.
+    let mut ps_words = Vec::new();
+    ps_words.push(enc_vintrp(0, 10, 0, 0, 0));
+    ps_words.push(enc_vintrp(1, 10, 0, 0, 1));
+    ps_words.push(enc_vintrp(0, 11, 1, 0, 2));
+    ps_words.push(enc_vintrp(1, 11, 1, 0, 3));
+    ps_words.push(enc_vintrp(0, 12, 2, 0, 4));
+    ps_words.push(enc_vintrp(1, 12, 2, 0, 5));
+    ps_words.push(enc_vintrp(0, 13, 3, 0, 6));
+    ps_words.push(enc_vintrp(1, 13, 3, 0, 7));
+    ps_words.push(enc_vintrp(2, 14, 4, 0, 2)); // v_interp_mov_f32 (flat in RDNA2)
+    ps_words.push(enc_vop2(0x03, 10, 256 + 14, 10));
+    ps_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [10, 11, 12, 13]));
+    ps_words.push(enc_sopp(0x01, 0));
+    let ps_out = translate_and_validate(&ps_words, Rdna2StageOverride::Pixel);
+
+    // Under default WebGPU translation options, FragIn must NEVER emit `@interpolate(flat)`,
+    // `@interpolate(linear)`, or `centroid` so every VS+PS pair passes Dawn `CreateRenderPipeline`.
+    assert!(
+        !ps_out.wgsl.contains("@interpolate(flat)")
+            && !ps_out.wgsl.contains("@interpolate(linear")
+            && !ps_out.wgsl.contains("centroid"),
+        "default FragIn must match VsOut default perspective/center interpolation:\n{}",
+        ps_out.wgsl
+    );
+
+    // Verify exact Naga struct-member Binding::Location parity between VsOut and FragIn.
+    let vs_mod = naga::front::wgsl::parse_str(&vs_out.wgsl).unwrap();
+    let ps_mod = naga::front::wgsl::parse_str(&ps_out.wgsl).unwrap();
+    let collect_loc_interps = |m: &naga::Module, struct_name: &str| {
+        let mut out = std::collections::BTreeMap::new();
+        for (_, ty) in m.types.iter() {
+            if ty.name.as_deref() == Some(struct_name)
+                && let naga::TypeInner::Struct { members, .. } = &ty.inner
+            {
+                for mem in members {
+                    if let Some(naga::Binding::Location {
+                        location,
+                        interpolation,
+                        sampling,
+                        ..
+                    }) = mem.binding
+                    {
+                        out.insert(location, (interpolation, sampling));
+                    }
+                }
+            }
+        }
+        out
+    };
+    let vs_locs = collect_loc_interps(&vs_mod, "VsOut");
+    let ps_locs = collect_loc_interps(&ps_mod, "FragIn");
+    assert_eq!(ps_locs.len(), 5);
+    for (loc, ps_interp) in &ps_locs {
+        assert_eq!(
+            vs_locs.get(loc),
+            Some(ps_interp),
+            "VS↔PS inter-stage interpolation mismatch at @location({loc}): vs={:?} ps={:?}",
+            vs_locs.get(loc),
+            ps_interp
+        );
+    }
+}
