@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 #include "os/vmem_backing.h"
 
@@ -25,6 +27,21 @@ constexpr bool kGuardLowAddresses = true;
 #endif
 
 std::atomic<ArenaObserver> g_arena_observer{nullptr};
+
+thread_local int t_diagnostic_reads = 0;
+
+// DiagnosticReads: the lock may be held by this very thread (a fault inside a held view), where
+// waiting can never succeed, or briefly by another one; give up after a short bounded wait.
+bool try_lock_bounded(std::unique_lock<std::mutex>& lock) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    do {
+        if (lock.try_lock()) {
+            return true;
+        }
+        std::this_thread::yield();
+    } while (std::chrono::steady_clock::now() < deadline);
+    return false;
+}
 
 void notify(const VirtualMemoryArena& arena,
             ArenaEvent event,
@@ -1124,6 +1141,10 @@ MemoryBasicInfo VirtualMemoryArena::query(uint64_t addr) const {
     return free_info;
 }
 
+VirtualMemoryArena::DiagnosticReads::DiagnosticReads() { ++t_diagnostic_reads; }
+VirtualMemoryArena::DiagnosticReads::~DiagnosticReads() { --t_diagnostic_reads; }
+bool VirtualMemoryArena::DiagnosticReads::active() { return t_diagnostic_reads > 0; }
+
 bool VirtualMemoryArena::read(uint64_t addr, void* dst, size_t len) const {
     if (len == 0) {
         return true;
@@ -1131,7 +1152,14 @@ bool VirtualMemoryArena::read(uint64_t addr, void* dst, size_t len) const {
     if (dst == nullptr) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+    if (DiagnosticReads::active()) [[unlikely]] {
+        if (!try_lock_bounded(lock)) {
+            return false;
+        }
+    } else {
+        lock.lock();
+    }
     if (!pages_allow_locked(addr, len, false)) {
         return false;
     }
