@@ -6681,7 +6681,7 @@ void test_compare_shadow_pages() {
 // window's write marks: the first flush compares everything; later ones only pages of slots marked
 // since, so an unmarked write is not seen (lifted code and host writers always mark) unless the
 // marks are verified, which compares the rest too and counts the miss.
-void test_window_write_marks_flush() {
+void test_window_write_marks_flush(bool fragmented = false) {
     namespace gw = playgta6::os::guest_window;
     namespace xw = playgta6::os::xmem_windows;
     namespace sc = playgta6::os::scarlett;
@@ -6702,7 +6702,11 @@ void test_window_write_marks_flush() {
     uint64_t pfn[2] = {};
     CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
     const uint64_t slots[] = {C + 4 * k64K, C + 5 * k64K};
-    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 2, pfn) == 1);
+    const uint64_t mapped_pfn[] = {pfn[fragmented ? 1 : 0], pfn[fragmented ? 0 : 1]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 2, mapped_pfn) == 1);
+    if (fragmented) {
+        CHECK(gw::contiguous(slots[0], 2 * k64K) == nullptr);
+    }
     {
         Fixture fx;
         Scene scene(fx);
@@ -6778,7 +6782,7 @@ void test_window_write_marks_flush() {
         CHECK(res->shadow_resident_bytes() == 3 * 4096);
         gw::set_write_marks_verified(false);
         // Remapping a slot marks it: other bytes appear there and are uploaded.
-        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&slots[0], 1, &pfn[1]) == 1);
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&slots[0], 1, &mapped_pfn[1]) == 1);
         mark = fx.captured.size();
         scene.execute({list});
         CHECK(!writes(mark).empty());
@@ -6808,6 +6812,42 @@ void test_window_write_marks_flush() {
             CHECK(s.shadow_bytes >= 2 * k64K + 0x1000 && s.shadow_resident_bytes <= s.shadow_bytes);
         }
         fx.vcall(buf2, Slot::Release);
+        if (fragmented) {
+            // Unaligned CPU origin and a short last shadow page in a fragmented range.
+            const uint64_t short_size = 2 * k64K - 246;
+            const uint64_t buf3 = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                {I(G + 4 * k64K + 123), I(put(buffer_desc(short_size))), I(0), I(0)},
+                dg::IID_ID3D12Resource, &result);
+            CHECK(result == 0);
+            scene.execute({list});
+            CHECK(com::write_guest(C + 4 * k64K + 123 + short_size - 1, uint8_t{77}));
+            mark = fx.captured.size();
+            scene.execute({list});
+            const uint32_t id3 = object_of<dg::Resource>(buf3)->id();
+            bool tail_uploaded = false;
+            for (const Packet& p : packets_since(fx, mark)) {
+                if (p.opcode != GpuOpcode::WriteBuffer) continue;
+                const auto w = payload_as<GpuWriteBufferPayload>(p);
+                if (w.id != id3) continue;
+                CHECK(w.dst_offset == (short_size / 4096) * 4096);
+                CHECK(w.data_len == short_size % 4096);
+                CHECK(p.payload.back() == 77);
+                tail_uploaded = true;
+            }
+            CHECK(tail_uploaded);
+            fx.vcall(buf3, Slot::Release);
+            // An unreadable candidate slot retains its uploaded shadow. Another mapped slot
+            // must still update; no uninitialized sparse staging may escape in either packet.
+            CHECK(gw::unmap_slot(slots[1]));
+            mark = fx.captured.size();
+            scene.execute({list});
+            CHECK(writes(mark).empty());
+            const uint32_t next = 42;
+            CHECK(com::write_guest(slots[0] + 0x200, next));
+            mark = fx.captured.size();
+            scene.execute({list});
+            CHECK((writes(mark) == std::vector<uint32_t>{0}));
+        }
         fx.vcall(buf, Slot::Release);
         fx.vcall(list, Slot::Release);
         scene.release_all();
@@ -9982,6 +10022,7 @@ int main() {
     test_same_bytes();
     test_compare_shadow_pages();
     test_window_write_marks_flush();
+    test_window_write_marks_flush(true);
     test_window_texture_sync_markpass_and_inplace_hash();
     test_g72_non256_linear_texture_single_pass_and_lazy_pad();
     test_g73_console_linear_direct_zero_copy_upload();
