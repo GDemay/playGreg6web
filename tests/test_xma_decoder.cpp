@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <string>
+#include <thread>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1001,6 +1003,64 @@ void test_wmapro_mono_and_subframe_layouts() {
     }
 }
 
+void test_wmapro_concurrent_first_decode() {
+    constexpr uint32_t workers = 8;
+    std::array<x::Frame, workers> frames;
+    std::array<uint32_t, workers> rates{}, channel_counts{};
+    for (uint32_t i = 0; i < workers; ++i) {
+        const uint32_t n = 64u << (i % 4);
+        rates[i] = x::kSampleRates[i % 4];
+        channel_counts[i] = 1 + i / 4;
+        std::array<std::vector<float>, 2> signal;
+        for (uint32_t c = 0; c < channel_counts[i]; ++c) {
+            signal[c].resize(3 * x::kFrameSamples);
+            for (size_t p = 0; p < signal[c].size(); ++p) {
+                signal[c][p] = 9000.0f * static_cast<float>(std::sin(2.0 * kTestPi * (611 + c * 317) * p / rates[i]));
+            }
+        }
+        EncodeFrameOpts options;
+        options.channels = channel_counts[i];
+        options.sample_rate = rates[i];
+        options.subframe_lens.assign(x::kFrameSamples / n, n);
+        options.prev_subframe_len = options.next_frame_first_len = n;
+        options.exercise_vec_stages = true;
+        frames[i] = encode_wmapro_frame(signal, x::kFrameSamples, options);
+    }
+    std::array<std::vector<int16_t>, workers> concurrent;
+    std::array<bool, workers> good{};
+    std::atomic<uint32_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    for (uint32_t i = 0; i < workers; ++i) {
+        threads.emplace_back([&, i] {
+            auto decoder = x::make_wmapro_decoder();
+            concurrent[i].resize(3 * x::kFrameSamples * channel_counts[i]);
+            ready.fetch_add(1);
+            while (!start.load()) std::this_thread::yield();
+            good[i] = decoder->decode(frames[i], channel_counts[i], rates[i], concurrent[i].data());
+            good[i] = decoder->decode(frames[i], channel_counts[i], rates[i],
+                concurrent[i].data() + x::kFrameSamples * channel_counts[i]) && good[i];
+            decoder->reset();
+            good[i] = decoder->decode(frames[i], channel_counts[i], rates[i],
+                concurrent[i].data() + 2 * x::kFrameSamples * channel_counts[i]) && good[i];
+        });
+    }
+    while (ready.load() != workers) std::this_thread::yield();
+    start.store(true);
+    for (auto& thread : threads) thread.join();
+    for (uint32_t i = 0; i < workers; ++i) {
+        CHECK(good[i]);
+        auto decoder = x::make_wmapro_decoder();
+        std::vector<int16_t> serial(concurrent[i].size());
+        CHECK(decoder->decode(frames[i], channel_counts[i], rates[i], serial.data()));
+        CHECK(decoder->decode(frames[i], channel_counts[i], rates[i], serial.data() + x::kFrameSamples * channel_counts[i]));
+        decoder->reset();
+        CHECK(decoder->decode(frames[i], channel_counts[i], rates[i], serial.data() + 2 * x::kFrameSamples * channel_counts[i]));
+        CHECK(serial == concurrent[i]);
+    }
+}
+
+
 void test_wmapro_stereo_decorrelation_and_pump() {
     constexpr uint32_t kFrames = 5u;
     constexpr uint32_t kTotalSamples = (kFrames + 1u) * x::kFrameSamples;
@@ -1356,6 +1416,7 @@ int benchmark_wmapro(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench-wmapro") return benchmark_wmapro(argc, argv);
+    test_wmapro_concurrent_first_decode();
     test_packet_header();
     test_frame_walk();
     test_padding_and_skip();
