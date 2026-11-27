@@ -199,6 +199,10 @@ public:
     // expanded) and appends their slot numbers to `slots`; every later take() of this pass answers
     // from that scan. False (nothing taken) with the window off.
     bool take_dirty(std::vector<uint64_t>* slots);
+    // Allocation-free query of an existing take_dirty scan (does not take or clear marks).
+    // True only when at most half of the range's bytes were in marked slots. False before
+    // a scan or for an invalid range; unaligned edge slots count only their covered bytes.
+    bool at_most_half_marked(uint64_t va, size_t len) const;
 
 private:
     std::vector<uint32_t> pass_of_;  // per slot: the pass that took its mark (0: none yet)

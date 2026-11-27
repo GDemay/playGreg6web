@@ -3854,10 +3854,63 @@ uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkP
         return 0;
     }
     const uint64_t size = shadow_size_;
+    const bool verify_marks = os::guest_window::write_marks_verified();
     // Held for the whole compare / upload-copy below so a concurrent decommit cannot fault it.
     const com::GuestRangeView view(cpu_va_, static_cast<size_t>(size));
     const uint8_t* live = view.data();
     std::vector<uint8_t> copy;
+    std::unique_ptr<uint8_t[]> sparse_copy;
+    // Keep the bulk staging allocation alive past the small candidate bitmap, as before:
+    // their destruction order affects allocator reuse on subsequent dense flushes.
+    std::vector<bool> candidate;
+    bool window_candidates = false;
+    bool window_prepared = false;
+    auto prepare_window = [&] {
+        window_prepared = true;
+        std::vector<uint64_t> slots;
+        const bool marked = marks != nullptr ? marks->take(cpu_va_, static_cast<size_t>(size), &slots)
+                                             : os::guest_window::take_written(cpu_va_, static_cast<size_t>(size), &slots);
+        if (marked && window_marked_) {
+            candidate.assign(static_cast<size_t>((size + kShadowPage - 1) / kShadowPage), false);
+            for (uint64_t off : slots) {
+                const uint64_t slot_end = ((cpu_va_ + off) | (os::guest_window::kSlotBytes - 1)) + 1 - cpu_va_;
+                const uint64_t hi = std::min<uint64_t>(size, slot_end);
+                for (uint64_t page = off / kShadowPage * kShadowPage; page < hi; page += kShadowPage) {
+                    candidate[static_cast<size_t>(page / kShadowPage)] = true;
+                }
+            }
+            window_candidates = true;
+        }
+        window_marked_ = marked;
+    };
+    if (live == nullptr && window_marked_ && !verify_marks && marks != nullptr &&
+        marks->at_most_half_marked(cpu_va_, static_cast<size_t>(size))) {
+        prepare_window();
+        if (window_candidates && !verify_marks &&
+            std::find(candidate.begin(), candidate.end(), false) != candidate.end()) {
+            // Keep the bulk copy when every page is a candidate. Otherwise only candidate
+            // pages are subsequently read or uploaded. Avoid initializing and
+            // copying an entire fragmented buffer for a single dirty window slot.
+            sparse_copy = std::make_unique_for_overwrite<uint8_t[]>(static_cast<size_t>(size));
+            for (size_t i = 0; i < candidate.size(); ++i) {
+                if (!candidate[i]) {
+                    continue;
+                }
+                const uint64_t off = i * kShadowPage;
+                const size_t n = static_cast<size_t>(std::min(kShadowPage, size - off));
+                uint8_t* dst = sparse_copy.get() + off;
+                const uint8_t* shadow = shadow_chunks_[off / kShadowChunk].get();
+                if (shadow != nullptr) {
+                    std::memcpy(dst, shadow + off % kShadowChunk, n);
+                } else {
+                    std::memset(dst, 0, n);
+                }
+                // Unreadable pages retain the prior shadow, including any readable prefix.
+                com::read_guest(cpu_va_ + off, dst, n);
+            }
+            live = sparse_copy.get();
+        }
+    }
     if (live == nullptr) {
         // Not mapped in one piece (e.g. an alias-window buffer whose pages are mapped one by one):
         // unreadable pages keep their shadow contents, i.e. count as unchanged.
@@ -3881,9 +3934,8 @@ uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkP
     // from the shadow. The tracking is reset before the comparison, so a write racing with it is
     // reported again at the next flush.
     std::vector<uint64_t> written;
-    const bool tracked = copy.empty() && os::take_written_pages(live, size, &write_cursor_, &written);
+    const bool tracked = sparse_copy == nullptr && copy.empty() && os::take_written_pages(live, size, &write_cursor_, &written);
     const uint64_t skew = reinterpret_cast<uintptr_t>(live) & (os::kWrittenPageSize - 1);
-    std::vector<bool> candidate;
     if (tracked && write_tracked_) {
         candidate.assign(static_cast<size_t>((size + kShadowPage - 1) / kShadowPage), false);
         for (uint64_t off : written) {
@@ -3896,30 +3948,13 @@ uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkP
     }
     write_tracked_ = tracked;
     tracked_host_ = tracked ? reinterpret_cast<uintptr_t>(live) : 0;
-    // O37: the translated window keeps write marks per 64 KiB slot instead (the browser has no OS
-    // write watch): the same protocol, with the slot marks taken (cleared) before the comparison
-    // and the first flush after the marks became usable comparing everything.
-    bool window_candidates = false;
-    if (!tracked && os::guest_window::translated(cpu_va_)) {
-        std::vector<uint64_t> slots;
-        const bool marked = marks != nullptr ? marks->take(cpu_va_, static_cast<size_t>(size), &slots)
-                                             : os::guest_window::take_written(cpu_va_, static_cast<size_t>(size), &slots);
-        if (marked && window_marked_) {
-            candidate.assign(static_cast<size_t>((size + kShadowPage - 1) / kShadowPage), false);
-            for (uint64_t off : slots) {
-                const uint64_t slot_end = ((cpu_va_ + off) | (os::guest_window::kSlotBytes - 1)) + 1 - cpu_va_;
-                const uint64_t hi = std::min<uint64_t>(size, slot_end);
-                for (uint64_t page = off / kShadowPage * kShadowPage; page < hi; page += kShadowPage) {
-                    candidate[static_cast<size_t>(page / kShadowPage)] = true;
-                }
-            }
-            window_candidates = true;
-        }
-        window_marked_ = marked;
+    // A fragmented view already took the shared marks before staging its candidate pages.
+    if (!tracked && !window_prepared && os::guest_window::translated(cpu_va_)) {
+        prepare_window();
     }
     // Verification: compare the unmarked pages too and count changes found there (a writer that
     // did not mark); such a page is uploaded all the same.
-    const bool verify = window_candidates && os::guest_window::write_marks_verified();
+    const bool verify = window_candidates && verify_marks;
     uint64_t run_start = 0;
     bool in_run = false;
     uint64_t uploaded = 0;
