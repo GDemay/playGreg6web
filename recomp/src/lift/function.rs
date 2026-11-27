@@ -14,8 +14,8 @@ use iced_x86::{
 
 use super::{
     GUEST_BASE_SYMBOL, GUEST_STATE_TYPE, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP,
-    HELPER_UNIMPLEMENTED, LiftError, LiftedFunction, MemoryModel, Support, UnsupportedInstruction,
-    function_symbol,
+    HELPER_UNIMPLEMENTED, LiftError, LiftedFunction, MemoryModel, Support, TBAA_GUEST_TAG,
+    TBAA_STATE_TAG, UnsupportedInstruction, function_symbol,
 };
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
@@ -498,6 +498,49 @@ fn is_pure_definition(rhs: &str) -> bool {
 /// state syncs around calls reload every register and flag the callee may write, and the load
 /// forwarding plus [`drop_overwritten_slot_stores`] then leave the reloads of values the caller
 /// overwrites before reading (typically the flags after a call) without a single use.
+/// Appends [`TBAA_STATE_TAG`] to every load/store of a `%state.*` field and [`TBAA_GUEST_TAG`]
+/// to every load/store through an `inttoptr` result (a guest pointer), see
+/// [`super::TBAA_METADATA`]. With both classes tagged LLVM drops state stores of values that are
+/// still in the state and keeps state values in registers across guest stores, which removes
+/// about 5% of the wasm code. Every other access stays untagged and aliases everything.
+fn tag_state_and_guest_accesses(ir: &str) -> String {
+    let mut guest_ptrs: BTreeSet<&str> = BTreeSet::new();
+    let mut out = String::with_capacity(ir.len() + ir.len() / 16);
+    for line in ir.lines() {
+        out.push_str(line);
+        let code = line.trim_start();
+        let rhs = match code.split_once(" = ") {
+            Some((lhs, rhs)) if lhs.starts_with('%') && !lhs.contains(' ') => {
+                if rhs.starts_with("inttoptr ") {
+                    guest_ptrs.insert(&lhs[1..]);
+                }
+                rhs
+            }
+            _ => code,
+        };
+        if (rhs.starts_with("load ") || rhs.starts_with("store "))
+            && !rhs.contains(" volatile ")
+            && !rhs.contains("!tbaa")
+            && let Some((_, after)) = rhs.split_once(", ptr %")
+        {
+            let ptr = &after[..after.find([' ', ',']).unwrap_or(after.len())];
+            let tag = if ptr.starts_with("state.") {
+                Some(TBAA_STATE_TAG)
+            } else if guest_ptrs.contains(ptr) {
+                Some(TBAA_GUEST_TAG)
+            } else {
+                None
+            };
+            if let Some(tag) = tag {
+                out.push_str(", !tbaa ");
+                out.push_str(tag);
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn drop_unused_values(ir: &str) -> String {
     let lines: Vec<&str> = ir.lines().collect();
     let mut defs: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1118,6 +1161,7 @@ impl FunctionLifter<'_> {
         ir.push_str("}\n");
         let ir = drop_overwritten_slot_stores(&ir);
         let ir = drop_unused_values(&ir);
+        let ir = tag_state_and_guest_accesses(&ir);
 
         // R65b: tag tiny internal true-leaf functions (no calls, tail calls, unwind handlers,
         // traps, or unsupported ops, and `<= TINY_LEAF_MAX_INSNS` x86 instructions) for

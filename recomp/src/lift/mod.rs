@@ -220,6 +220,25 @@ pub const LIFTED_FUNCTION_ATTRIBUTES: &str = "\"target-features\"=\"+simd128\"";
 /// compiler already left only the loads it could not hoist inside its loops.
 pub const LOOP_BARRIER: &str = "fence syncscope(\"singlethread\") acquire";
 
+/// TBAA access tag on every load/store of a `%state.*` field (see [`TBAA_METADATA`]).
+pub const TBAA_STATE_TAG: &str = "!9002";
+/// TBAA access tag on every load/store through a guest pointer (an `inttoptr` result).
+pub const TBAA_GUEST_TAG: &str = "!9004";
+/// Module-level TBAA nodes behind [`TBAA_STATE_TAG`] and [`TBAA_GUEST_TAG`]: two sibling scalar
+/// types under one root, so LLVM knows a guest memory access never touches the guest CPU state.
+/// `%state` is `noalias`, but it is passed to every call, so without these tags each guest store
+/// clobbers every `%state` field: a register loaded at entry and stored back unchanged before a
+/// call (`store (load %state.gprN), %state.gprN`) could not be dropped. The state is a host
+/// object (`Pg6GuestThread`), never inside the guest-addressable arena. Accesses without a tag
+/// (allocas, the window table, helpers) still alias everything. Numbered from 9000 so no other
+/// numbered metadata can collide.
+pub const TBAA_METADATA: &str = "!9000 = !{!\"playgta6 tbaa\"}
+!9001 = !{!\"playgta6 guest state\", !9000, i64 0}
+!9002 = !{!9001, !9001, i64 0}
+!9003 = !{!\"playgta6 guest memory\", !9000, i64 0}
+!9004 = !{!9003, !9003, i64 0}
+";
+
 /// [`LIFTED_FUNCTION_ATTRIBUTES`] with extra target features appended.
 fn module_attributes(extra: &str) -> String {
     let base = LIFTED_FUNCTION_ATTRIBUTES.trim_end_matches('"');
@@ -794,6 +813,10 @@ pub fn emit_module_with_dispatch(
     }
     out.push('\n');
     let _ = writeln!(out, "attributes #0 = {{ {attributes} }}");
+    if out.contains(", !tbaa !") {
+        out.push('\n');
+        out.push_str(TBAA_METADATA);
+    }
     Ok(out)
 }
 
