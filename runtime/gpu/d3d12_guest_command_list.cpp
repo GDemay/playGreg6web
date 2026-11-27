@@ -45,6 +45,8 @@ const char* work_name(Work w) {
     case Work::DispatchesDroppedByBridge: return "dispatches_dropped_by_bridge";
     case Work::IndirectExecutionsSkipped: return "indirect_executions_skipped";
     case Work::IndirectExecutionsEmitted: return "indirect_executions_emitted";
+    case Work::IndirectVertexIndexArgsSkipped: return "indirect_vertex_index_args_skipped";
+    case Work::IndirectRootViewArgsSkipped: return "indirect_root_view_args_skipped";
     case Work::TextureUploads: return "texture_uploads";
     case Work::TextureSyncViewSkips: return "texture_sync_view_skips";
     case Work::TextureSyncViewTracked: return "texture_sync_view_tracked";
