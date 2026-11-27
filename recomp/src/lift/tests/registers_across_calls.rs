@@ -200,7 +200,7 @@ fn function_ir(ir: &str, va: u64) -> &str {
 /// GPR indices whose state slot `text` addresses.
 fn gprs(text: &str) -> Vec<usize> {
     (0..16)
-        .filter(|i| text.contains(&format!("ptr %state.gpr{i}\n")))
+        .filter(|i| text.contains(&format!("ptr %state.gpr{i}, !tbaa !9002\n")))
         .collect()
 }
 

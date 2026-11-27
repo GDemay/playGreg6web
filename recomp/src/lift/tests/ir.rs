@@ -12,8 +12,8 @@ use super::{
 use crate::cfg::{self, Edge, Terminator};
 use crate::lift::{
     GUEST_BASE_SYMBOL, GuestBase, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP,
-    HELPER_PROBE_HIT, HELPER_UNIMPLEMENTED, LiftError, WASM64_TRIPLE, emit_module, lift_function, lift_module,
-    lift_module_with,
+    HELPER_PROBE_HIT, HELPER_UNIMPLEMENTED, LiftError, TBAA_GUEST_TAG, TBAA_METADATA,
+    TBAA_STATE_TAG, WASM64_TRIPLE, emit_module, lift_function, lift_module, lift_module_with,
 };
 
 /// Instructions of the LLVM block `label` (up to the next label or the end of the function).
@@ -39,6 +39,53 @@ fn flag_stores(body: &str, flag: &str) -> usize {
 
 fn trap_call(va: u64) -> String {
     format!("call void @{HELPER_TRAP}(ptr %state, i64 {va})\n  unreachable")
+}
+
+#[test]
+fn state_and_guest_accesses_carry_disjoint_tbaa_tags() {
+    let func = asm_function(0x1000, |a| {
+        a.mov(qword_ptr(rcx), rax)?;
+        a.mov(rdx, qword_ptr(rcx + 8))?;
+        a.add(rdx, rax)?;
+        a.ret()
+    });
+    let module = lift_module([&func]).expect("lifts");
+    let ir = &module.ir;
+    let accesses: Vec<&str> = ir
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| {
+            let rhs = l.split_once(" = ").map_or(*l, |(_, r)| r);
+            rhs.starts_with("load ") || rhs.starts_with("store ")
+        })
+        .collect();
+    let tagged = |tag: &str, pred: &dyn Fn(&str) -> bool| {
+        let hits: Vec<&&str> = accesses.iter().filter(|l| pred(l)).collect();
+        assert!(!hits.is_empty(), "no access of this class:\n{ir}");
+        for l in hits {
+            assert!(l.ends_with(&format!(", !tbaa {tag}")), "{l}\n{ir}");
+        }
+    };
+    // Guest CPU state fields (entry loads, exit stores).
+    tagged(TBAA_STATE_TAG, &|l| l.contains(", ptr %state."));
+    // Guest memory through `inttoptr` pointers: one store, one load.
+    let guest_ptrs: Vec<String> = ir
+        .lines()
+        .filter_map(|l| l.trim_start().split_once(" = inttoptr "))
+        .map(|(lhs, _)| format!(", ptr {lhs}, "))
+        .collect();
+    assert!(guest_ptrs.len() >= 2, "{ir}");
+    tagged(TBAA_GUEST_TAG, &|l| guest_ptrs.iter().any(|p| l.contains(p.as_str())));
+    // Register/flag allocas and everything else stay untagged (alias everything).
+    for l in accesses.iter().filter(|l| l.contains(", ptr %r") || l.contains(", ptr %cf")) {
+        assert!(!l.contains("!tbaa"), "{l}\n{ir}");
+    }
+    // The tags resolve to two sibling types under one root, defined once per module.
+    assert_eq!(ir.matches(TBAA_METADATA).count(), 1, "{ir}");
+    assert!(ir.ends_with(TBAA_METADATA), "{ir}");
+    for tag in [TBAA_STATE_TAG, TBAA_GUEST_TAG] {
+        assert_eq!(ir.matches(&format!("\n{tag} = !{{")).count(), 1, "{tag}\n{ir}");
+    }
 }
 
 #[test]
@@ -677,7 +724,7 @@ fn flags_overwritten_before_any_reader_are_not_materialised() {
     assert!(!ir.contains("@__playgta6_umul128("), "{ir}");
     // Every flag still reaches the state at the return.
     for flag in 0..6 {
-        assert!(ir.contains(&format!("ptr %state.flag{flag}\n")), "{ir}");
+        assert!(ir.contains(&format!("ptr %state.flag{flag}, !tbaa !9002\n")), "{ir}");
     }
 }
 
@@ -710,7 +757,7 @@ fn register_and_flag_allocas_are_forwarded_within_a_block() {
     assert_eq!(stores("rsp"), 1, "{ir}");
     assert_eq!(flag_stores(&body, "cf"), 1, "{ir}");
     // The final values still reach the state.
-    assert!(ir.contains("ptr %state.gpr0\n"), "{ir}");
+    assert!(ir.contains("ptr %state.gpr0, !tbaa !9002\n"), "{ir}");
 }
 
 #[test]
@@ -739,7 +786,7 @@ fn state_pointers_are_computed_once_in_the_entry_block() {
         assert!(ir.find(&def).unwrap() < entry_end, "{slot}:\n{ir}");
         assert!(
             ir[entry_end..]
-                .matches(&format!("ptr %state.{slot}\n"))
+                .matches(&format!("ptr %state.{slot}, !tbaa !9002\n"))
                 .count()
                 >= 2,
             "{slot}:\n{ir}"
@@ -1185,7 +1232,7 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
     // O37/R57 guarded dirty mark (1 monotonic load + 1 cold release store) + outlined cold
     // slow_store helpers for the boundary-crossing fallback.
     assert_eq!(
-        fn_ir.matches(", align 1\n").count(),
+        fn_ir.matches(", align 1\n").count() + fn_ir.matches(", align 1, !tbaa !").count(),
         6,
         "2 loads + 2 coalesced stores + 1 mark load + 1 mark store = 6 align-1 accesses total:\n{fn_ir}"
     );
@@ -1394,7 +1441,7 @@ fn shard_dispatch_emits_switch_internal_linkage_and_empty_shard_trap() {
 fn guest_loads(func: &cfg::Function) -> usize {
     let ir = lift_function(func).expect("lifts").ir;
     ir.lines()
-        .filter(|l| l.contains(" = load ") && l.ends_with("align 1"))
+        .filter(|l| l.contains(" = load ") && l.ends_with("align 1, !tbaa !9004"))
         .count()
 }
 
@@ -1457,7 +1504,7 @@ fn reloads_after_a_call_that_nothing_reads_are_dropped() {
 fn r65a_entry_dead_gpr_and_flag_load_elision() {
     let has_entry_gpr = |ir: &str, idx: usize| -> bool {
         let entry = block_text(ir, "entry");
-        entry.contains(&format!("load i64, ptr %state.gpr{idx}\n"))
+        entry.contains(&format!("load i64, ptr %state.gpr{idx}, !tbaa !9002\n"))
     };
     let has_entry_flag = |ir: &str, idx: usize| -> bool {
         let entry = block_text(ir, "entry");
@@ -1492,7 +1539,7 @@ fn r65a_entry_dead_gpr_and_flag_load_elision() {
             "dead entry flag{f} load must be elided:\n{ir}"
         );
         assert!(
-            ir.contains(&format!("ptr %state.flag{f}\n")),
+            ir.contains(&format!("ptr %state.flag{f}, !tbaa !9002\n")),
             "exit sync_out store must remain for flag{f}:\n{ir}"
         );
     }
@@ -1503,7 +1550,7 @@ fn r65a_entry_dead_gpr_and_flag_load_elision() {
             "dead entry gpr{idx} load must be elided:\n{ir}"
         );
         assert!(
-            ir.contains(&format!("ptr %state.gpr{idx}\n")),
+            ir.contains(&format!("ptr %state.gpr{idx}, !tbaa !9002\n")),
             "exit sync_out store must remain for gpr{idx}:\n{ir}"
         );
     }
