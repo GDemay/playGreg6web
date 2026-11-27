@@ -3883,8 +3883,10 @@ uint64_t Resource::flush_shadow(CommandEncoder& encoder, os::guest_window::MarkP
     std::unique_ptr<uint8_t[]> sparse_copy;
     if (live == nullptr && os::guest_window::translated(cpu_va_)) {
         prepare_window();
-        if (window_candidates && !verify_marks) {
-            // Only candidate pages are subsequently read or uploaded. Avoid initializing and
+        if (window_candidates && !verify_marks &&
+            std::find(candidate.begin(), candidate.end(), false) != candidate.end()) {
+            // Keep the bulk copy when every page is a candidate. Otherwise only candidate
+            // pages are subsequently read or uploaded. Avoid initializing and
             // copying an entire fragmented buffer for a single dirty window slot.
             sparse_copy = std::make_unique_for_overwrite<uint8_t[]>(static_cast<size_t>(size));
             for (size_t i = 0; i < candidate.size(); ++i) {

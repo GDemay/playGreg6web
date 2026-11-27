@@ -17,10 +17,12 @@ namespace gw=os::guest_window;
 int main(int argc,char** argv) {
  if(argc!=4)return 2;
  const size_t mapped_bytes=std::strtoull(argv[1],nullptr,0)*1024*1024;
+ const bool dense_resident=std::strcmp(argv[3],"fragmented-dense-resident")==0;
+ const bool dense=dense_resident||std::strcmp(argv[3],"fragmented-dense")==0;
  const bool unaligned=std::strcmp(argv[3],"fragmented-unaligned")==0;
  const size_t bytes=mapped_bytes-(unaligned?246:0);
  const size_t frames=std::strtoull(argv[2],nullptr,0);
- const bool scattered=unaligned||std::strcmp(argv[3],"fragmented")==0;
+ const bool scattered=dense||unaligned||std::strcmp(argv[3],"fragmented")==0;
  if(!mapped_bytes||mapped_bytes%gw::kSlotBytes||!frames||(!scattered&&std::strcmp(argv[3],"contiguous")))return 2;
  try {
  os::set_write_tracking(false); gw::reset_for_testing();gw::set_enabled(true);
@@ -38,20 +40,30 @@ int main(int argc,char** argv) {
  auto r=com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),dg::device_ref(dev.get()),d,std::move(place),0);
  if(!r||!r->initialize()||r->cpu_address()!=cpu)throw std::runtime_error("buffer init failed");
  auto flush=[&](gpu::CommandEncoder& e){dev->begin_submission();dev->flush_cpu_buffers(e);dev->end_submission();};
- {gpu::CommandEncoder e;flush(e);if(e.size())throw std::runtime_error("zero initial buffer uploaded");}
+ if(dense_resident)for(size_t i=0;i<bytes;i+=4096)if(!com::write_guest(cpu+i,uint32_t{0xA5}))throw std::runtime_error("warm dense write failed");
+ {gpu::CommandEncoder e;flush(e);if(e.size()&&!dense_resident)throw std::runtime_error("zero initial buffer uploaded");}
  double ms=0;uint64_t digest=14695981039346656037ull;
  const auto c0=dg::work_total(dg::Work::ShadowComparedBytes);
  for(size_t f=0;f<frames;++f){
   const size_t at=(f%(bytes/gw::kSlotBytes))*gw::kSlotBytes+4096;
   const uint32_t value=static_cast<uint32_t>(f+1);
-  if(!com::write_guest(cpu+at,value))throw std::runtime_error("write failed");
+  if(dense){for(size_t i=0;i<bytes;i+=4096)if(!com::write_guest(cpu+i,value))throw std::runtime_error("dense write failed");}
+  else if(!com::write_guest(cpu+at,value))throw std::runtime_error("write failed");
   gpu::CommandEncoder e;const auto t=std::chrono::steady_clock::now();flush(e);
   ms+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t).count();
-  using namespace playgta6;GpuPacketHeader h{};GpuWriteBufferPayload w{};
-  if(e.size()!=sizeof(h)+sizeof(w)+4096)throw std::runtime_error("wrong packet size");
-  std::memcpy(&h,e.data(),sizeof(h));std::memcpy(&w,e.data()+sizeof(h),sizeof(w));
-  if(h.opcode!=static_cast<uint16_t>(GpuOpcode::WriteBuffer)||w.id!=r->id()||w.dst_offset!=at||w.data_len!=4096)throw std::runtime_error("wrong packet");
-  for(size_t k=0;k<4096;k+=4){uint32_t word;std::memcpy(&word,e.data()+sizeof(h)+sizeof(w)+k,4);if(word!=(k?0:value))throw std::runtime_error("wrong payload");}
+  using namespace playgta6;
+  size_t cursor=0, uploaded=0;
+  const size_t expected_bytes=dense?bytes:4096;
+  while(cursor<e.size()){
+   GpuPacketHeader h{};GpuWriteBufferPayload w{};
+   if(e.size()-cursor<sizeof(h)+sizeof(w))throw std::runtime_error("short packet");
+   std::memcpy(&h,e.data()+cursor,sizeof(h));std::memcpy(&w,e.data()+cursor+sizeof(h),sizeof(w));
+   const size_t n=std::min<size_t>(1<<20,expected_bytes-uploaded);
+   if(h.opcode!=static_cast<uint16_t>(GpuOpcode::WriteBuffer)||w.id!=r->id()||w.dst_offset!=(dense?uploaded:at)||w.data_len!=n||h.payload_bytes!=sizeof(w)+n||e.size()-cursor<sizeof(h)+sizeof(w)+n)throw std::runtime_error("wrong packet");
+   for(size_t k=0;k<n;k+=4){uint32_t word;std::memcpy(&word,e.data()+cursor+sizeof(h)+sizeof(w)+k,4);if(word!=(k%4096?0:value))throw std::runtime_error("wrong payload");}
+   cursor+=sizeof(h)+sizeof(w)+n;uploaded+=n;
+  }
+  if(uploaded!=expected_bytes)throw std::runtime_error("wrong uploaded bytes");
   for(size_t k=0;k<e.size();++k){digest^=e.data()[k];digest*=1099511628211ull;}
  }
  // Untimed short-tail and unreadable-slot regression controls (packet byte checks above
