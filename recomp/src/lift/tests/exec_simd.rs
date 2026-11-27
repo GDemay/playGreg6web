@@ -2645,7 +2645,10 @@ fn wasm64_batch2_simd128_codegen_and_exec_bit_exact() {
             name: &'static str,
             func: crate::cfg::Function,
             want_wasm: &'static str,
-            forbid_wasm: Option<&'static str>,
+            // (pattern, max tolerated occurrences). LLVM 23 lowers unrelated flag unpacking in the
+            // caller via a few `i8x16.replace_lane`; the scalarised mask expansion this guards
+            // against emits 16+, so a small budget keeps the probe LLVM-version-agnostic.
+            forbid_wasm: Option<(&'static str, usize)>,
             want_x86: Option<&'static str>,
         }
         let probes = [
@@ -2656,7 +2659,7 @@ fn wasm64_batch2_simd128_codegen_and_exec_bit_exact() {
                     a.ret()
                 }),
                 want_wasm: "v128.bitselect",
-                forbid_wasm: Some("v128.const"),
+                forbid_wasm: Some(("v128.const", 0)),
                 want_x86: Some("vblendvps"),
             },
             CodegenProbe {
@@ -2676,7 +2679,7 @@ fn wasm64_batch2_simd128_codegen_and_exec_bit_exact() {
                     a.ret()
                 }),
                 want_wasm: "i32x4.trunc_sat_f64x2_s_zero",
-                forbid_wasm: Some("i32x4.shl"),
+                forbid_wasm: Some(("i32x4.shl", 0)),
                 want_x86: None,
             },
             CodegenProbe {
@@ -2696,7 +2699,7 @@ fn wasm64_batch2_simd128_codegen_and_exec_bit_exact() {
                     a.ret()
                 }),
                 want_wasm: "i8x16.ne",
-                forbid_wasm: Some("i8x16.replace_lane"),
+                forbid_wasm: Some(("i8x16.replace_lane", 7)),
                 want_x86: None,
             },
             CodegenProbe {
@@ -2789,10 +2792,10 @@ fn wasm64_batch2_simd128_codegen_and_exec_bit_exact() {
                 asm.contains(want_wasm),
                 "{name} expected `{want_wasm}` in wasm64 asm:\n{asm}"
             );
-            if let Some(forbid) = forbid_wasm {
+            if let Some((forbid, budget)) = forbid_wasm {
                 assert!(
-                    !asm.contains(forbid),
-                    "{name} must NOT emit `{forbid}` in wasm64 asm:\n{asm}"
+                    asm.matches(forbid).count() <= *budget,
+                    "{name} must NOT emit more than {budget} `{forbid}` in wasm64 asm:\n{asm}"
                 );
             }
             if let Some(x86_mnem) = want_x86 {
