@@ -218,15 +218,15 @@ const opsOf = (gpu, op) => gpu.passCalls.filter((c) => c.op === op);
 
 // ---------------------------------------------------------------------------------------------
 
-test('processor owns an AsyncPipelineCache (maxConcurrent 4) unless enableAsyncPipelines is false', () => {
+test('processor owns an AsyncPipelineCache (maxConcurrent 2) unless enableAsyncPipelines is false', () => {
   const gpu = createMockGpu();
   const { processor } = makeProcessor(gpu);
   assert.ok(processor.asyncPipelineCache instanceof AsyncPipelineCache);
   assert.equal(processor.asyncPipelineCache.device, gpu.device);
-  assert.equal(processor.asyncPipelineCache.maxConcurrent, 4);
+  assert.equal(processor.asyncPipelineCache.maxConcurrent, 2);
 
-  const custom = makeProcessor(createMockGpu(), { maxConcurrentPipelineCompiles: 2 }).processor;
-  assert.equal(custom.asyncPipelineCache.maxConcurrent, 2);
+  const custom = makeProcessor(createMockGpu(), { maxConcurrentPipelineCompiles: 4 }).processor;
+  assert.equal(custom.asyncPipelineCache.maxConcurrent, 4);
 
   const disabled = makeProcessor(createMockGpu(), { enableAsyncPipelines: false }).processor;
   assert.equal(disabled.asyncPipelineCache, null);
@@ -541,7 +541,7 @@ test('buildGpuTelemetrySnapshot surfaces asyncPipelineStats', async () => {
   let snap = buildGpuTelemetrySnapshot(processor, { timestamp: 1 });
   assert.deepEqual(snap.asyncPipelineStats, {
     generation: 0,
-    maxConcurrent: 4,
+    maxConcurrent: 2,
     queued: 0,
     inFlight: 1,
     peakQueueDepth: 1,

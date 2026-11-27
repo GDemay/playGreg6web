@@ -167,6 +167,8 @@ const SENTINEL_BOUND_BIND_GROUP = Object.freeze({ bound: true });
 const DRAIN_DEFERRED_OPTS_IMMEDIATE = Object.freeze({ immediate: true });
 const DRAIN_DEFERRED_OPTS_DEFERRED = Object.freeze({ immediate: false });
 const DRAIN_RING_REUSE_OPTS = Object.freeze({ reuseResult: true });
+const DRAIN_RING_REUSE_COALESCE_OPTS = Object.freeze({ reuseResult: true, coalescePresents: true });
+const DRAIN_RING_REUSE_NO_COALESCE_OPTS = Object.freeze({ reuseResult: true, coalescePresents: false });
 
 function createPassCommandSlot() {
   return {
@@ -232,10 +234,12 @@ const RECYCLE_CMD_BUFFER_MAX_BYTES = 32 * 1024 * 1024;
 const DEFAULT_OVERSIZED_RT_RECLAIM_IDLE_FRAMES = 2;
 const DEFAULT_OVERSIZED_RT_RECLAIM_INTERVAL_FRAMES = 2;
 const MAX_ZERO_ALLOC_RING_DRAIN_BATCHES = 64;
-const DEFAULT_MAX_WGSL_COMPILE_BYTES = 1024 * 1024;
-const DEFAULT_MAX_CONCURRENT_SHADER_COMPILES = 2;
+const DEFAULT_MAX_WGSL_COMPILE_BYTES = 256 * 1024;
+const DEFAULT_MAX_CONCURRENT_SHADER_COMPILES = 1;
 const DEFAULT_SHADER_COMPILE_SLICE_BUDGET_MS = 8;
-const DEFAULT_MAX_PENDING_RANGED_PIPELINES = 4096;
+const DEFAULT_MAX_PENDING_RANGED_PIPELINES = 2048;
+const DEFAULT_HEAVY_SHADER_YIELD_BYTES = 64 * 1024;
+const DEFAULT_HEAVY_SHADER_YIELD_MS = 4;
 const MAX_OVERSIZED_SHADER_HASHES = 8192;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 
@@ -2581,8 +2585,8 @@ async function requestNegotiatedDevice(adapter) {
   return { device, enabledFeatures };
 }
 
-// W103: concurrent create{Render,Compute}PipelineAsync compiles allowed in flight (async_pipeline_cache.js).
-const DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES = 4;
+// W103 / Wave-5: concurrent create{Render,Compute}PipelineAsync compiles allowed in flight (async_pipeline_cache.js).
+const DEFAULT_MAX_CONCURRENT_PIPELINE_COMPILES = 2;
 
 // W104: live-resource replay log used to recreate guest GPU resources after device-loss recovery.
 // The guest never learns that the browser lost its GPUDevice, so every live resource creation
@@ -3552,11 +3556,13 @@ class WgpuCommandProcessor {
     );
     this._deferRangedFallbackPipelines = options.deferRangedFallbackPipelines !== false;
     this._rangedShaderCompileQueue = [];
+    this._rangedShaderCompileSeq = 0;
     this._activeRangedShaderCompiles = 0;
     this._peakConcurrentRangedShaderCompiles = 0;
     this._rangedShaderCompileYields = 0;
     this._rangedShaderCompilePumpTimer = null;
     this._rangedShaderCompileMicrotaskPending = false;
+    this._rangedShaderWaitingForPipelineIdle = false;
     this._coalescePresentsEnabled = options.coalescePresents !== false;
     this._coalescedPresents = 0;
     this._presentScanScratch = { count: 0, lastOffset: -1 };
@@ -10448,6 +10454,7 @@ class WgpuCommandProcessor {
       this._rangedShaderCompilePumpTimer = null;
     }
     this._rangedShaderCompileMicrotaskPending = false;
+    this._rangedShaderWaitingForPipelineIdle = false;
     this._activeRangedShaderCompiles = 0;
     if (Array.isArray(this._rangedShaderCompileQueue) && this._rangedShaderCompileQueue.length > 0) {
       const queued = this._rangedShaderCompileQueue;
@@ -10465,7 +10472,41 @@ class WgpuCommandProcessor {
     }
   }
 
-  _scheduleRangedShaderCompilePump(useMacrotask) {
+  _isAsyncPipelineCacheAtCapacity() {
+    const cache = this.asyncPipelineCache;
+    if (!cache) {
+      return false;
+    }
+    let inFlight = 0;
+    let limit = 0;
+    if (typeof cache._inFlight === 'number' && typeof cache.maxConcurrentCompiles === 'number') {
+      inFlight = cache._inFlight;
+      limit = cache.maxConcurrentCompiles;
+    } else if (typeof cache.getStats === 'function') {
+      try {
+        const st = cache.getStats();
+        if (st && typeof st === 'object') {
+          inFlight =
+            typeof st.activeCompiles === 'number'
+              ? st.activeCompiles
+              : typeof st.inFlight === 'number'
+                ? st.inFlight
+                : 0;
+          limit =
+            typeof st.maxConcurrentCompiles === 'number'
+              ? st.maxConcurrentCompiles
+              : typeof st.maxConcurrent === 'number'
+                ? st.maxConcurrent
+                : 0;
+        }
+      } catch (_) {
+        return false;
+      }
+    }
+    return limit > 0 && inFlight >= limit;
+  }
+
+  _scheduleRangedShaderCompilePump(useMacrotask, delayMs = 0) {
     if (this._destroyed || this._deviceLost || this._deviceRecovering) {
       return;
     }
@@ -10474,10 +10515,11 @@ class WgpuCommandProcessor {
         return;
       }
       this._rangedShaderCompileYields += 1;
+      const waitMs = typeof delayMs === 'number' && delayMs > 0 ? delayMs : 0;
       this._rangedShaderCompilePumpTimer = setTimeout(() => {
         this._rangedShaderCompilePumpTimer = null;
         this._pumpRangedShaderCompileQueue();
-      }, 0);
+      }, waitMs);
       return;
     }
     if (this._rangedShaderCompileMicrotaskPending || this._rangedShaderCompilePumpTimer !== null) {
@@ -10490,11 +10532,73 @@ class WgpuCommandProcessor {
     });
   }
 
-  _enqueueRangedShaderCompile(runCompile) {
+  _enqueueRangedShaderCompile(runCompile, meta = null) {
+    const stage = meta && meta.stage !== undefined ? meta.stage : null;
+    const isGraphics =
+      stage === SHADER_STAGE.COMPUTE
+        ? false
+        : typeof stage === 'string'
+          ? stage.trim().toLowerCase() !== 'compute'
+          : true;
+    const rawBytes =
+      meta && typeof meta.byteLength === 'number'
+        ? meta.byteLength
+        : meta && typeof meta.wgslBytes === 'number'
+          ? meta.wgslBytes
+          : Number.MAX_SAFE_INTEGER;
+    const byteLength = Number.isFinite(rawBytes) && rawBytes >= 0 ? rawBytes : Number.MAX_SAFE_INTEGER;
     return new Promise((resolve) => {
-      this._rangedShaderCompileQueue.push({ runCompile, resolve });
+      this._rangedShaderCompileQueue.push({
+        runCompile,
+        resolve,
+        stage,
+        isGraphics,
+        byteLength,
+        seq: ++this._rangedShaderCompileSeq,
+      });
       this._pumpRangedShaderCompileQueue();
     });
+  }
+
+  _dequeueNextRangedShaderCompileJob() {
+    const q = this._rangedShaderCompileQueue;
+    const len = q.length;
+    if (len === 0) {
+      return null;
+    }
+    if (len === 1) {
+      return q.pop();
+    }
+    let bestIdx = 0;
+    let best = q[0];
+    for (let i = 1; i < len; i += 1) {
+      const cand = q[i];
+      const candGraphics = cand && cand.isGraphics !== false;
+      const bestGraphics = best && best.isGraphics !== false;
+      const candBytes =
+        cand && typeof cand.byteLength === 'number' ? cand.byteLength : Number.MAX_SAFE_INTEGER;
+      const bestBytes =
+        best && typeof best.byteLength === 'number' ? best.byteLength : Number.MAX_SAFE_INTEGER;
+      const candSeq = cand && typeof cand.seq === 'number' ? cand.seq : i;
+      const bestSeq = best && typeof best.seq === 'number' ? best.seq : bestIdx;
+      if (
+        (candGraphics && !bestGraphics) ||
+        (candGraphics === bestGraphics &&
+          (candBytes < bestBytes || (candBytes === bestBytes && candSeq < bestSeq)))
+      ) {
+        bestIdx = i;
+        best = cand;
+      }
+    }
+    const last = q.pop();
+    if (bestIdx < q.length) {
+      q[bestIdx] = last;
+    }
+    return best;
+  }
+
+  _drainRangedShaderCompileQueue() {
+    return this._pumpRangedShaderCompileQueue();
   }
 
   _pumpRangedShaderCompileQueue() {
@@ -10511,6 +10615,38 @@ class WgpuCommandProcessor {
       this._rangedShaderCompileQueue.length > 0 &&
       (maxConc === 0 || this._activeRangedShaderCompiles < maxConc)
     ) {
+      // Wave-5 (#663, #1077): Yield shader compilation when AsyncPipelineCache is already at
+      // capacity so shader compiles and pipeline compiles never pile up on Dawn simultaneously.
+      if (this._isAsyncPipelineCacheAtCapacity()) {
+        this._scheduleRangedShaderCompilePump(true, DEFAULT_HEAVY_SHADER_YIELD_MS);
+        if (
+          !this._rangedShaderWaitingForPipelineIdle &&
+          this.asyncPipelineCache &&
+          typeof this.asyncPipelineCache.whenIdle === 'function'
+        ) {
+          this._rangedShaderWaitingForPipelineIdle = true;
+          Promise.resolve(this.asyncPipelineCache.whenIdle()).then(
+            () => {
+              this._rangedShaderWaitingForPipelineIdle = false;
+              if (this._destroyed || this._deviceLost || this._deviceRecovering) {
+                return;
+              }
+              if (this._rangedShaderCompileQueue.length > 0) {
+                if (this._rangedShaderCompilePumpTimer !== null) {
+                  clearTimeout(this._rangedShaderCompilePumpTimer);
+                  this._rangedShaderCompilePumpTimer = null;
+                }
+                this._pumpRangedShaderCompileQueue();
+              }
+            },
+            () => {
+              this._rangedShaderWaitingForPipelineIdle = false;
+            }
+          );
+        }
+        return;
+      }
+
       if (startedInSlice > 0 && budgetMs > 0) {
         const elapsed = this._getNowMs() - sliceStartMs;
         if (elapsed >= budgetMs) {
@@ -10519,10 +10655,14 @@ class WgpuCommandProcessor {
         }
       }
 
-      const job = this._rangedShaderCompileQueue.shift();
+      const job = this._dequeueNextRangedShaderCompileJob();
       if (!job) {
         continue;
       }
+      const isHeavyShader =
+        typeof job.byteLength === 'number' &&
+        Number.isFinite(job.byteLength) &&
+        job.byteLength > DEFAULT_HEAVY_SHADER_YIELD_BYTES;
       startedInSlice += 1;
       this._activeRangedShaderCompiles += 1;
       if (this._activeRangedShaderCompiles > this._peakConcurrentRangedShaderCompiles) {
@@ -10556,7 +10696,11 @@ class WgpuCommandProcessor {
           job.resolve(result);
           if (this._rangedShaderCompileQueue.length > 0) {
             const elapsedAfter = this._getNowMs() - sliceStartMs;
-            this._scheduleRangedShaderCompilePump(budgetMs > 0 && elapsedAfter >= budgetMs);
+            const needMacrotaskYield = isHeavyShader || (budgetMs > 0 && elapsedAfter >= budgetMs);
+            this._scheduleRangedShaderCompilePump(
+              needMacrotaskYield,
+              isHeavyShader ? DEFAULT_HEAVY_SHADER_YIELD_MS : 0
+            );
           }
         };
         compilationPromise.then(onSettled, onSettled);
@@ -10571,16 +10715,30 @@ class WgpuCommandProcessor {
         }
         job.resolve(result);
         const elapsedAfter = this._getNowMs() - sliceStartMs;
-        const needMacrotaskYield = budgetMs > 0 && elapsedAfter >= budgetMs;
+        const needMacrotaskYield = isHeavyShader || (budgetMs > 0 && elapsedAfter >= budgetMs);
         const releaseSlot = () => {
           this._activeRangedShaderCompiles = Math.max(0, this._activeRangedShaderCompiles - 1);
-          if (this._rangedShaderCompileQueue.length > 0) {
+          if (
+            !this._destroyed &&
+            !this._deviceLost &&
+            !this._deviceRecovering &&
+            this._rangedShaderCompileQueue.length > 0
+          ) {
             this._pumpRangedShaderCompileQueue();
           }
         };
         if (needMacrotaskYield) {
           this._rangedShaderCompileYields += 1;
-          setTimeout(releaseSlot, 0);
+          const yieldDelay = isHeavyShader ? DEFAULT_HEAVY_SHADER_YIELD_MS : 0;
+          const timerId = setTimeout(() => {
+            if (this._rangedShaderCompilePumpTimer === timerId) {
+              this._rangedShaderCompilePumpTimer = null;
+            }
+            releaseSlot();
+          }, yieldDelay);
+          if (this._rangedShaderCompilePumpTimer === null) {
+            this._rangedShaderCompilePumpTimer = timerId;
+          }
           return;
         }
         Promise.resolve().then(releaseSlot);
@@ -11041,41 +11199,73 @@ class WgpuCommandProcessor {
           resolvedHash: lookupHashHex,
           fallbackProfile: null,
         };
-        return this._enqueueRangedShaderCompile(() => {
+        // Wave-5 (#663, #1077): Quarantine oversized ranged WGSL immediately BEFORE ever
+        // entering _rangedShaderCompileQueue or calling device.createShaderModule().
+        const maxBytes = this._maxWgslCompileBytes;
+        if (maxBytes > 0 && wgsl.length > maxBytes) {
+          const compiled = this._compileShaderModuleEntry(id, realEntry, false);
+          cleanup();
           if (!isStillCurrent()) {
-            cleanup();
             return null;
           }
-          const compiled = this._compileShaderModuleEntry(id, realEntry, false);
-          return {
-            compilationPromise: compiled ? compiled._compilationInfoPromise || null : null,
-            finalize: () => {
-              cleanup();
-              if (!isStillCurrent()) {
-                return null;
+          if (!compiled) {
+            if (realEntry.oversizedRejected) {
+              const cur = this.shaderModules.get(id);
+              if (cur && cur.pendingRanged) {
+                cur.pendingRanged = false;
+                cur.oversizedRejected = true;
               }
-              if (!compiled) {
-                if (realEntry.oversizedRejected) {
-                  const cur = this.shaderModules.get(id);
-                  if (cur && cur.pendingRanged) {
-                    cur.pendingRanged = false;
-                    cur.oversizedRejected = true;
-                  }
-                  this._onRangedShaderSettled(id, false);
+              this._onRangedShaderSettled(id, false);
+              return null;
+            }
+            failCurrent(null);
+            return null;
+          }
+          this.shaderModules.set(id, compiled);
+          this._shaderModuleGenerations.set(id, ++this._nextShaderModuleGen);
+          this._invalidatePipelinesReferencingShader(id);
+          this._rangedShaderReady += 1;
+          this._onRangedShaderSettled(id, true);
+          return compiled;
+        }
+        return this._enqueueRangedShaderCompile(
+          () => {
+            if (!isStillCurrent()) {
+              cleanup();
+              return null;
+            }
+            const compiled = this._compileShaderModuleEntry(id, realEntry, false);
+            return {
+              compilationPromise: compiled ? compiled._compilationInfoPromise || null : null,
+              finalize: () => {
+                cleanup();
+                if (!isStillCurrent()) {
                   return null;
                 }
-                failCurrent(null);
-                return null;
-              }
-              this.shaderModules.set(id, compiled);
-              this._shaderModuleGenerations.set(id, ++this._nextShaderModuleGen);
-              this._invalidatePipelinesReferencingShader(id);
-              this._rangedShaderReady += 1;
-              this._onRangedShaderSettled(id, true);
-              return compiled;
-            },
-          };
-        });
+                if (!compiled) {
+                  if (realEntry.oversizedRejected) {
+                    const cur = this.shaderModules.get(id);
+                    if (cur && cur.pendingRanged) {
+                      cur.pendingRanged = false;
+                      cur.oversizedRejected = true;
+                    }
+                    this._onRangedShaderSettled(id, false);
+                    return null;
+                  }
+                  failCurrent(null);
+                  return null;
+                }
+                this.shaderModules.set(id, compiled);
+                this._shaderModuleGenerations.set(id, ++this._nextShaderModuleGen);
+                this._invalidatePipelinesReferencingShader(id);
+                this._rangedShaderReady += 1;
+                this._onRangedShaderSettled(id, true);
+                return compiled;
+              },
+            };
+          },
+          { stage, byteLength: wgsl.length }
+        );
       },
       (err) => {
         cleanup();
@@ -11145,6 +11335,78 @@ class WgpuCommandProcessor {
     }
 
     const wasInFlightRanged = this._inFlightRangedShaders.has(id);
+    if (rangedPackCache && this._maxWgslCompileBytes > 0 && typeof rangedPackCache.getShaderMetadata === 'function') {
+      let rangedKnownBytes = null;
+      try {
+        const meta = rangedPackCache.getShaderMetadata(rangedLookupKey);
+        if (meta && typeof meta.length === 'number' && Number.isFinite(meta.length) && meta.length > 0) {
+          rangedKnownBytes = meta.length;
+        }
+      } catch (_) {
+        // Optional metadata lookup failure is non-fatal.
+      }
+      if (rangedKnownBytes !== null && rangedKnownBytes > this._maxWgslCompileBytes) {
+        // Wave-5 (#663, #1077): Quarantine oversized ranged shaders immediately from index metadata
+        // BEFORE HTTP 206 fetch, _rangedShaderCompileQueue, or device.createShaderModule().
+        this._inFlightRangedShaders.delete(id);
+        this._oversizedWgslFallbacks += 1;
+        if (resolved.lookupHashHex) {
+          this._recordOversizedShaderHash(resolved.lookupHashHex);
+        }
+        if (
+          this.shaderFallbackRouter &&
+          typeof this.shaderFallbackRouter.recordMissingShader === 'function' &&
+          resolved.lookupHashHex
+        ) {
+          try {
+            this.shaderFallbackRouter.recordMissingShader(
+              resolved.lookupHashHex,
+              stageCodeToName(stage) || 'vertex',
+              'compile_failed'
+            );
+          } catch (_) {
+            // Never allow telemetry tracking errors to interrupt shader compilation.
+          }
+        }
+        if (
+          this.shaderFallbackRouter &&
+          resolved.source === 'builtin' &&
+          typeof resolved.code === 'string' &&
+          resolved.code.length > 0 &&
+          resolved.code.length <= this._maxWgslCompileBytes
+        ) {
+          const fbEntry = {
+            module: null,
+            stage,
+            code: resolved.code,
+            codeLen: resolved.code.length,
+            isInlineCode: false,
+            hashHex: resolved.hashHex,
+            entryPoint: resolved.entryPoint,
+            source: resolved.source,
+            requestedHash: resolved.requestedHash,
+            resolvedHash: resolved.resolvedHash,
+            fallbackProfile: resolved.fallbackProfile,
+            oversizedFallback: true,
+          };
+          const compiledFb = this._compileShaderModuleEntry(id, fbEntry, false);
+          if (compiledFb) {
+            this.shaderModules.set(id, compiledFb);
+          }
+          if (wasInFlightRanged || this._pendingRangedPipelines.size > 0) {
+            this._onRangedShaderSettled(id, Boolean(compiledFb));
+          }
+          return;
+        }
+        if (wasInFlightRanged) {
+          this.shaderModules.delete(id);
+        }
+        if (wasInFlightRanged || this._pendingRangedPipelines.size > 0) {
+          this._onRangedShaderSettled(id, false);
+        }
+        return;
+      }
+    }
     if (!rangedPackCache) {
       this._inFlightRangedShaders.delete(id);
     }
@@ -11182,9 +11444,14 @@ class WgpuCommandProcessor {
       return;
     }
 
+    const isEntryOversized =
+      this._maxWgslCompileBytes > 0 &&
+      typeof entry.code === 'string' &&
+      entry.code.length > this._maxWgslCompileBytes;
     const shouldDefer =
-      this._lazyShaderCompile === true ||
-      (this._lazyShaderCompile === 'pack' && entry.source === 'pack');
+      !isEntryOversized &&
+      (this._lazyShaderCompile === true ||
+        (this._lazyShaderCompile === 'pack' && entry.source === 'pack'));
     if (shouldDefer) {
       this._deferredShaderCount += 1;
       this.shaderModules.set(id, entry);
@@ -13974,6 +14241,8 @@ class WgpuCommandProcessor {
     let coalescePresents = false;
     if (options && typeof options.coalescePresents === 'boolean') {
       coalescePresents = options.coalescePresents;
+    } else if (options && typeof options.coalescePresent === 'boolean') {
+      coalescePresents = options.coalescePresent;
     } else if (!deferFinalPresent && this._coalescePresentsEnabled && view && endOffset - startOffset >= 24) {
       // Coalesce stall backlogs of >= 3 Presents packed into a single buffer while keeping
       // explicit 2-frame command-buffer unit tests intact.
@@ -17514,7 +17783,9 @@ function createWgpuWorkerHandler(options = {}) {
       coalescePresents:
         initPayload.coalescePresents !== undefined
           ? initPayload.coalescePresents
-          : options.coalescePresents,
+          : initPayload.coalescePresent !== undefined
+            ? initPayload.coalescePresent
+            : options.coalescePresents,
       promote1DTo2D:
         initPayload.promote1DTo2D !== undefined
           ? initPayload.promote1DTo2D
@@ -17570,6 +17841,7 @@ function createWgpuWorkerHandler(options = {}) {
   // W363: Reusable options scratch + shared resolved promise for hot synchronous handleMessage paths
   // (avoids per-message Uint8Array, options, and Promise/async-frame allocations).
   const cmdBufferExecOpts = { reuseResult: true, byteLength: 0 };
+  const cmdBufferExecCoalesceOpts = { reuseResult: true, byteLength: 0, coalescePresents: true };
   const splashPresentOptsScratch = {
     nowMs: undefined,
     respectPacing: undefined,
@@ -18333,12 +18605,32 @@ function createWgpuWorkerHandler(options = {}) {
         ) {
           processor.attachGuestMemory(pendingGuestMemory);
         }
+        const hasExplicitCoalesce =
+          typeof payload.coalescePresents === 'boolean' ||
+          typeof payload.coalescePresent === 'boolean';
+        const explicitCoalescePresents =
+          typeof payload.coalescePresents === 'boolean'
+            ? payload.coalescePresents
+            : payload.coalescePresent === true;
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         let result;
         try {
           if (canPassDirectByteLength) {
-            cmdBufferExecOpts.byteLength = payload.byteLength;
-            result = processor.executeCommandBuffer(batchInput, cmdBufferExecOpts);
+            if (hasExplicitCoalesce) {
+              cmdBufferExecCoalesceOpts.byteLength = payload.byteLength;
+              cmdBufferExecCoalesceOpts.coalescePresents = explicitCoalescePresents;
+              result = processor.executeCommandBuffer(batchInput, cmdBufferExecCoalesceOpts);
+            } else {
+              cmdBufferExecOpts.byteLength = payload.byteLength;
+              result = processor.executeCommandBuffer(batchInput, cmdBufferExecOpts);
+            }
+          } else if (hasExplicitCoalesce) {
+            result = processor.executeCommandBuffer(
+              batchInput,
+              explicitCoalescePresents
+                ? DRAIN_RING_REUSE_COALESCE_OPTS
+                : DRAIN_RING_REUSE_NO_COALESCE_OPTS
+            );
           } else {
             result = processor.executeCommandBuffer(batchInput, DRAIN_RING_REUSE_OPTS);
           }
