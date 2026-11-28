@@ -98,6 +98,7 @@
 #include "abi/playgta6_abi.h"
 #include "gpu/descriptor_heap.h"
 #include "gpu/pso_cache.h"
+#include "gpu/shader_pack_index.h"
 #include "gpu/state_bridge.h"
 
 namespace playgta6::gpu {
@@ -225,6 +226,10 @@ struct StageReflection {
     uint32_t rt_arena_mask = 0;
     // C2 "address_sources" (rt_residency.h): which root params / constants hold guest addresses.
     std::vector<rt_residency::AddressSource> address_sources;
+    // Set by shift_legacy_fragment_bindings: every @group(0) binding number of the stage was raised
+    // by this much, so the module built for the stage must be renumbered the same way
+    // (pack_key_code(key, shift)). 0 = numbered as translated.
+    uint32_t group0_binding_shift = 0;
 };
 
 // Pack key (stage identity) -> reflection.
@@ -240,6 +245,22 @@ inline constexpr uint32_t kStageReflectionMaxVersion = 3;
 
 // Parses a sidecar (see above). False + message when malformed; unknown members are ignored.
 bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* out, std::string* error);
+
+// Packs translated before the disjoint fragment numbering (#1868) number a fragment stage's
+// @group(0) bindings from 0, like every vertex stage, so a vertex and a pixel stage that read
+// different descriptors at the same binding number cannot share one pipeline layout (the join
+// reports "the stages disagree on this binding's kind or source"). This raises every @group(0)
+// binding of each such fragment stage (one with a group-0 binding below `shift`, none at or above
+// it, and the highest one plus `shift` still under kMaxGroup0Binding) by `shift` and records it in
+// StageReflection::group0_binding_shift; the stage's module must then be renumbered alike. A
+// fragment stage already numbered from `shift` (current packs) is left as it is. With `pack`, a
+// stage is a fragment stage when the pack holds its key as one (the pipeline binds it as the pixel
+// stage whatever its reflection says: std-pack sidecars carry "compute" reflections for some
+// fragment keys); without, when its reflection says so. Returns the number of stages shifted.
+inline constexpr uint32_t kLegacyFragmentBindingShift = 128;
+inline constexpr uint32_t kMaxGroup0Binding = 1000;  // WebGPU maxBindingsPerBindGroup (binding < 1000)
+size_t shift_legacy_fragment_bindings(StageReflectionIndex* index, uint32_t shift = kLegacyFragmentBindingShift,
+                                      const ShaderPackIndex* pack = nullptr);
 
 // The root parameter whose user data starts at `user_sgpr` (-1 when none does).
 inline constexpr uint32_t kGraphicsUserDataBase = 8;
